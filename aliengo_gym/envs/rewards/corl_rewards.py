@@ -89,7 +89,7 @@ class CoRLRewards:
     def _reward_ang_vel_limit(self):
         '''Penalizes joint velocities exceeding a predefined threshold.
         '''
-        return -torch.sum(torch.clamp(torch.abs(self.env.dof_vel) - 0.8, min=0.0), dim=1)
+        return torch.sum(torch.clamp(torch.abs(self.env.dof_vel) - 0.8, min=0.0), dim=1)
 
     #############################################################
     ################ STABILITY AND CONFIGURATION ################
