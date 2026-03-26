@@ -7,7 +7,7 @@ from isaacgym import gymapi
 class CoRLRewards:
     def __init__(self, env):
         self.env = env
-        self.eps = 0.1
+        self.eps = 0.5
         # print(self.env.commands.shape)
 
     def load_env(self, env):
@@ -20,6 +20,7 @@ class CoRLRewards:
     def _reward_base_orientation(self):
         '''Penalize base tilt (roll/pitch deviation from upright).
         '''
+        # print(f"Reward base orient: {torch.sum(torch.square(self.env.projected_gravity[:, :2]), dim=1)}")
         return torch.sum(torch.square(self.env.projected_gravity[:, :2]), dim=1)
 
     def _reward_upright_orientation(self):
