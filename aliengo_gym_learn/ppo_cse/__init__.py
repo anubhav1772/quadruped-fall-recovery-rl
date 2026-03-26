@@ -161,24 +161,24 @@ class Runner:
                         with logger.Prefix(metrics="eval/episode"):
                             logger.store_metrics(**infos['eval/episode'])
 
-                    if 'curriculum' in infos:
+                    # if 'curriculum' in infos:
 
-                        cur_reward_sum += rewards
-                        cur_episode_length += 1
+                    cur_reward_sum += rewards
+                    cur_episode_length += 1
 
-                        new_ids = (dones > 0).nonzero(as_tuple=False)
+                    new_ids = (dones > 0).nonzero(as_tuple=False)
 
-                        new_ids_train = new_ids[new_ids < num_train_envs]
-                        rewbuffer.extend(cur_reward_sum[new_ids_train].cpu().numpy().tolist())
-                        lenbuffer.extend(cur_episode_length[new_ids_train].cpu().numpy().tolist())
-                        cur_reward_sum[new_ids_train] = 0
-                        cur_episode_length[new_ids_train] = 0
+                    new_ids_train = new_ids[new_ids < num_train_envs]
+                    rewbuffer.extend(cur_reward_sum[new_ids_train].cpu().numpy().tolist())
+                    lenbuffer.extend(cur_episode_length[new_ids_train].cpu().numpy().tolist())
+                    cur_reward_sum[new_ids_train] = 0
+                    cur_episode_length[new_ids_train] = 0
 
-                        new_ids_eval = new_ids[new_ids >= num_train_envs]
-                        rewbuffer_eval.extend(cur_reward_sum[new_ids_eval].cpu().numpy().tolist())
-                        lenbuffer_eval.extend(cur_episode_length[new_ids_eval].cpu().numpy().tolist())
-                        cur_reward_sum[new_ids_eval] = 0
-                        cur_episode_length[new_ids_eval] = 0
+                    new_ids_eval = new_ids[new_ids >= num_train_envs]
+                    rewbuffer_eval.extend(cur_reward_sum[new_ids_eval].cpu().numpy().tolist())
+                    lenbuffer_eval.extend(cur_episode_length[new_ids_eval].cpu().numpy().tolist())
+                    cur_reward_sum[new_ids_eval] = 0
+                    cur_episode_length[new_ids_eval] = 0
 
                     if 'curriculum/distribution' in infos:
                         distribution = infos['curriculum/distribution']
