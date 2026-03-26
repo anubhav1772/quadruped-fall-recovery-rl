@@ -13,7 +13,6 @@ from aliengo_gym import MINI_GYM_ROOT_DIR
 from aliengo_gym.envs.base.base_task import BaseTask
 from aliengo_gym.utils.math_utils import quat_apply_yaw, wrap_to_pi, get_scale_shift
 from aliengo_gym.utils.terrain import Terrain
-# from .legged_robot_config import Cfg
 from .legged_robot_config import BaseCfg as Cfg
 
 
@@ -91,6 +90,10 @@ class LeggedRobot(BaseTask):
         self.obs_buf = torch.clip(self.obs_buf, -clip_obs, clip_obs)
         if self.privileged_obs_buf is not None:
             self.privileged_obs_buf = torch.clip(self.privileged_obs_buf, -clip_obs, clip_obs)
+
+        # print("dones sum:", self.reset_buf.sum())
+        # print("reward sample:", self.rew_buf[:5])
+
         return self.obs_buf, self.privileged_obs_buf, self.rew_buf, self.reset_buf, self.extras
 
     def post_physics_step(self):
@@ -153,10 +156,12 @@ class LeggedRobot(BaseTask):
     def check_termination(self):
         """ Check if environments need to be reset
         """
+        # Contact termination is effectively DISABLED (since terminate_after_contacts_on = [])
         self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1.,
                                    dim=1)
         self.time_out_buf = self.episode_length_buf > self.cfg.env.max_episode_length  # no terminal reward for time-outs
         self.reset_buf |= self.time_out_buf
+
         if self.cfg.rewards.use_terminal_body_height:
             self.body_height_buf = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1) \
                                    < self.cfg.rewards.terminal_body_height
@@ -283,6 +288,7 @@ class LeggedRobot(BaseTask):
         self.rew_buf[:] = 0.
         self.rew_buf_pos[:] = 0.
         self.rew_buf_neg[:] = 0.
+
         for i in range(len(self.reward_functions)):
             name = self.reward_names[i]
             rew = self.reward_functions[i]() * self.reward_scales[name]
@@ -302,6 +308,8 @@ class LeggedRobot(BaseTask):
             self.rew_buf[:] = self.rew_buf_pos[:] * torch.exp(self.rew_buf_neg[:] / self.cfg.rewards.sigma_rew_neg)
 
         self.episode_sums["total"] += self.rew_buf
+        # print(f"Episodic sum: {self.episode_sums['total']}")
+
         # add termination reward after clipping
         if "termination" in self.reward_scales:
             rew = self.reward_container._reward_termination() * self.reward_scales["termination"]
@@ -324,13 +332,6 @@ class LeggedRobot(BaseTask):
                                   self.dof_vel[:, :self.num_actuated_dof] * self.obs_scales.dof_vel,
                                   self.actions
                                   ), dim=-1)
-        # if self.cfg.env.observe_command and not self.cfg.env.observe_height_command:
-        #     self.obs_buf = torch.cat((self.projected_gravity,
-        #                               self.commands[:, :3] * self.commands_scale,
-        #                               (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
-        #                               self.dof_vel * self.obs_scales.dof_vel,
-        #                               self.actions
-        #                               ), dim=-1)
 
         if self.cfg.env.observe_command:
             self.obs_buf = torch.cat((self.projected_gravity,
@@ -505,6 +506,24 @@ class LeggedRobot(BaseTask):
             self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
                                                  self.desired_contact_states), dim=-1)
 
+        if self.cfg.env.priv_observe_heightmap:
+            heights = self.env.measured_heights              # (N, K)
+            body_height = self.env.root_states[:, 2:3]       # (N, 1)
+
+            # Relative terrain height
+            heights_relative = body_height - heights
+
+            # Normalize
+            height_scale, height_shift = get_scale_shift(
+                self.cfg.normalization.relative_height_range
+            )
+            heights_normalized = (heights_relative - height_shift) * height_scale
+
+            self.privileged_obs_buf = torch.cat(
+                (self.privileged_obs_buf, heights_normalized),
+                dim=1
+            )
+
         # print(f"priv obs shape: {self.privileged_obs_buf.shape}")
         assert self.privileged_obs_buf.shape[
                    1] == self.cfg.env.num_privileged_obs, f"num_privileged_obs ({self.cfg.env.num_privileged_obs}) != the number of privileged observations ({self.privileged_obs_buf.shape[1]}), you will discard data from the student!"
@@ -546,7 +565,7 @@ class LeggedRobot(BaseTask):
         self.root_states[0, 3:7] = torch.Tensor(quat)
         self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_states))
 
-    # ------------- Callbacks --------------
+    ############### Callbacks ###############
     def _call_train_eval(self, func, env_ids):
 
         env_ids_train = env_ids[env_ids < self.num_train_envs]
@@ -840,14 +859,6 @@ class LeggedRobot(BaseTask):
         # setting the smaller commands to zero
         self.commands[env_ids, :2] *= (torch.norm(self.commands[env_ids, :2], dim=1) > 0.2).unsqueeze(1)
 
-        # # Also suppress gait when all velocity commands are near zero
-        # near_zero_vel = (torch.norm(self.commands[env_ids, :2], dim=1) < 0.1)
-        # # Set frequency to 0 -> clock stops ticking -> no oscillation
-        # self.commands[env_ids[near_zero_vel], 4] = 0.0
-        # # Set footswing height to 0
-        # if self.cfg.commands.num_commands > 9:
-        #     self.commands[env_ids[near_zero_vel], 9] = 0.0
-
         # reset command sums
         for key in self.command_sums.keys():
             self.command_sums[key][env_ids] = 0.
@@ -860,13 +871,6 @@ class LeggedRobot(BaseTask):
             bounds = self.commands[:, 7]
             durations = self.commands[:, 8]
 
-            # Freeze gait clock when velocity commands are near zero
-            # cmd_norm = torch.norm(self.commands[:, :3], dim=1)
-            # gait_active = (cmd_norm > 0.1).float()
-            #
-            # self.gait_indices = torch.remainder(
-            #     self.gait_indices + self.dt * frequencies * gait_active, 1.0
-            # )
             self.gait_indices = torch.remainder(self.gait_indices + self.dt * frequencies, 1.0)
 
             if self.cfg.commands.pacing_offset:
@@ -1023,15 +1027,46 @@ class LeggedRobot(BaseTask):
             self.root_states[env_ids, :3] += self.env_origins[env_ids]
 
         # base yaws
-        init_yaws = torch_rand_float(-cfg.terrain.yaw_init_range,
-                                     cfg.terrain.yaw_init_range, (len(env_ids), 1),
-                                     device=self.device)
-        quat = quat_from_angle_axis(init_yaws, torch.Tensor([0, 0, 1]).to(self.device))[:, 0, :]
-        self.root_states[env_ids, 3:7] = quat
+        # robot is always upright
+        # init_yaws = torch_rand_float(-cfg.terrain.yaw_init_range,
+        #                              cfg.terrain.yaw_init_range, (len(env_ids), 1),
+        #                              device=self.device)
+        # quat = quat_from_angle_axis(init_yaws, torch.Tensor([0, 0, 1]).to(self.device))[:, 0, :]
+        # self.root_states[env_ids, 3:7] = quat
+
+        # for learning recovery
+        num_resets = len(env_ids)
+
+        roll = torch.rand(num_resets, device=self.device) * 2.0 - 1.0
+        pitch = torch.rand(num_resets, device=self.device) * 2.0 - 1.0
+        yaw = torch.rand(num_resets, device=self.device) * 2.0 * 3.1416 - 3.1416
+
+        # Start easier: ±90° (important for learning)
+        roll = roll * 1.57
+        pitch = pitch * 1.57
+
+        quat = quat_from_euler_xyz(roll, pitch, yaw)
+
+        # Mix upright + fallen (stability + recovery)
+        upright_mask = torch.rand(num_resets, device=self.device) < 0.3
+        upright_quat = torch.tensor([0., 0., 0., 1.], device=self.device).repeat(num_resets, 1)
+
+        final_quat = torch.where(
+            upright_mask.unsqueeze(1),
+            upright_quat,
+            quat
+        )
+
+        self.root_states[env_ids, 3:7] = final_quat
+
+        # height for better physics
+        self.root_states[env_ids, 2] = 0.2 + 0.1 * torch.rand(num_resets, device=self.device)
 
         # base velocities
-        self.root_states[env_ids, 7:13] = torch_rand_float(-0.5, 0.5, (len(env_ids), 6),
-                                                           device=self.device)  # [7:10]: lin vel, [10:13]: ang vel
+        # self.root_states[env_ids, 7:13] = torch_rand_float(-0.5, 0.5, (len(env_ids), 6),
+                                                           # device=self.device)  # [7:10]: lin vel, [10:13]: ang vel
+        self.root_states[env_ids, 7:13] = 0.0
+
         env_ids_int32 = env_ids.to(dtype=torch.int32)
         self.gym.set_actor_root_state_tensor_indexed(self.sim,
                                                      gymtorch.unwrap_tensor(self.root_states),
@@ -1135,6 +1170,10 @@ class LeggedRobot(BaseTask):
                                    torch.ones(3) * noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel,
                                    noise_vec
                                    ), dim=0)
+        if self.cfg.env.observe_only_ang_vel:
+            noise_vec = torch.cat((torch.ones(3) * noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel,
+                                   noise_vec
+                                   ), dim=0)
 
         if self.cfg.env.observe_only_lin_vel:
             noise_vec = torch.cat((torch.ones(3) * noise_scales.lin_vel * noise_level * self.obs_scales.lin_vel,
@@ -1156,7 +1195,6 @@ class LeggedRobot(BaseTask):
 
         return noise_vec
 
-    # ----------------------------------------
     def _init_buffers(self):
         """ Initialize torch tensors which will contain simulation states and processed quantities
         """
@@ -1758,6 +1796,8 @@ class LeggedRobot(BaseTask):
             num_cols = np.floor(np.sqrt(len(env_ids)))
             num_rows = np.ceil(self.num_envs / num_cols)
             xx, yy = torch.meshgrid(torch.arange(num_rows), torch.arange(num_cols))
+            xx = xx.to(self.device)
+            yy = yy.to(self.device)
             spacing = cfg.env.env_spacing
             self.env_origins[env_ids, 0] = spacing * xx.flatten()[:len(env_ids)]
             self.env_origins[env_ids, 1] = spacing * yy.flatten()[:len(env_ids)]
