@@ -439,6 +439,35 @@ class LeggedRobot(BaseTask):
             self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
                                                       (self.payloads.unsqueeze(1) - payloads_shift) * payloads_scale),
                                                      dim=1)
+
+        # if self.cfg.env.priv_observe_link_masses:
+        #     # [N, 4] output: [base_payload_norm, hip_norm, thigh_norm, calf_norm]
+        #     mass_groups_norm = torch.zeros(self.num_envs, 4, device=self.device, dtype=torch.float)
+        #
+        #     # 0) base/trunk as PAYLOAD (same behavior as old priv_observe_base_mass)
+        #     payload_scale, payload_shift = get_scale_shift(self.cfg.normalization.added_mass_range)
+        #     mass_groups_norm[:, 0] = (self.payloads - payload_shift) * payload_scale
+        #
+        #     # 1..3) hip/thigh/calf as mass DELTAS wrt defaults
+        #     # self.mass_groups[:,1:] should contain current [hip, thigh, calf] group masses
+        #     # self.mass_groups_default[1:] should contain nominal/default masses
+        #     link_mass_deltas = self.mass_groups[:, 1:] - self.mass_groups_default[1:].unsqueeze(0)
+        #
+        #     # per-dim ranges, e.g. [[hip_min, hip_max], [thigh_min, thigh_max], [calf_min, calf_max]]
+        #     # cfg.normalization.link_mass_delta_ranges shape [3,2]
+        #     lm_ranges = torch.tensor(self.cfg.normalization.link_mass_delta_ranges,
+        #                              device=self.device, dtype=torch.float)  # [3,2]
+        #     lm_min = lm_ranges[:, 0]  # [3]
+        #     lm_max = lm_ranges[:, 1]  # [3]
+        #
+        #     # scale to roughly [-1, 1]
+        #     lm_shift = 0.5 * (lm_max + lm_min)          # [3]
+        #     lm_scale = 2.0 / (lm_max - lm_min + 1e-8)   # [3]
+        #     mass_groups_norm[:, 1:] = (link_mass_deltas - lm_shift) * lm_scale
+        #
+        #     self.privileged_obs_buf = torch.cat((self.privileged_obs_buf, mass_groups_norm), dim=1)
+        #     self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf, mass_groups_norm), dim=1)
+
         if self.cfg.env.priv_observe_com_displacement:
             com_displacements_scale, com_displacements_shift = get_scale_shift(
                 self.cfg.normalization.com_displacement_range)
@@ -565,7 +594,6 @@ class LeggedRobot(BaseTask):
         self.root_states[0, 3:7] = torch.Tensor(quat)
         self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_states))
 
-    ############### Callbacks ###############
     def _call_train_eval(self, func, env_ids):
 
         env_ids_train = env_ids[env_ids < self.num_train_envs]
@@ -1352,6 +1380,12 @@ class LeggedRobot(BaseTask):
         self.restitutions = self.default_restitution * torch.ones(self.num_envs, 4, dtype=torch.float, device=self.device,
                                                                   requires_grad=False)
         self.payloads = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+
+
+        self.mass_groups = torch.zeros(self.num_envs, 4, dtype=torch.float, device=self.device, requires_grad=False)
+        # defaults for normalization/reference
+        self.mass_groups_default = torch.zeros(4, dtype=torch.float, device=self.device, requires_grad=False)
+
         self.com_displacements = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device,
                                              requires_grad=False)
         self.motor_strengths = torch.ones(self.num_envs, self.num_dof, dtype=torch.float, device=self.device,
@@ -1566,6 +1600,20 @@ class LeggedRobot(BaseTask):
         self.height_samples = torch.tensor(self.terrain.heightsamples).view(self.terrain.tot_rows,
                                                                             self.terrain.tot_cols).to(self.device)
 
+    def _compute_mass_groups_from_body_props(self, body_props):
+        # choose mean for leg groups (stable scaling), body as sum (usually one trunk)
+        def agg(indices, use_mean=False):
+            if len(indices) == 0:
+                return 0.0
+            vals = [body_props[j].mass for j in indices]
+            return float(np.mean(vals) if use_mean else np.sum(vals))
+
+        m_body  = agg(self.mass_group_indices["body"],  use_mean=False)
+        m_hip   = agg(self.mass_group_indices["hip"],   use_mean=True)
+        m_thigh = agg(self.mass_group_indices["thigh"], use_mean=True)
+        m_calf  = agg(self.mass_group_indices["calf"],  use_mean=True)
+        return m_body, m_hip, m_thigh, m_calf
+
     def _create_envs(self):
         """ Creates environments:
              1. loads the robot URDF/MJCF asset,
@@ -1607,6 +1655,16 @@ class LeggedRobot(BaseTask):
         self.num_bodies = len(body_names)
         self.num_dofs = len(self.dof_names)
         self.feet_names = [s for s in body_names if self.cfg.asset.foot_name in s]
+
+        self.mass_group_indices = {
+            "body":  [i for i, n in enumerate(body_names) if ("trunk" in n or n == "base")],
+            "hip":   [i for i, n in enumerate(body_names) if ("_hip" in n)],
+            "thigh": [i for i, n in enumerate(body_names) if ("_thigh" in n)],
+            "calf":  [i for i, n in enumerate(body_names) if ("_calf" in n)],
+        }
+        print("mass_group_indices:", {k: len(v) for k, v in self.mass_group_indices.items()})
+
+
         penalized_contact_names = []
         for name in self.cfg.asset.penalize_contacts_on:
             penalized_contact_names.extend([s for s in body_names if name in s])
@@ -1654,6 +1712,19 @@ class LeggedRobot(BaseTask):
             self.gym.set_actor_dof_properties(env_handle, anymal_handle, dof_props)
             body_props = self.gym.get_actor_rigid_body_properties(env_handle, anymal_handle)
             body_props = self._process_rigid_body_props(body_props, i)
+
+            # Compute m_true[i] from body_props using precomputed group indices
+            # self.mass_groups[i, 0] = sum/mean masses for trunk/base
+            # self.mass_groups[i, 1] = sum/mean masses for hips
+            # self.mass_groups[i, 2] = sum/mean masses for thighs
+            # self.mass_groups[i, 3] = sum/mean masses for calves
+
+            m_body, m_hip, m_thigh, m_calf = self._compute_mass_groups_from_body_props(body_props)
+            self.mass_groups[i, 0] = m_body
+            self.mass_groups[i, 1] = m_hip
+            self.mass_groups[i, 2] = m_thigh
+            self.mass_groups[i, 3] = m_calf
+
             self.gym.set_actor_rigid_body_properties(env_handle, anymal_handle, body_props, recomputeInertia=True)
             self.envs.append(env_handle)
             self.actor_handles.append(anymal_handle)
