@@ -12,8 +12,41 @@ class AC_Args(PrefixProto, cli=False):
     activation = 'elu'  # can be elu, relu, selu, crelu, lrelu, tanh, sigmoid
 
     adaptation_module_branch_hidden_dims = [256, 128]
+    estimator_mass_dim = 0 #4
 
     use_decoder = False
+
+
+class EstimatorEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dims, output_dim, mass_dim, activation):
+        super().__init__()
+        layers = [nn.Linear(input_dim, hidden_dims[0]), activation]
+        for i in range(len(hidden_dims) - 1):
+            layers.append(nn.Linear(hidden_dims[i], hidden_dims[i + 1]))
+            layers.append(activation)
+        self.trunk = nn.Sequential(*layers)
+
+        self.output_dim = output_dim
+        self.mass_dim = min(max(mass_dim, 0), output_dim)
+        self.latent_dim = output_dim - self.mass_dim
+
+        if self.mass_dim > 0:
+            self.mass_head = nn.Linear(hidden_dims[-1], self.mass_dim)
+        else:
+            self.mass_head = None
+        self.latent_head = nn.Linear(hidden_dims[-1], self.latent_dim)
+
+    def forward_heads(self, observation_history):
+        features = self.trunk(observation_history)
+        mass_hat = self.mass_head(features) if self.mass_head is not None else None
+        latent_hat = self.latent_head(features)
+        return mass_hat, latent_hat
+
+    def forward(self, observation_history):
+        mass_hat, latent_hat = self.forward_heads(observation_history)
+        if mass_hat is None:
+            return latent_hat
+        return torch.cat((mass_hat, latent_hat), dim=-1)
 
 
 class ActorCritic(nn.Module):
@@ -36,21 +69,28 @@ class ActorCritic(nn.Module):
         activation = get_activation(AC_Args.activation)
 
         # Adaptation module
-        adaptation_module_layers = []
-        adaptation_module_layers.append(nn.Linear(self.num_obs_history, AC_Args.adaptation_module_branch_hidden_dims[0]))
-        adaptation_module_layers.append(activation)
-        for l in range(len(AC_Args.adaptation_module_branch_hidden_dims)):
-            if l == len(AC_Args.adaptation_module_branch_hidden_dims) - 1:
-                adaptation_module_layers.append(
-                    nn.Linear(AC_Args.adaptation_module_branch_hidden_dims[l], self.num_privileged_obs))
-            else:
-                adaptation_module_layers.append(
-                    nn.Linear(AC_Args.adaptation_module_branch_hidden_dims[l],
-                              AC_Args.adaptation_module_branch_hidden_dims[l + 1]))
-                adaptation_module_layers.append(activation)
-        self.adaptation_module = nn.Sequential(*adaptation_module_layers)
+        # adaptation_module_layers = []
+        # adaptation_module_layers.append(nn.Linear(self.num_obs_history, AC_Args.adaptation_module_branch_hidden_dims[0]))
+        # adaptation_module_layers.append(activation)
+        # for l in range(len(AC_Args.adaptation_module_branch_hidden_dims)):
+        #     if l == len(AC_Args.adaptation_module_branch_hidden_dims) - 1:
+        #         adaptation_module_layers.append(
+        #             nn.Linear(AC_Args.adaptation_module_branch_hidden_dims[l], self.num_privileged_obs))
+        #     else:
+        #         adaptation_module_layers.append(
+        #             nn.Linear(AC_Args.adaptation_module_branch_hidden_dims[l],
+        #                       AC_Args.adaptation_module_branch_hidden_dims[l + 1]))
+        #         adaptation_module_layers.append(activation)
+        # self.adaptation_module = nn.Sequential(*adaptation_module_layers)
 
-
+        self.estimator_mass_dim = min(max(AC_Args.estimator_mass_dim, 0), self.num_privileged_obs)
+        self.adaptation_module = EstimatorEncoder(
+            input_dim=self.num_obs_history,
+            hidden_dims=AC_Args.adaptation_module_branch_hidden_dims,
+            output_dim=self.num_privileged_obs,
+            mass_dim=self.estimator_mass_dim,
+            activation=activation,
+        )
 
         # Policy
         actor_layers = []
@@ -145,6 +185,9 @@ class ActorCritic(nn.Module):
 
     def get_student_latent(self, observation_history):
         return self.adaptation_module(observation_history)
+
+    def get_estimator_outputs(self, observation_history):
+        return self.adaptation_module.forward_heads(observation_history)
 
 def get_activation(act_name):
     if act_name == "elu":

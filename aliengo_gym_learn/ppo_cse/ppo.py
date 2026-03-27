@@ -27,6 +27,9 @@ class PPO_Args(PrefixProto):
     desired_kl = 0.01
     max_grad_norm = 1.
 
+    use_mass_regression_loss = False #True
+    mass_regression_coef = 1.0
+
     selective_adaptation_module_loss = False
 
 
@@ -183,6 +186,14 @@ class PPO:
                 adaptation_loss = F.mse_loss(adaptation_pred[:num_train, selection_indices], adaptation_target[:num_train, selection_indices])
                 adaptation_test_loss = F.mse_loss(adaptation_pred[num_train:, selection_indices], adaptation_target[num_train:, selection_indices])
 
+                if PPO_Args.use_mass_regression_loss and self.actor_critic.estimator_mass_dim > 0:
+                    mass_dim = self.actor_critic.estimator_mass_dim
+                    mass_pred = adaptation_pred[:, :mass_dim]
+                    mass_target = adaptation_target[:, :mass_dim]
+                    mass_reg_loss = F.mse_loss(mass_pred[:num_train], mass_target[:num_train])
+                    mass_reg_test_loss = F.mse_loss(mass_pred[num_train:], mass_target[num_train:])
+                    adaptation_loss = adaptation_loss + PPO_Args.mass_regression_coef * mass_reg_loss
+                    adaptation_test_loss = adaptation_test_loss + PPO_Args.mass_regression_coef * mass_reg_test_loss
 
 
                 self.adaptation_module_optimizer.zero_grad()
