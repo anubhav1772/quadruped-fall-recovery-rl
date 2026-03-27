@@ -419,8 +419,9 @@ class LeggedRobot(BaseTask):
                                                 dim=1)
             self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
                                                       (self.ground_friction_coeffs.unsqueeze(
-                                                          1) - friction_coeffs_shift) * friction_coeffs_scale),
-                                                     dim=1)
+                                                      1) - ground_friction_coeffs_shift) * ground_friction_coeffs_scale),
+                                                      dim=1)
+
         if self.cfg.env.priv_observe_restitution:
             restitutions_scale, restitutions_shift = get_scale_shift(self.cfg.normalization.restitution_range)
             self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
@@ -472,12 +473,10 @@ class LeggedRobot(BaseTask):
             com_displacements_scale, com_displacements_shift = get_scale_shift(
                 self.cfg.normalization.com_displacement_range)
             self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
-                                                 (
-                                                         self.com_displacements - com_displacements_shift) * com_displacements_scale),
+                                                 (self.com_displacements - com_displacements_shift) * com_displacements_scale),
                                                 dim=1)
             self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
-                                                      (
-                                                              self.com_displacements - com_displacements_shift) * com_displacements_scale),
+                                                      (self.com_displacements - com_displacements_shift) * com_displacements_scale),
                                                      dim=1)
         if self.cfg.env.priv_observe_motor_strength:
             motor_strengths_scale, motor_strengths_shift = get_scale_shift(self.cfg.normalization.motor_strength_range)
@@ -495,10 +494,54 @@ class LeggedRobot(BaseTask):
                                                  (
                                                          self.motor_offsets - motor_offset_shift) * motor_offset_scale),
                                                 dim=1)
-            self.next_privileged_obs_buf = torch.cat((self.privileged_obs_buf,
+            self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
                                                       (
                                                               self.motor_offsets - motor_offset_shift) * motor_offset_scale),
                                                      dim=1)
+
+        if self.cfg.env.priv_observe_com_position:
+            body_positions_world = self.rigid_body_state.view(self.num_envs, self.num_bodies, 13)[:, :, :3]
+            body_masses = self.rigid_body_masses.unsqueeze(-1)
+            # body_masses = self.body_masses.unsqueeze(0).unsqueeze(-1)
+            total_mass = body_masses.sum(dim=1).clamp_min(1e-8)
+            com_world = (body_positions_world * body_masses).sum(dim=1) / total_mass
+            com_in_base = quat_rotate_inverse(self.base_quat, com_world - self.base_pos)
+            com_position_scale, com_position_shift = get_scale_shift(self.cfg.normalization.com_position_range)
+            normalized_com_position = (com_in_base - com_position_shift) * com_position_scale
+            self.privileged_obs_buf = torch.cat((self.privileged_obs_buf, normalized_com_position), dim=1)
+            self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf, normalized_com_position), dim=1)
+
+
+        if self.cfg.env.priv_observe_Kp_factor:
+            Kp_factor_scale, Kp_factor_shift = get_scale_shift(self.cfg.normalization.Kp_factor_range)
+            self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
+                                                 (self.Kp_factors - Kp_factor_shift) * Kp_factor_scale),
+                                                dim=1)
+            self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
+                                                      (self.Kp_factors - Kp_factor_shift) * Kp_factor_scale),
+                                                     dim=1)
+        if self.cfg.env.priv_observe_Kd_factor:
+            Kd_factor_scale, Kd_factor_shift = get_scale_shift(self.cfg.normalization.Kd_factor_range)
+            self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
+                                                 (self.Kd_factors - Kd_factor_shift) * Kd_factor_scale),
+                                                dim=1)
+            self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
+                                                      (self.Kd_factors - Kd_factor_shift) * Kd_factor_scale),
+                                                     dim=1)
+        if self.cfg.env.priv_observe_contact_forces:
+            contact_forces_scale, contact_forces_shift = get_scale_shift(self.cfg.normalization.contact_force_range)
+            foot_contact_forces = self.contact_forces[:, self.feet_indices, :].reshape(self.num_envs, -1)
+            self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
+                                                 (foot_contact_forces - contact_forces_shift) * contact_forces_scale),
+                                                dim=1)
+            self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
+                                                      (foot_contact_forces - contact_forces_shift) * contact_forces_scale),
+                                                     dim=1)
+        if self.cfg.env.priv_observe_contact_states:
+            foot_contact_states = (self.contact_forces[:, self.feet_indices, 2] > 1.0).float()  # [num_envs, 4]
+            self.privileged_obs_buf = torch.cat((self.privileged_obs_buf, foot_contact_states), dim=-1)
+            self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf, foot_contact_states), dim=-1)
+
         if self.cfg.env.priv_observe_body_height:
             body_height_scale, body_height_shift = get_scale_shift(self.cfg.normalization.body_height_range)
             self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
@@ -736,6 +779,9 @@ class LeggedRobot(BaseTask):
         props[0].mass = self.default_body_mass + self.payloads[env_id]
         props[0].com = gymapi.Vec3(self.com_displacements[env_id, 0], self.com_displacements[env_id, 1],
                                    self.com_displacements[env_id, 2])
+        # Use per-env rigid body masses for CoM privileged feature
+        self.rigid_body_masses[env_id] = torch.tensor([prop.mass for prop in props], dtype=torch.float,
+                                                      device=self.device)
         return props
 
     def _post_physics_step_callback(self):
@@ -1386,6 +1432,9 @@ class LeggedRobot(BaseTask):
         # defaults for normalization/reference
         self.mass_groups_default = torch.zeros(4, dtype=torch.float, device=self.device, requires_grad=False)
 
+        self.rigid_body_masses = torch.zeros(self.num_envs, self.num_bodies, dtype=torch.float, device=self.device,
+                                     requires_grad=False)
+
         self.com_displacements = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device,
                                              requires_grad=False)
         self.motor_strengths = torch.ones(self.num_envs, self.num_dof, dtype=torch.float, device=self.device,
@@ -1655,6 +1704,9 @@ class LeggedRobot(BaseTask):
         self.num_bodies = len(body_names)
         self.num_dofs = len(self.dof_names)
         self.feet_names = [s for s in body_names if self.cfg.asset.foot_name in s]
+
+        # asset_body_props = self.gym.get_asset_rigid_body_properties(self.robot_asset)
+        # self.body_masses = torch.tensor([prop.mass for prop in asset_body_props], device=self.device, dtype=torch.float)
 
         self.mass_group_indices = {
             "body":  [i for i, n in enumerate(body_names) if ("trunk" in n or n == "base")],
