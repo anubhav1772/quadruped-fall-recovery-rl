@@ -74,7 +74,8 @@ class RolloutStorage:
         self.step = 0
 
     def compute_returns(self, last_values, gamma, lam):
-        advantage = 0
+        # advantage = 0
+        advantage = torch.zeros_like(last_values)
         for step in reversed(range(self.num_transitions_per_env)):
             if step == self.num_transitions_per_env - 1:
                 next_values = last_values
@@ -84,6 +85,8 @@ class RolloutStorage:
             delta = self.rewards[step] + next_is_not_terminal * gamma * next_values - self.values[step]
             advantage = delta + next_is_not_terminal * gamma * lam * advantage
             self.returns[step] = advantage + self.values[step]
+
+        self.returns = (self.returns - self.returns.mean()) / (self.returns.std() + 1e-8)
 
         # Compute and normalize the advantages
         self.advantages = self.returns - self.values
