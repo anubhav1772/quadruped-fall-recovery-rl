@@ -57,6 +57,9 @@ class LeggedRobot(BaseTask):
         self.collecting_evaluation = False
         self.num_still_evaluating = 0
 
+        self.debug_rewards = True
+        self.debug_counter = 0
+
     def step(self, actions):
         """ Apply actions, simulate, call self.post_physics_step()
 
@@ -111,6 +114,17 @@ class LeggedRobot(BaseTask):
         self.episode_length_buf += 1
         self.common_step_counter += 1
 
+        if self.debug_rewards and self.common_step_counter % 1000 == 0:
+            base_height = self.root_states[:, 2]
+
+            print("POST STEP:")
+            print("height mean:", base_height.mean().item())
+            print("height min:", base_height.min().item())
+
+            ang_vel = torch.norm(self.root_states[:, 10:13], dim=1)
+
+            print("ang vel mean:", ang_vel.mean().item())
+
         # prepare quantities
         self.base_pos[:] = self.root_states[:self.num_envs, 0:3]
         self.base_quat[:] = self.root_states[:self.num_envs, 3:7]
@@ -153,19 +167,36 @@ class LeggedRobot(BaseTask):
 
         # self._render_headless()
 
+    # def check_termination(self):
+    #     """ Check if environments need to be reset
+    #     """
+    #     # Contact termination is effectively DISABLED (since terminate_after_contacts_on = [])
+    #     self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1.,
+    #                                dim=1)
+    #     self.time_out_buf = self.episode_length_buf > self.cfg.env.max_episode_length  # no terminal reward for time-outs
+    #     self.reset_buf |= self.time_out_buf
+    #
+    #     if self.cfg.rewards.use_terminal_body_height:
+    #         self.body_height_buf = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1) \
+    #                                < self.cfg.rewards.terminal_body_height
+    #         self.reset_buf = torch.logical_or(self.body_height_buf, self.reset_buf)
+
     def check_termination(self):
-        """ Check if environments need to be reset
-        """
-        # Contact termination is effectively DISABLED (since terminate_after_contacts_on = [])
-        self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1.,
-                                   dim=1)
-        self.time_out_buf = self.episode_length_buf > self.cfg.env.max_episode_length  # no terminal reward for time-outs
+
+        self.reset_buf = torch.any(
+            torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1.,
+            dim=1
+        )
+
+        self.time_out_buf = self.episode_length_buf > self.cfg.env.max_episode_length
         self.reset_buf |= self.time_out_buf
 
-        if self.cfg.rewards.use_terminal_body_height:
-            self.body_height_buf = torch.mean(self.root_states[:, 2].unsqueeze(1) - self.measured_heights, dim=1) \
-                                   < self.cfg.rewards.terminal_body_height
-            self.reset_buf = torch.logical_or(self.body_height_buf, self.reset_buf)
+        # fallen = self.root_states[:, 2] < 0.12
+        # ONLY kill when low height and not recovering
+        # fallen = (self.root_states[:, 2] < 0.10) & (upright < 0.3)
+        # detect collapse, avoids early resets, distinguishes recovery vs failure
+        fallen = (self.root_states[:, 2] < 0.10) & (self.episode_length_buf > 20) & (self.projected_gravity[:, 2] < 0.5)
+        self.reset_buf |= fallen
 
     def reset_idx(self, env_ids):
         """ Reset some environments.
@@ -291,22 +322,35 @@ class LeggedRobot(BaseTask):
 
         for i in range(len(self.reward_functions)):
             name = self.reward_names[i]
-            rew = self.reward_functions[i]() * self.reward_scales[name]
-            self.rew_buf += rew
-            if torch.sum(rew) >= 0:
-                self.rew_buf_pos += rew
-            elif torch.sum(rew) <= 0:
-                self.rew_buf_neg += rew
-            self.episode_sums[name] += rew
+
+            raw_rew = self.reward_functions[i]()              # RAW
+            scaled_rew = raw_rew * self.reward_scales[name]   # SCALED
+
+            self.rew_buf += scaled_rew
+
+            if torch.sum(scaled_rew) >= 0:
+                self.rew_buf_pos += scaled_rew
+            elif torch.sum(scaled_rew) <= 0:
+                self.rew_buf_neg += scaled_rew
+
+            self.episode_sums[name] += scaled_rew
+
+            # DEBUG LOGGING (lightweight)
+            if self.debug_rewards and self.debug_counter % 500 == 0:
+                print(f"{name}: raw_mean={raw_rew.mean().item():.2e}, raw_max={raw_rew.max().item():.2e}, "
+                      f"scaled_mean={scaled_rew.mean().item():.2e}, scaled_max={scaled_rew.max().item():.2e}")
+
             if name in ['tracking_contacts_shaped_force', 'tracking_contacts_shaped_vel']:
-                self.command_sums[name] += self.reward_scales[name] + rew
+                self.command_sums[name] += self.reward_scales[name] + scaled_rew
             else:
-                self.command_sums[name] += rew
+                self.command_sums[name] += scaled_rew
+
         if self.cfg.rewards.only_positive_rewards:
             self.rew_buf[:] = torch.clip(self.rew_buf[:], min=0.)
         elif self.cfg.rewards.only_positive_rewards_ji22_style: #TODO: update
             self.rew_buf[:] = self.rew_buf_pos[:] * torch.exp(self.rew_buf_neg[:] / self.cfg.rewards.sigma_rew_neg)
 
+        # self.rew_buf *= 1000.0
         self.episode_sums["total"] += self.rew_buf
         # print(f"Episodic sum: {self.episode_sums['total']}")
 
@@ -314,14 +358,16 @@ class LeggedRobot(BaseTask):
         if "termination" in self.reward_scales:
             rew = self.reward_container._reward_termination() * self.reward_scales["termination"]
             self.rew_buf += rew
-            self.episode_sums["termination"] += rew
-            self.command_sums["termination"] += rew
+            self.episode_sums["termination"] += scaled_rew
+            self.command_sums["termination"] += scaled_rew
 
         self.command_sums["lin_vel_raw"] += self.base_lin_vel[:, 0]
         self.command_sums["ang_vel_raw"] += self.base_ang_vel[:, 2]
         self.command_sums["lin_vel_residual"] += (self.base_lin_vel[:, 0] - self.commands[:, 0]) ** 2
         self.command_sums["ang_vel_residual"] += (self.base_ang_vel[:, 2] - self.commands[:, 2]) ** 2
         self.command_sums["ep_timesteps"] += 1
+
+        self.debug_counter += 1
 
     def compute_observations(self):
         """ Computes observations
@@ -1084,6 +1130,7 @@ class LeggedRobot(BaseTask):
         Args:
             env_ids (List[int]): Environemnt ids
         """
+
         # base position
         if self.custom_origins:
             self.root_states[env_ids] = self.base_init_state
@@ -1100,30 +1147,30 @@ class LeggedRobot(BaseTask):
             self.root_states[env_ids] = self.base_init_state
             self.root_states[env_ids, :3] += self.env_origins[env_ids]
 
-        # base yaws
-        # robot is always upright
-        # init_yaws = torch_rand_float(-cfg.terrain.yaw_init_range,
-        #                              cfg.terrain.yaw_init_range, (len(env_ids), 1),
-        #                              device=self.device)
-        # quat = quat_from_angle_axis(init_yaws, torch.Tensor([0, 0, 1]).to(self.device))[:, 0, :]
-        # self.root_states[env_ids, 3:7] = quat
-
-        # for learning recovery
         num_resets = len(env_ids)
 
-        roll = torch.rand(num_resets, device=self.device) * 2.0 - 1.0
-        pitch = torch.rand(num_resets, device=self.device) * 2.0 - 1.0
-        yaw = torch.rand(num_resets, device=self.device) * 2.0 * 3.1416 - 3.1416
+        # curriculum progress
+        progress = torch.clamp(
+            torch.tensor(self.common_step_counter, device=self.device) / 5e6,
+            0.0, 1.0
+        )
 
-        # Start easier: ±90° (important for learning)
-        roll = roll * 1.57
-        pitch = pitch * 1.57
+        # orientation difficulty
+        max_angle = 0.5 + 1.0 * progress  # ~30° -> ~90°
+        max_yaw = 0.5 + 2.5 * progress
+
+        roll = (torch.rand(num_resets, device=self.device) * 2.0 - 1.0) * max_angle
+        pitch = (torch.rand(num_resets, device=self.device) * 2.0 - 1.0) * max_angle
+        yaw = torch.rand(num_resets, device=self.device) * 2.0 * 3.1416 - 3.1416
 
         quat = quat_from_euler_xyz(roll, pitch, yaw)
 
-        # Mix upright + fallen (stability + recovery)
-        upright_mask = torch.rand(num_resets, device=self.device) < 0.3
-        upright_quat = torch.tensor([0., 0., 0., 1.], device=self.device).repeat(num_resets, 1)
+        # upright vs fallen mix
+        upright_prob = torch.clamp(0.5 - 0.3 * progress, 0.2, 0.5)
+        upright_mask = torch.rand(num_resets, device=self.device) < upright_prob
+
+        upright_quat = torch.zeros((num_resets, 4), device=self.device)
+        upright_quat[:, 3] = 1.0
 
         final_quat = torch.where(
             upright_mask.unsqueeze(1),
@@ -1133,13 +1180,26 @@ class LeggedRobot(BaseTask):
 
         self.root_states[env_ids, 3:7] = final_quat
 
-        # height for better physics
-        self.root_states[env_ids, 2] = 0.2 + 0.1 * torch.rand(num_resets, device=self.device)
+        # safe height
+        self.root_states[env_ids, 2] = 0.30 + 0.10 * torch.rand(num_resets, device=self.device)
 
-        # base velocities
-        # self.root_states[env_ids, 7:13] = torch_rand_float(-0.5, 0.5, (len(env_ids), 6),
-                                                           # device=self.device)  # [7:10]: lin vel, [10:13]: ang vel
-        self.root_states[env_ids, 7:13] = 0.0
+        # small velocity noise
+        self.root_states[env_ids, 7:13] = 0.1 * torch.randn(num_resets, 6, device=self.device)
+
+        if self.debug_rewards and torch.rand(1) < 0.01:  # print occasionally
+            heights = self.root_states[env_ids, 2]
+            quats = self.root_states[env_ids, 3:7]
+
+            roll, pitch, yaw = get_euler_xyz(quats)
+
+            upright_ratio = (torch.abs(roll) < 0.2) & (torch.abs(pitch) < 0.2)
+
+            print("---- RESET STATS ----")
+            print("progress:", progress.item() if torch.is_tensor(progress) else progress)
+            print("height mean:", heights.mean().item(), "min:", heights.min().item())
+            print("roll mean:", roll.mean().item(), "std:", roll.std().item())
+            print("pitch mean:", pitch.mean().item(), "std:", pitch.std().item())
+            print("upright %:", upright_ratio.float().mean().item())
 
         env_ids_int32 = env_ids.to(dtype=torch.int32)
         self.gym.set_actor_root_state_tensor_indexed(self.sim,
