@@ -68,7 +68,7 @@ class BaseCfg(PrefixProto, cli=False):
         thickness = 0.01
 
     class env(PrefixProto, cli=False):
-        num_envs = 5
+        num_envs = 4096
         num_observations = 42
         num_scalar_observations = 42
         # if not None a privilige_obs_buf will be returned by step() (critic obs for assymetric training). None is returned otherwise
@@ -107,7 +107,7 @@ class BaseCfg(PrefixProto, cli=False):
         priv_observe_friction = True
         priv_observe_com_position = True
         priv_observe_com_displacement = False
-        priv_observe_foot_contact_states = True
+        # priv_observe_foot_contact_states = True
         priv_observe_Kp_factor = True
         priv_observe_Kd_factor = True
         priv_observe_contact_forces = True
@@ -314,7 +314,7 @@ class BaseCfg(PrefixProto, cli=False):
 
     class rewards(PrefixProto, cli=False):
         only_positive_rewards = False  # if true negative total rewards are clipped at zero (avoids early termination problems)
-        only_positive_rewards_ji22_style = False
+        only_positive_rewards_ji22_style = True
         sigma_rew_neg = 0.02
         reward_container_name = "CoRLRewards"
         tracking_sigma = 0.25  # tracking reward = exp(-error^2/sigma)
@@ -345,9 +345,9 @@ class BaseCfg(PrefixProto, cli=False):
         ang_vel_limit = -0.1
         base_contact = -0.2
         feet_on_ground = 0.3
-        posture = 4.0
+        posture = 1.0 #4.0
         base_orientation = -0.5
-        upright_orientation = 6.0
+        upright_orientation = 2.0 #6.0
         height_alignment = 0.0 #1.0 (on uneven, make measure_heights=True)
         dof_pos_limits = -1.0
         action_smoothness_1 = -0.05
@@ -390,8 +390,8 @@ class BaseCfg(PrefixProto, cli=False):
         hop_symmetry = 0.0
 
     class normalization(PrefixProto, cli=False):
-        clip_observations = 100.
-        clip_actions = 10.
+        clip_observations = 10 #100.
+        clip_actions = 1.0 #10.
 
         friction_range = [0, 1.0]
         ground_friction_range = [1, 1.0]
