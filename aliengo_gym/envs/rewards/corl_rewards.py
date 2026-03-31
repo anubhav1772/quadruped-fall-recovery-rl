@@ -61,12 +61,22 @@ class CoRLRewards:
     def _reward_dof_acc(self):
         '''Penalizes high joint accelerations for smoother motion.
         '''
-        return torch.sum(torch.square(self.env.dof_acc), dim=1)
+        # return torch.sum(torch.square(self.env.dof_acc), dim=1)
+        # # softer scaling
+        # acc = self.env.dof_acc
+        # acc_penalty = torch.mean((acc / 50.0)**2, dim=1)
+
+        acc = torch.clamp(self.env.dof_acc, -200, 200)
+        acc_penalty = torch.mean(acc**2, dim=1)
+        return acc_penalty
 
     def _reward_dof_vel(self):
         '''Penalizes high joint velocities to reduce excessive movement.
         '''
-        return torch.sum(torch.square(self.env.dof_vel), dim=1)
+        # return torch.sum(torch.square(self.env.dof_vel), dim=1)
+        vel = torch.clamp(self.env.dof_vel, -50, 50)
+        vel_penalty = torch.mean(vel**2, dim=1)
+        return vel_penalty
 
     ###################################################
     ################ MOTION SMOOTHNESS ################
