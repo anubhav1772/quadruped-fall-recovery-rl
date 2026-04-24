@@ -496,7 +496,8 @@ class FallRecoveryConfig(BaseCfg):
     """
 
     class env(BaseCfg.env):
-        num_observations = 45       # ang_vel(3) in base + observe_only_ang_vel adds 3 more + gravity(3) + dof_pos(12) + dof_vel(12) + actions(12)
+        num_observations = 45       # base: ang_vel(3) + gravity(3) + dof_pos(12) + dof_vel(12) + actions(12) = 42,
+                                    # + observe_only_ang_vel prepends ang_vel(3) again = 45 total
         num_scalar_observations = 45
         episode_length_s = 15       # longer episodes to allow full recovery sequences (was 3 s)
         observe_only_ang_vel = True  # prepend ang_vel again for emphasis in recovery task (gives 45 obs total)

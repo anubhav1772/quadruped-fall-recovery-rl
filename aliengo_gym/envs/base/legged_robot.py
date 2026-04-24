@@ -1,5 +1,6 @@
 # License: see [LICENSE, LICENSES/legged_gym/LICENSE]
 
+import math
 import os
 from typing import Dict
 
@@ -1267,13 +1268,13 @@ class LeggedRobot(BaseTask):
             0.0, 1.0
         )
 
-        # Curriculum: start easy (side falls ±30°), progress to hard (back/front ±115°)
-        max_roll = 0.5 + 1.5 * progress    # ~30° → ~115° (rad)
-        max_pitch = 0.3 + 1.0 * progress   # ~17° → ~75° (rad)
+        # Curriculum: start easy (side falls ~±30°), progress to hard (~±115°)
+        max_roll = 0.5 + 1.5 * progress    # 0.5 rad → 2.0 rad
+        max_pitch = 0.3 + 1.0 * progress   # 0.3 rad → 1.3 rad
 
         roll = (torch.rand(num_resets, device=self.device) * 2.0 - 1.0) * max_roll
         pitch = (torch.rand(num_resets, device=self.device) * 2.0 - 1.0) * max_pitch
-        yaw = torch.rand(num_resets, device=self.device) * 2.0 * 3.1416 - 3.1416
+        yaw = torch.rand(num_resets, device=self.device) * 2.0 * math.pi - math.pi
 
         quat = quat_from_euler_xyz(roll, pitch, yaw)
         self.root_states[env_ids, 3:7] = quat

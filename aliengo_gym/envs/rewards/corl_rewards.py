@@ -128,11 +128,11 @@ class CoRLRewards:
         posture_error = torch.sum((q - q_stand)**2, dim=1)
         r_posture = torch.exp(-posture_error)
 
-        # Stability factor: 0 when fully tilted (g_z = 0), 1 when fully upright (g_z = -1)
+        # Stability factor: 0.0 when flat (g_z ≈ 0), 1.0 when upright (g_z = -1)
         g_z = self.env.projected_gravity[:, 2]
-        stability_factor = torch.clamp(-(g_z + 0.0) / 1.0, 0.0, 1.0)  # 0.5 when flat, 1.0 when upright
+        stability_factor = torch.clamp(-(g_z + 0.0) / 1.0, 0.0, 1.0)
 
-        # Active during recovery (0.5 weight) + enhanced when upright (up to 1.0 weight)
+        # Weight is 0.5 (from constant) when flat, up to 1.0 when upright
         return r_posture * (0.5 + 0.5 * stability_factor)
 
     def _reward_base_height(self):
