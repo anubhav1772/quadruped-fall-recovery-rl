@@ -151,6 +151,8 @@ class LeggedRobot(BaseTask):
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self.reset_idx(env_ids)
 
+        self.check_recovery_success()
+
         self.compute_observations()
 
         self.last_last_actions[:] = self.last_actions[:]
@@ -191,12 +193,26 @@ class LeggedRobot(BaseTask):
         self.time_out_buf = self.episode_length_buf > self.cfg.env.max_episode_length
         self.reset_buf |= self.time_out_buf
 
-        # fallen = self.root_states[:, 2] < 0.12
-        # ONLY kill when low height and not recovering
-        # fallen = (self.root_states[:, 2] < 0.10) & (upright < 0.3)
-        # detect collapse, avoids early resets, distinguishes recovery vs failure
-        fallen = (self.root_states[:, 2] < 0.10) & (self.episode_length_buf > 20) & (self.projected_gravity[:, 2] < 0.5)
+        # Only terminate on truly irrecoverable collapses (very low height with no recovery motion).
+        # Do NOT use projected_gravity < 0.5 as a termination condition: this would kill the episode
+        # while the robot is still recovering (tilted but moving back toward upright).
+        fallen = (self.root_states[:, 2] < 0.10) & (self.episode_length_buf > 20)
         self.reset_buf |= fallen
+
+    def check_recovery_success(self):
+        """Track successful recoveries within the current episode.
+
+        Success is defined as: upright (|roll|, |pitch| < 0.3 rad),
+        stable height (z > 0.25 m), and low velocity (||v|| < 0.5 m/s).
+        """
+        roll, pitch, _ = get_euler_xyz(self.base_quat)
+
+        upright = (torch.abs(roll) < 0.3) & (torch.abs(pitch) < 0.3)
+        stable_height = self.root_states[:, 2] > 0.25
+        low_velocity = torch.norm(self.base_lin_vel, dim=1) < 0.5
+
+        recovered = (upright & stable_height & low_velocity).float()
+        self.episode_sums["recovery_success"] += recovered
 
     def reset_idx(self, env_ids):
         """ Reset some environments.
@@ -372,7 +388,8 @@ class LeggedRobot(BaseTask):
     def compute_observations(self):
         """ Computes observations
         """
-        self.obs_buf = torch.cat((self.projected_gravity,
+        self.obs_buf = torch.cat((self.base_ang_vel * self.obs_scales.ang_vel,
+                                  self.projected_gravity,
                                   (self.dof_pos[:, :self.num_actuated_dof] - self.default_dof_pos[:,
                                                                              :self.num_actuated_dof]) * self.obs_scales.dof_pos,
                                   self.dof_vel[:, :self.num_actuated_dof] * self.obs_scales.dof_vel,
@@ -380,7 +397,8 @@ class LeggedRobot(BaseTask):
                                   ), dim=-1)
 
         if self.cfg.env.observe_command:
-            self.obs_buf = torch.cat((self.projected_gravity,
+            self.obs_buf = torch.cat((self.base_ang_vel * self.obs_scales.ang_vel,
+                                      self.projected_gravity,
                                       self.commands * self.commands_scale,
                                       (self.dof_pos[:, :self.num_actuated_dof] - self.default_dof_pos[:,
                                                                                  :self.num_actuated_dof]) * self.obs_scales.dof_pos,
@@ -1220,6 +1238,57 @@ class LeggedRobot(BaseTask):
                 self.complete_video_frames_eval = self.video_frames_eval[:]
             self.video_frames_eval = []
 
+    def _reset_root_states_fall_recovery(self, env_ids, cfg):
+        """Reset robots to fallen poses for fall recovery training.
+
+        Uses a curriculum that starts with easy falls (small tilt) and progressively
+        increases difficulty (larger tilt angles) as training advances.
+
+        Args:
+            env_ids (List[int]): Environment ids to reset
+            cfg: Configuration object
+        """
+        if len(env_ids) == 0:
+            return
+
+        # Base position
+        if self.custom_origins:
+            self.root_states[env_ids] = self.base_init_state
+            self.root_states[env_ids, :3] += self.env_origins[env_ids]
+        else:
+            self.root_states[env_ids] = self.base_init_state
+            self.root_states[env_ids, :3] += self.env_origins[env_ids]
+
+        num_resets = len(env_ids)
+
+        # Curriculum progress: 0 at start → 1 at 5M steps
+        progress = torch.clamp(
+            torch.tensor(self.common_step_counter, device=self.device) / 5e6,
+            0.0, 1.0
+        )
+
+        # Curriculum: start easy (side falls ±30°), progress to hard (back/front ±115°)
+        max_roll = 0.5 + 1.5 * progress    # ~30° → ~115° (rad)
+        max_pitch = 0.3 + 1.0 * progress   # ~17° → ~75° (rad)
+
+        roll = (torch.rand(num_resets, device=self.device) * 2.0 - 1.0) * max_roll
+        pitch = (torch.rand(num_resets, device=self.device) * 2.0 - 1.0) * max_pitch
+        yaw = torch.rand(num_resets, device=self.device) * 2.0 * 3.1416 - 3.1416
+
+        quat = quat_from_euler_xyz(roll, pitch, yaw)
+        self.root_states[env_ids, 3:7] = quat
+
+        # Low initial height (robot lying on ground)
+        self.root_states[env_ids, 2] = 0.15 + 0.05 * torch.rand(num_resets, device=self.device)
+
+        # Small initial velocity noise
+        self.root_states[env_ids, 7:13] = 0.05 * torch.randn(num_resets, 6, device=self.device)
+
+        env_ids_int32 = env_ids.to(dtype=torch.int32)
+        self.gym.set_actor_root_state_tensor_indexed(self.sim,
+                                                     gymtorch.unwrap_tensor(self.root_states),
+                                                     gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+
     def _push_robots(self, env_ids, cfg):
         """ Random pushes the robots. Emulates an impulse by setting a randomized base velocity.
         """
@@ -1270,7 +1339,8 @@ class LeggedRobot(BaseTask):
         self.add_noise = self.cfg.noise.add_noise
         noise_scales = self.cfg.noise_scales
         noise_level = self.cfg.noise.noise_level
-        noise_vec = torch.cat((torch.ones(3) * noise_scales.gravity * noise_level,
+        noise_vec = torch.cat((torch.ones(3) * noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel,
+                               torch.ones(3) * noise_scales.gravity * noise_level,
                                torch.ones(
                                    self.num_actuated_dof) * noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos,
                                torch.ones(
@@ -1279,7 +1349,8 @@ class LeggedRobot(BaseTask):
                                ), dim=0)
 
         if self.cfg.env.observe_command:
-            noise_vec = torch.cat((torch.ones(3) * noise_scales.gravity * noise_level,
+            noise_vec = torch.cat((torch.ones(3) * noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel,
+                                   torch.ones(3) * noise_scales.gravity * noise_level,
                                    torch.zeros(self.cfg.commands.num_commands),
                                    torch.ones(
                                        self.num_actuated_dof) * noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos,
@@ -1648,11 +1719,15 @@ class LeggedRobot(BaseTask):
             for name in self.reward_scales.keys()}
         self.episode_sums["total"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device,
                                                  requires_grad=False)
+        self.episode_sums["recovery_success"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device,
+                                                            requires_grad=False)
         self.episode_sums_eval = {
             name: -1 * torch.ones(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
             for name in self.reward_scales.keys()}
         self.episode_sums_eval["total"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device,
                                                       requires_grad=False)
+        self.episode_sums_eval["recovery_success"] = -1 * torch.ones(self.num_envs, dtype=torch.float,
+                                                                      device=self.device, requires_grad=False)
         self.command_sums = {
             name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
             for name in

@@ -115,15 +115,36 @@ class CoRLRewards:
         return torch.sum(contacts, dim=1)
 
     def _reward_posture(self):
-        '''Rewards tracking a desired standing joint configuration when upright.
+        '''Rewards tracking a desired standing joint configuration.
+
+        Activates across all orientations with a stability-based weighting:
+        provides partial guidance when tilted (recovery phase) and full
+        guidance when upright (maintenance phase). This is critical for
+        fall recovery: the robot gets reward for moving toward the standing
+        joint configuration even before it achieves upright orientation.
         '''
         q = self.env.dof_pos[:, :self.env.num_actuated_dof]
         q_stand = self.env.default_dof_pos[:, :self.env.num_actuated_dof]
         posture_error = torch.sum((q - q_stand)**2, dim=1)
         r_posture = torch.exp(-posture_error)
+
+        # Stability factor: 0 when fully tilted (g_z = 0), 1 when fully upright (g_z = -1)
         g_z = self.env.projected_gravity[:, 2]
-        upright_mask = (torch.abs(g_z + 1.0) < self.eps).float()
-        return r_posture * upright_mask
+        stability_factor = torch.clamp(-(g_z + 0.0) / 1.0, 0.0, 1.0)  # 0.5 when flat, 1.0 when upright
+
+        # Active during recovery (0.5 weight) + enhanced when upright (up to 1.0 weight)
+        return r_posture * (0.5 + 0.5 * stability_factor)
+
+    def _reward_base_height(self):
+        '''Rewards maintaining the target base height above ground.
+
+        Provides a smooth exponential reward that peaks at the target height,
+        encouraging the robot to stand up during recovery and maintain
+        standing height during normal locomotion.
+        '''
+        body_height = self.env.base_pos[:, 2]
+        target_height = self.env.cfg.rewards.base_height_target
+        return torch.exp(-torch.square(target_height - body_height) / 0.04)
 
     #############################################################
     ########################## SAFETY ###########################
