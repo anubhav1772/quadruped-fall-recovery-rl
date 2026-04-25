@@ -4,7 +4,7 @@ def train_aliengo(headless=True):
     assert isaacgym
     import torch
 
-    from aliengo_gym.envs.base.legged_robot_config import BaseCfg as Cfg
+    from aliengo_gym.envs.base.fall_recovery_config import FallRecoveryConfig as Cfg
     # from aliengo_gym.envs.aliengo.aliengo_config import config_aliengo
     from aliengo_gym.envs.aliengo.velocity_tracking import VelocityTrackingEasyEnv
 
@@ -65,4 +65,4 @@ if __name__ == '__main__':
                 """, filename=".charts.yml", dedent=True)
 
     # to see the environment rendering, set headless=False
-    train_aliengo(headless=True)
+    train_aliengo(headless=False)
