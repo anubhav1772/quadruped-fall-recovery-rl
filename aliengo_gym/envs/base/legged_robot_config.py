@@ -68,7 +68,8 @@ class BaseCfg(PrefixProto, cli=False):
         thickness = 0.01
 
     class env(PrefixProto, cli=False):
-        num_envs = 4096
+        train_recovery = False
+        num_envs = 10
         num_observations = 42
         num_scalar_observations = 42
         # if not None a privilige_obs_buf will be returned by step() (critic obs for assymetric training). None is returned otherwise

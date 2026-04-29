@@ -60,6 +60,8 @@ class LeggedRobot(BaseTask):
         self.debug_rewards = True
         self.debug_counter = 0
 
+        self.max_video_frames = 200
+
     def step(self, actions):
         """ Apply actions, simulate, call self.post_physics_step()
 
@@ -114,16 +116,16 @@ class LeggedRobot(BaseTask):
         self.episode_length_buf += 1
         self.common_step_counter += 1
 
-        if self.debug_rewards and self.common_step_counter % 1000 == 0:
-            base_height = self.root_states[:, 2]
+        # if self.debug_rewards and self.common_step_counter % 1000 == 0:
+        #     base_height = self.root_states[:, 2]
 
-            print("POST STEP:")
-            print("height mean:", base_height.mean().item())
-            print("height min:", base_height.min().item())
+        #     print("POST STEP:")
+        #     print("height mean:", base_height.mean().item())
+        #     print("height min:", base_height.min().item())
 
-            ang_vel = torch.norm(self.root_states[:, 10:13], dim=1)
+        #     ang_vel = torch.norm(self.root_states[:, 10:13], dim=1)
 
-            print("ang vel mean:", ang_vel.mean().item())
+        #     print("ang vel mean:", ang_vel.mean().item())
 
         # prepare quantities
         self.base_pos[:] = self.root_states[:self.num_envs, 0:3]
@@ -167,7 +169,8 @@ class LeggedRobot(BaseTask):
         if self.viewer and self.enable_viewer_sync and self.debug_viz:
             self._draw_debug_vis()
 
-        # self._render_headless()
+        if self.cfg.env.record_video:
+            self._render_headless()
 
     # def check_termination(self):
     #     """ Check if environments need to be reset
@@ -185,14 +188,14 @@ class LeggedRobot(BaseTask):
 
     def check_termination(self):
 
-        print(
-            "steps:",
-            self.episode_length_buf.float().mean().item(),
-            "max:",
-            self.episode_length_buf.max().item(),
-            "min:",
-            self.episode_length_buf.min().item()
-        )
+        # print(
+        #     "steps:",
+        #     self.episode_length_buf.float().mean().item(),
+        #     "max:",
+        #     self.episode_length_buf.max().item(),
+        #     "min:",
+        #     self.episode_length_buf.min().item()
+        # )
 
         # 1. No contact-based termination for recovery
         self.reset_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -218,16 +221,24 @@ class LeggedRobot(BaseTask):
         # self.reset_buf |= fallen
 
     def check_recovery_success(self):
-        """Track successful recoveries within the current episode.
-        Success is defined as: upright (|roll|, |pitch| < 0.3 rad),
-        stable height (z > 0.25 m), and low velocity (||v|| < 0.5 m/s).
+        """Counts successful fall-recovery events per episode.
+        A recovery is detected when the robot is upright (projected gravity z < -0.9),
+        reaches a stable height (base height > 0.25 m), and has low linear velocity
+        (‖v‖ < 0.2 m/s). Only the first occurrence per episode is counted using
+        a recovery flag to avoid multiple counts.
         """
-        roll, pitch, _ = get_euler_xyz(self.base_quat)
-        upright = (torch.abs(roll) < 0.3) & (torch.abs(pitch) < 0.3)
+        g_z = self.projected_gravity[:, 2]
+
+        upright = g_z < -0.9
         stable_height = self.root_states[:, 2] > 0.25
-        low_velocity = torch.norm(self.base_lin_vel, dim=1) < 0.5
-        recovered = (upright & stable_height & low_velocity).float()
-        self.episode_sums["recovery_success"] += recovered
+        low_velocity = torch.norm(self.base_lin_vel, dim=1) < 0.2
+
+        recovered = upright & stable_height & low_velocity
+
+        new_recovery = recovered & (~self.recovered_flag)
+
+        self.recovered_flag |= recovered
+        self.episode_sums["recovery_success"] += new_recovery.float()
 
     def reset_idx(self, env_ids):
         """ Reset some environments.
@@ -275,10 +286,20 @@ class LeggedRobot(BaseTask):
         train_env_ids = env_ids[env_ids < self.num_train_envs]
         if len(train_env_ids) > 0:
             self.extras["train/episode"] = {}
+            # for key in self.episode_sums.keys():
+            #     self.extras["train/episode"]['rew_' + key] = torch.mean(
+            #         self.episode_sums[key][train_env_ids])
+            #     self.episode_sums[key][train_env_ids] = 0.
+            #
             for key in self.episode_sums.keys():
-                self.extras["train/episode"]['rew_' + key] = torch.mean(
-                    self.episode_sums[key][train_env_ids])
-                self.episode_sums[key][train_env_ids] = 0.
+                if key == "recovery_success":
+                    self.extras["train/episode"]["recovery_success"] = torch.mean(
+                        self.episode_sums[key][train_env_ids]
+                    )
+                else:
+                    self.extras["train/episode"]['rew_' + key] = torch.mean(
+                        self.episode_sums[key][train_env_ids]
+                    )
         eval_env_ids = env_ids[env_ids >= self.num_train_envs]
         if len(eval_env_ids) > 0:
             self.extras["eval/episode"] = {}
@@ -332,6 +353,8 @@ class LeggedRobot(BaseTask):
         for i in range(len(self.lag_buffer)):
             self.lag_buffer[i][env_ids, :] = 0
 
+        self.recovered_flag[env_ids] = False
+
     def set_idx_pose(self, env_ids, dof_pos, base_state):
         if len(env_ids) == 0:
             return
@@ -379,9 +402,9 @@ class LeggedRobot(BaseTask):
             self.episode_sums[name] += scaled_rew
 
             # DEBUG LOGGING
-            if self.debug_rewards and self.debug_counter % 500 == 0:
-                print(f"{name}: raw_mean={raw_rew.mean().item():.2e}, raw_max={raw_rew.max().item():.2e}, "
-                      f"scaled_mean={scaled_rew.mean().item():.2e}, scaled_max={scaled_rew.max().item():.2e}")
+            # if self.debug_rewards and self.debug_counter % 500 == 0:
+            #     print(f"{name}: raw_mean={raw_rew.mean().item():.2e}, raw_max={raw_rew.max().item():.2e}, "
+            #           f"scaled_mean={scaled_rew.mean().item():.2e}, scaled_max={scaled_rew.max().item():.2e}")
 
             if name in ['tracking_contacts_shaped_force', 'tracking_contacts_shaped_vel']:
                 self.command_sums[name] += self.reward_scales[name] + scaled_rew
@@ -1233,13 +1256,13 @@ class LeggedRobot(BaseTask):
         self.root_states[env_ids, 7:13] = vel
 
         ########################### DEBUG CODE ############################
-        roll, pitch, _ = get_euler_xyz(self.root_states[env_ids, 3:7])
-        roll = torch.atan2(torch.sin(roll), torch.cos(roll))
-        pitch = torch.atan2(torch.sin(pitch), torch.cos(pitch))
-        print("RESET (recovery):")
-        print("roll mean:", roll.mean().item())
-        print("pitch mean:", pitch.mean().item())
-        print("height mean:", self.root_states[env_ids, 2].mean().item())
+        # roll, pitch, _ = get_euler_xyz(self.root_states[env_ids, 3:7])
+        # roll = torch.atan2(torch.sin(roll), torch.cos(roll))
+        # pitch = torch.atan2(torch.sin(pitch), torch.cos(pitch))
+        # print("RESET (recovery):")
+        # print("roll mean:", roll.mean().item())
+        # print("pitch mean:", pitch.mean().item())
+        # print("height mean:", self.root_states[env_ids, 2].mean().item())
         ###################################################################
 
         # 5. Push to sim
@@ -1251,6 +1274,20 @@ class LeggedRobot(BaseTask):
             gymtorch.unwrap_tensor(env_ids_int32),
             len(env_ids_int32)
         )
+
+        if cfg.env.record_video and 0 in env_ids:
+            if self.complete_video_frames is None:
+                self.complete_video_frames = []
+            else:
+                self.complete_video_frames = self.video_frames[:]
+            self.video_frames = []
+
+        if cfg.env.record_video and self.eval_cfg is not None and self.num_train_envs in env_ids:
+            if self.complete_video_frames_eval is None:
+                self.complete_video_frames_eval = []
+            else:
+                self.complete_video_frames_eval = self.video_frames_eval[:]
+            self.video_frames_eval = []
 
     def _reset_root_states(self, env_ids, cfg):
             """ Resets ROOT states position and velocities of selected environmments
@@ -1764,6 +1801,9 @@ class LeggedRobot(BaseTask):
         self.episode_sums["total"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device,
                                                  requires_grad=False)
         self.episode_sums["recovery_success"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+
+        self.recovered_flag = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
         self.episode_sums_eval = {
             name: -1 * torch.ones(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
             for name in self.reward_scales.keys()}
@@ -1982,6 +2022,10 @@ class LeggedRobot(BaseTask):
             self.camera_props.width = 360
             self.camera_props.height = 240
             self.rendering_camera = self.gym.create_camera_sensor(self.envs[0], self.camera_props)
+
+            if self.rendering_camera == -1:
+                raise RuntimeError("❌ Camera creation failed — EGL not working")
+
             self.gym.set_camera_location(self.rendering_camera, self.envs[0], gymapi.Vec3(1.5, 1, 3.0),
                                          gymapi.Vec3(0, 0, 0))
             if self.eval_cfg is not None:
@@ -2008,36 +2052,78 @@ class LeggedRobot(BaseTask):
         return img.reshape([w, h // 4, 4])
 
     def _render_headless(self):
-        if self.record_now and self.complete_video_frames is not None and len(self.complete_video_frames) == 0:
+        if self.record_now:
             bx, by, bz = self.root_states[0, 0], self.root_states[0, 1], self.root_states[0, 2]
-            self.gym.set_camera_location(self.rendering_camera, self.envs[0], gymapi.Vec3(bx, by - 1.0, bz + 1.0),
-                                         gymapi.Vec3(bx, by, bz))
-            self.video_frame = self.gym.get_camera_image(self.sim, self.envs[0], self.rendering_camera,
-                                                         gymapi.IMAGE_COLOR)
-            self.video_frame = self.video_frame.reshape((self.camera_props.height, self.camera_props.width, 4))
-            self.video_frames.append(self.video_frame)
 
-        if self.record_eval_now and self.complete_video_frames_eval is not None and len(
-                self.complete_video_frames_eval) == 0:
-            if self.eval_cfg is not None:
-                bx, by, bz = self.root_states[self.num_train_envs, 0], self.root_states[self.num_train_envs, 1], \
-                             self.root_states[self.num_train_envs, 2]
-                self.gym.set_camera_location(self.rendering_camera_eval, self.envs[self.num_train_envs],
-                                             gymapi.Vec3(bx, by - 1.0, bz + 1.0),
-                                             gymapi.Vec3(bx, by, bz))
-                self.video_frame_eval = self.gym.get_camera_image(self.sim, self.envs[self.num_train_envs],
-                                                                  self.rendering_camera_eval,
-                                                                  gymapi.IMAGE_COLOR)
-                self.video_frame_eval = self.video_frame_eval.reshape(
-                    (self.camera_props.height, self.camera_props.width, 4))
-                self.video_frames_eval.append(self.video_frame_eval)
+            self.gym.set_camera_location(
+                self.rendering_camera,
+                self.envs[0],
+                gymapi.Vec3(bx, by - 1.0, bz + 1.0),
+                gymapi.Vec3(bx, by, bz)
+            )
+
+            self.gym.step_graphics(self.sim)
+            self.gym.render_all_camera_sensors(self.sim)
+
+            img = self.gym.get_camera_image(
+                self.sim,
+                self.envs[0],
+                self.rendering_camera,
+                gymapi.IMAGE_COLOR
+            )
+
+            if img is None or img.size == 0:
+                return
+
+            frame = img.reshape(
+                (self.camera_props.height, self.camera_props.width, 4)
+            )
+            frame = frame[:, :, :3].astype(np.uint8)
+
+            if len(self.video_frames) < self.max_video_frames:
+                self.video_frames.append(frame)
+
+        # EVAL
+        if self.record_now and self.eval_cfg is not None:
+            bx, by, bz = self.root_states[self.num_train_envs, 0], self.root_states[self.num_train_envs, 1], \
+                         self.root_states[self.num_train_envs, 2]
+
+            self.gym.set_camera_location(
+                self.rendering_camera_eval,
+                self.envs[self.num_train_envs],
+                gymapi.Vec3(bx, by - 1.0, bz + 1.0),
+                gymapi.Vec3(bx, by, bz)
+            )
+
+            self.gym.step_graphics(self.sim)
+            self.gym.render_all_camera_sensors(self.sim)
+
+            img = self.gym.get_camera_image(
+                self.sim,
+                self.envs[self.num_train_envs],
+                self.rendering_camera_eval,
+                gymapi.IMAGE_COLOR
+            )
+
+            if img is None or img.size == 0:
+                return
+
+            frame = img.reshape(
+                (self.camera_props.height, self.camera_props.width, 4)
+            )
+            frame = frame[:, :, :3].astype(np.uint8)
+
+            if len(self.video_frames_eval) < self.max_video_frames:
+                self.video_frames_eval.append(frame)
 
     def start_recording(self):
-        self.complete_video_frames = None
+        # self.complete_video_frames = None
+        self.video_frames = []
         self.record_now = True
 
     def start_recording_eval(self):
-        self.complete_video_frames_eval = None
+        # self.complete_video_frames_eval = None
+        self.video_frames_eval = []
         self.record_eval_now = True
 
     def pause_recording(self):
@@ -2059,6 +2145,48 @@ class LeggedRobot(BaseTask):
         if self.complete_video_frames_eval is None:
             return []
         return self.complete_video_frames_eval
+
+    def stop_recording(self, tag="train", telegram_fn=None):
+        import cv2, imageio, os
+        from datetime import datetime
+
+        self.record_now = False
+
+        if len(self.video_frames) == 0:
+            print("[WARN] No frames recorded")
+            return
+
+        os.makedirs("runs/videos", exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        mp4_path = f"runs/videos/{tag}_{timestamp}.mp4"
+        gif_path = f"runs/videos/{tag}_{timestamp}.gif"
+
+        h, w, _ = self.video_frames[0].shape
+
+        writer = cv2.VideoWriter(
+            mp4_path,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            30,
+            (w, h),
+        )
+
+        for f in self.video_frames:
+            writer.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+
+        writer.release()
+
+        imageio.mimsave(gif_path, self.video_frames[::2], fps=15)
+
+        print(f"[Video Saved] {mp4_path}")
+
+        if telegram_fn:
+            try:
+                telegram_fn(gif_path, caption=tag)
+            except Exception as e:
+                print("[WARNING] Telegram failed:", e)
+
+        return mp4_path
 
     def _get_env_origins(self, env_ids, cfg):
         """ Sets environment origins. On rough terrain the origins are defined by the terrain platforms.

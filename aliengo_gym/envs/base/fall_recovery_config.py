@@ -13,10 +13,13 @@ class FallRecoveryConfig(BaseCfg):
     """
 
     class env(BaseCfg.env):
+        train_recovery = True
         num_observations = 42  # ang_vel(3) in base + observe_only_ang_vel adds 3 more + gravity(3) + dof_pos(12) + dof_vel(12) + actions(12)
         num_scalar_observations = 42
         episode_length_s = 15  # longer episodes to allow full recovery sequences (was 3 s)
         observe_only_ang_vel = True  # prepend ang_vel again for emphasis in recovery task (gives 45 obs total)
+
+        record_video = False
 
     class reward_scales(BaseCfg.reward_scales):
         # Recovery-priority rewards (significantly increased vs locomotion)

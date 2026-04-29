@@ -9,6 +9,8 @@ from params_proto import PrefixProto
 
 from .actor_critic import ActorCritic
 from .rollout_storage import RolloutStorage
+# from tracebot.send_telegram import send_gif
+# from send_telegram import send_gif
 
 
 def class_to_dict(obj) -> dict:
@@ -48,7 +50,7 @@ class RunnerArgs(PrefixProto, cli=False):
 
     # logging
     save_interval = 400  # check for potential saves every this many iterations
-    save_video_interval = 100
+    save_video_interval = 150
     log_freq = 10
 
     # load and resume
@@ -219,8 +221,8 @@ class Runner:
                 mean_adaptation_module_test_loss=mean_adaptation_module_test_loss
             )
 
-            if RunnerArgs.save_video_interval:
-                self.log_video(it)
+            # if RunnerArgs.save_video_interval:
+            #     self.log_video(it)
 
             self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
             if logger.every(RunnerArgs.log_freq, "iteration", start_on=1):
@@ -279,21 +281,36 @@ class Runner:
             self.env.start_recording()
             if self.env.num_eval_envs > 0:
                 self.env.start_recording_eval()
-            print("START RECORDING")
+            print("START RECORDING...")
             self.last_recording_it = it
 
-        frames = self.env.get_complete_frames()
-        if len(frames) > 0:
-            self.env.pause_recording()
-            print("LOGGING VIDEO")
-            logger.save_video(frames, f"videos/{it:05d}.mp4", fps=1 / self.env.dt)
+        # frames = self.env.get_complete_frames()
+        # if len(frames) > 0:
+        #     self.env.pause_recording()
+        #     print("LOGGING VIDEO")
+        #     logger.save_video(frames, f"videos/{it:05d}.mp4", fps=1 / self.env.dt)
+        #
+        # if self.env.record_now and len(self.env.video_frames) > 0:
+        # ---- Stop + save when enough frames collected ----
+        if self.env.record_now and len(self.env.video_frames) >= self.env.max_video_frames:
+            print("SAVING VIDEO...r)")
 
-        if self.env.num_eval_envs > 0:
-            frames = self.env.get_complete_frames_eval()
-            if len(frames) > 0:
-                self.env.pause_recording_eval()
-                print("LOGGING EVAL VIDEO")
-                logger.save_video(frames, f"videos/{it:05d}_eval.mp4", fps=1 / self.env.dt)
+            # self.env.stop_recording(
+            #     tag=f"iter_{it}",
+            #     telegram_fn=send_gif   # import this at top
+            # )
+
+            self.env.stop_recording(
+                tag=f"iter_{it}",
+                telegram_fn=None
+            )
+
+        # if self.env.num_eval_envs > 0:
+        #     frames = self.env.get_complete_frames_eval()
+        #     if len(frames) > 0:
+        #         self.env.pause_recording_eval()
+        #         print("LOGGING EVAL VIDEO")
+        #         logger.save_video(frames, f"videos/{it:05d}_eval.mp4", fps=1 / self.env.dt)
 
     def get_inference_policy(self, device=None):
         self.alg.actor_critic.eval()  # switch to evaluation mode (dropout for example)
