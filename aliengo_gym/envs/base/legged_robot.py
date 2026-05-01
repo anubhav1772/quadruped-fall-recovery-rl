@@ -52,7 +52,7 @@ class LeggedRobot(BaseTask):
 
         self._prepare_reward_function()
         self.init_done = True
-        self.record_now = False
+        self.record_now = self.cfg.env.record_now
         self.record_eval_now = False
         self.collecting_evaluation = False
         self.num_still_evaluating = 0
@@ -60,7 +60,7 @@ class LeggedRobot(BaseTask):
         self.debug_rewards = True
         self.debug_counter = 0
 
-        self.max_video_frames = 200
+        self.max_video_frames = 500
 
     def step(self, actions):
         """ Apply actions, simulate, call self.post_physics_step()
@@ -155,6 +155,10 @@ class LeggedRobot(BaseTask):
 
         self.check_recovery_success()
 
+        # if self.common_step_counter % 1000 == 0:
+        #     forces = self.contact_forces[:, self.base_contact_indices, :]
+        #     print("force mean:", torch.mean(torch.abs(forces[:, :, 2])).item())
+
         self.compute_observations()
 
         self.last_last_actions[:] = self.last_actions[:]
@@ -227,18 +231,44 @@ class LeggedRobot(BaseTask):
         (‖v‖ < 0.2 m/s). Only the first occurrence per episode is counted using
         a recovery flag to avoid multiple counts.
         """
+        # g_z = self.projected_gravity[:, 2]
+
+        # upright = g_z < -0.9
+        # stable_height = self.root_states[:, 2] > 0.25
+        # low_velocity = torch.norm(self.base_lin_vel, dim=1) < 0.2
+
+        # recovered = upright & stable_height & low_velocity
+
+        # new_recovery = recovered & (~self.recovered_flag)
+
+        # self.recovered_flag |= recovered
+        # self.episode_sums["recovery_success"] += new_recovery.float()
+
         g_z = self.projected_gravity[:, 2]
 
         upright = g_z < -0.9
-        stable_height = self.root_states[:, 2] > 0.25
-        low_velocity = torch.norm(self.base_lin_vel, dim=1) < 0.2
+        stable_height = self.root_states[:, 2] > 0.28
+        low_velocity = torch.norm(self.base_lin_vel, dim=1) < 0.1
+        low_ang_vel = torch.norm(self.base_ang_vel, dim=1) < 0.2
 
-        recovered = upright & stable_height & low_velocity
+        posture_error = torch.norm(
+            self.dof_pos - self.default_dof_pos, dim=1
+        )
+        good_posture = posture_error < 1.0
 
-        new_recovery = recovered & (~self.recovered_flag)
+        recovered = upright & stable_height & low_velocity & low_ang_vel & good_posture
 
-        self.recovered_flag |= recovered
+        # persistence
+        self.recovery_counter += recovered.float()
+        self.recovery_counter[~recovered] = 0
+
+        stable_recovery = self.recovery_counter > 20
+
+        new_recovery = stable_recovery & (~self.recovered_flag)
+
+        self.recovered_flag |= stable_recovery
         self.episode_sums["recovery_success"] += new_recovery.float()
+
 
     def reset_idx(self, env_ids):
         """ Reset some environments.
@@ -272,6 +302,7 @@ class LeggedRobot(BaseTask):
         # Commands
         if self.cfg.env.train_recovery:
             self.commands[env_ids] = 0.0
+            self.recovery_counter[env_ids] = 0.0
         else:
             self._resample_commands(env_ids)
 
@@ -1184,9 +1215,9 @@ class LeggedRobot(BaseTask):
         """
 
         if self.cfg.env.train_recovery:
-            self.dof_pos[env_ids] = self.default_dof_pos + 0.2 * torch.randn(len(env_ids), self.num_dof, device=self.device)
-            # self.dof_vel[env_ids] = 0.2 * torch.randn(len(env_ids), self.num_dof, device=self.device)
-            self.dof_vel[env_ids] = 0.
+            self.dof_pos[env_ids] = self.default_dof_pos + 0.5 * torch.randn(len(env_ids), self.num_dof, device=self.device)
+            self.dof_vel[env_ids] = 0.5 * torch.randn(len(env_ids), self.num_dof, device=self.device)
+            # self.dof_vel[env_ids] = 0.
         else:
             self.dof_pos[env_ids] = self.default_dof_pos * torch_rand_float(0.5, 1.5, (len(env_ids), self.num_dof),
                                                                             device=self.device)
@@ -1237,11 +1268,47 @@ class LeggedRobot(BaseTask):
         pitch[mask] = sign_pitch[mask] * min_pitch
 
         quat = quat_from_euler_xyz(roll, pitch, yaw)
+
+        gravity = self.gravity_vec[env_ids]
+        g = quat_rotate_inverse(quat, gravity)
+
+        # reject near-upright or semi-upright states
+        mask = g[:, 2] < -0.3
+
+        while mask.any():
+            idx = mask.nonzero(as_tuple=False).flatten()
+
+            # resample HARD orientations
+            roll[idx] = (torch.rand(len(idx), device=self.device) * 2 - 1) * torch.pi
+            pitch[idx] = (torch.rand(len(idx), device=self.device) * 2 - 1) * torch.pi
+
+            quat[idx] = quat_from_euler_xyz(roll[idx], pitch[idx], yaw[idx])
+            g[idx] = quat_rotate_inverse(
+                quat[idx],
+                gravity[idx]
+            )
+
+            # mask = g[:, 2] < -0.7
+            mask = g[:, 2] < -0.5 # rejection condition (no semi-standing states)
+
+        ###########
+
+        ############# DEBUG ################
+        g_z = g[:, 2]
+
+        sideways = ((g_z > -0.7) & (g_z < 0.3)).float().mean()
+        fallen   = (g_z > 0.3).float().mean()
+        upright  = (g_z < -0.7).float().mean()
+
+        print(f"[RESET DEBUG] upright {upright:.2f}, sideways {sideways:.2f}, fallen {fallen:.2f}")
+        ####################################
+
         self.root_states[env_ids, 3:7] = quat
 
         # 3. Height
-        base_height = 0.28   # sweet spot for Aliengo recovery
-        self.root_states[env_ids, 2] = base_height + 0.02 * torch.rand(num_resets, device=self.device)
+        # base_height = 0.28
+        # self.root_states[env_ids, 2] = base_height + 0.02 * torch.rand(num_resets, device=self.device)
+        self.root_states[env_ids, 2] = 0.18 + 0.10 * torch.rand(num_resets, device=self.device)
 
         # 4. Velocities
         vel = torch.zeros(num_resets, 6, device=self.device)
@@ -1251,7 +1318,11 @@ class LeggedRobot(BaseTask):
         vel[:, 2] = torch.clamp(vel[:, 2], -0.1, 0.0)
 
         # NO angular velocity
-        vel[:, 3:6] = 0.0
+        # vel[:, 3:6] = 0.0
+        vel[:, 3:6] = torch.clamp(
+            1.0 * torch.randn(num_resets, 3, device=self.device),
+            -2.0, 2.0
+        )
 
         self.root_states[env_ids, 7:13] = vel
 
@@ -1275,6 +1346,20 @@ class LeggedRobot(BaseTask):
             len(env_ids_int32)
         )
 
+        # zero torques
+        zero_torques = torch.zeros_like(self.torques)
+
+        for _ in range(5):   # 5–10 steps
+            self.gym.set_dof_actuation_force_tensor(
+                self.sim, gymtorch.unwrap_tensor(zero_torques)
+            )
+            self.gym.simulate(self.sim)
+            self.gym.fetch_results(self.sim, True)
+
+        # refresh after settling
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+        self.gym.refresh_dof_state_tensor(self.sim)
+
         if cfg.env.record_video and 0 in env_ids:
             if self.complete_video_frames is None:
                 self.complete_video_frames = []
@@ -1288,6 +1373,37 @@ class LeggedRobot(BaseTask):
             else:
                 self.complete_video_frames_eval = self.video_frames_eval[:]
             self.video_frames_eval = []
+
+    def _reset_root_states_disturbance(self, env_ids, cfg):
+        num_resets = len(env_ids)
+
+        # start upright
+        self.root_states[env_ids, 0:2] = self.env_origins[env_ids, 0:2]
+        self.root_states[env_ids, 2] = 0.30  # nominal height
+
+        # upright orientation
+        quat = torch.tensor([0, 0, 0, 1], device=self.device).repeat(num_resets, 1)
+        self.root_states[env_ids, 3:7] = quat
+
+        # Adding disturbances
+        # linear velocity
+        self.root_states[env_ids, 7:10] = 0.5 * torch.randn(num_resets, 3, device=self.device)
+
+        # angular velocity (important!)
+        self.root_states[env_ids, 10:13] = torch.clamp(
+            1.0 * torch.randn(num_resets, 3, device=self.device),
+            -2.0, 2.0
+        )
+
+        # push to sim
+        env_ids_int32 = env_ids.to(dtype=torch.int32)
+
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.root_states),
+            gymtorch.unwrap_tensor(env_ids_int32),
+            len(env_ids_int32)
+        )
 
     def _reset_root_states(self, env_ids, cfg):
             """ Resets ROOT states position and velocities of selected environmments
@@ -1506,6 +1622,9 @@ class LeggedRobot(BaseTask):
 
         self.contact_forces = gymtorch.wrap_tensor(net_contact_forces)[:self.num_envs * self.num_bodies, :].view(self.num_envs, -1,
                                                                             3)  # shape: num_envs, num_bodies, xyz axis
+
+        if self.cfg.env.train_recovery:
+            self.recovery_counter = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
 
         # initialize some data used later on
         self.common_step_counter = 0
@@ -2021,6 +2140,7 @@ class LeggedRobot(BaseTask):
             self.camera_props = gymapi.CameraProperties()
             self.camera_props.width = 360
             self.camera_props.height = 240
+            self.camera_props.enable_tensors = False # True (on gcp headless) #False (local)
             self.rendering_camera = self.gym.create_camera_sensor(self.envs[0], self.camera_props)
 
             if self.rendering_camera == -1:
@@ -2039,6 +2159,16 @@ class LeggedRobot(BaseTask):
         self.video_frames_eval = []
         self.complete_video_frames = []
         self.complete_video_frames_eval = []
+
+        #############
+        all_bodies = torch.arange(self.num_bodies, device=self.device)
+        feet = torch.tensor(self.feet_indices, device=self.device)
+
+        mask = torch.ones_like(all_bodies, dtype=torch.bool)
+        mask[feet] = False
+
+        self.base_contact_indices = all_bodies[mask]
+        ############
 
     def render(self, mode="rgb_array"):
         assert mode == "rgb_array"
