@@ -90,14 +90,30 @@ class CoRLRewards:
         diff = diff * (self.env.last_last_actions[:, :self.env.num_dof] != 0)  # ignore second step
         return torch.sum(diff, dim=1)
 
+    # def _reward_ang_vel_limit(self):
+    #     '''Penalizes joint velocities exceeding a predefined threshold.
+    #     '''
+    #     return torch.sum(torch.clamp(torch.abs(self.env.dof_vel) - 0.8, min=0.0), dim=1)
+
     def _reward_ang_vel_limit(self):
-        '''Penalizes joint velocities exceeding a predefined threshold.
-        '''
-        return torch.sum(torch.clamp(torch.abs(self.env.dof_vel) - 0.8, min=0.0), dim=1)
+        """penalizes fast motion only after recovery.
+        """
+        penalty = torch.sum(
+            torch.clamp(torch.abs(self.env.dof_vel) - 0.8, min=0.0),
+            dim=1
+        )
+
+        g_z = self.env.projected_gravity[:, 2]
+        upright = (g_z < -0.7).float()
+
+        return penalty * upright
 
     #############################################################
     ################ STABILITY AND CONFIGURATION ################
     #############################################################
+
+    def _reward_asymmetry(self):
+        return torch.std(self.env.dof_pos[:, :self.env.num_actuated_dof], dim=1)
 
     def _reward_feet_on_ground(self):
         '''Rewards maintaining foot contacts with the ground for stability.
@@ -108,25 +124,22 @@ class CoRLRewards:
         return torch.sum(contacts, dim=1)
 
     def _reward_posture(self):
-        '''Rewards tracking a desired standing joint configuration.
-        Activates across all orientations with a stability-based weighting:
-        provides partial guidance when tilted (recovery phase) and full
-        guidance when upright (maintenance phase). This is critical for
-        fall recovery: the robot gets reward for moving toward the standing
-        joint configuration even before it achieves upright orientation.
-        '''
+        """Counts successful fall-recovery events per episode.
+        A recovery is detected when the robot is upright
+        (projected gravity z < -0.9), reaches a stable height
+        (base height > 0.25 m), and has low linear velocity
+        (‖v‖ < 0.2 m/s). Only the first occurrence per episode
+        is counted using a recovery flag to avoid multiple counts.
+        """
         q = self.env.dof_pos[:, :self.env.num_actuated_dof]
         q_stand = self.env.default_dof_pos[:, :self.env.num_actuated_dof]
         posture_error = torch.sum((q - q_stand)**2, dim=1)
         r_posture = torch.exp(-posture_error)
-
         g_z = self.env.projected_gravity[:, 2]
 
-        # Stability factor: 0 when fully tilted (g_z = 0), 1 when fully upright (g_z = -1)
-        # 0.5 when flat, 1.0 when upright
-        stability_factor = torch.clamp(-(g_z + 0.0) / 1.0, 0.0, 1.0)
-        # Active during recovery (0.5 wight) + enhanced when upright (up to 1.0 weight)
-        return r_posture * (0.5 + 0.5 * stability_factor)
+        # Only reward posture when upright
+        upright = (g_z < -0.9).float()
+        return r_posture * upright
 
     def _reward_base_height(self):
         '''Rewards maintaining the target base height above ground.
@@ -145,12 +158,17 @@ class CoRLRewards:
     ########################## SAFETY ###########################
     #############################################################
 
+    # def _reward_base_contact(self):
+    #     '''Penalizes contact between the robot base and the ground.
+    #     '''
+    #     forces = self.env.contact_forces[:, self.env.termination_contact_indices, :]  # (N, K, 3)
+    #     force_norm = torch.norm(forces, dim=-1)  # (N, K)
+    #     return (force_norm > 1.0).any(dim=1).float()  # if ANY base body touches
+
     def _reward_base_contact(self):
-        '''Penalizes contact between the robot base and the ground.
-        '''
-        forces = self.env.contact_forces[:, self.env.termination_contact_indices, :]  # (N, K, 3)
-        force_norm = torch.norm(forces, dim=-1)  # (N, K)
-        return (force_norm > 1.0).any(dim=1).float()  # if ANY base body touches
+        forces = self.env.contact_forces[:, self.env.base_contact_indices, :]
+        force_norm = torch.norm(forces, dim=-1)
+        return (force_norm > 0.2).any(dim=1).float()
 
     def _reward_dof_pos_limits(self):
         '''Penalizes joint positions exceeding their allowable limits.
