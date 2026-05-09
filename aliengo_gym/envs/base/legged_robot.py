@@ -13,7 +13,8 @@ from aliengo_gym import MINI_GYM_ROOT_DIR
 from aliengo_gym.envs.base.base_task import BaseTask
 from aliengo_gym.utils.math_utils import quat_apply_yaw, wrap_to_pi, get_scale_shift
 from aliengo_gym.utils.terrain import Terrain
-from .legged_robot_config import BaseCfg as Cfg
+# from .legged_robot_config import BaseCfg as Cfg
+from .fall_recovery_config import FallRecoveryConfig as Cfg
 
 
 class LeggedRobot(BaseTask):
@@ -584,33 +585,84 @@ class LeggedRobot(BaseTask):
                                                       (self.payloads.unsqueeze(1) - payloads_shift) * payloads_scale),
                                                      dim=1)
 
-        # if self.cfg.env.priv_observe_link_masses:
-        #     # [N, 4] output: [base_payload_norm, hip_norm, thigh_norm, calf_norm]
-        #     mass_groups_norm = torch.zeros(self.num_envs, 4, device=self.device, dtype=torch.float)
-        #
-        #     # 0) base/trunk as PAYLOAD (same behavior as old priv_observe_base_mass)
-        #     payload_scale, payload_shift = get_scale_shift(self.cfg.normalization.added_mass_range)
-        #     mass_groups_norm[:, 0] = (self.payloads - payload_shift) * payload_scale
-        #
-        #     # 1..3) hip/thigh/calf as mass DELTAS wrt defaults
-        #     # self.mass_groups[:,1:] should contain current [hip, thigh, calf] group masses
-        #     # self.mass_groups_default[1:] should contain nominal/default masses
-        #     link_mass_deltas = self.mass_groups[:, 1:] - self.mass_groups_default[1:].unsqueeze(0)
-        #
-        #     # per-dim ranges, e.g. [[hip_min, hip_max], [thigh_min, thigh_max], [calf_min, calf_max]]
-        #     # cfg.normalization.link_mass_delta_ranges shape [3,2]
-        #     lm_ranges = torch.tensor(self.cfg.normalization.link_mass_delta_ranges,
-        #                              device=self.device, dtype=torch.float)  # [3,2]
-        #     lm_min = lm_ranges[:, 0]  # [3]
-        #     lm_max = lm_ranges[:, 1]  # [3]
-        #
-        #     # scale to roughly [-1, 1]
-        #     lm_shift = 0.5 * (lm_max + lm_min)          # [3]
-        #     lm_scale = 2.0 / (lm_max - lm_min + 1e-8)   # [3]
-        #     mass_groups_norm[:, 1:] = (link_mass_deltas - lm_shift) * lm_scale
-        #
-        #     self.privileged_obs_buf = torch.cat((self.privileged_obs_buf, mass_groups_norm), dim=1)
-        #     self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf, mass_groups_norm), dim=1)
+        if self.cfg.env.priv_observe_link_masses:
+
+            # [N, 4]
+            # [trunk_mass_norm, hip_mass_norm, thigh_mass_norm, calf_mass_norm]
+            mass_groups_norm = torch.zeros(
+                self.num_envs,
+                4,
+                device=self.device,
+                dtype=torch.float
+            )
+
+            # 0) TRUNK / BASE MASS
+            # Current absolute trunk mass
+            trunk_mass = self.mass_groups[:, 0]
+
+            trunk_range = torch.tensor(
+                self.cfg.normalization.trunk_mass_range,
+                device=self.device,
+                dtype=torch.float
+            )
+
+            trunk_min = trunk_range[0]
+            trunk_max = trunk_range[1]
+
+            trunk_shift = 0.5 * (trunk_max + trunk_min)
+            trunk_scale = 2.0 / (trunk_max - trunk_min + 1e-8)
+
+            mass_groups_norm[:, 0] = (
+                trunk_mass - trunk_shift
+            ) * trunk_scale
+
+            # 1..3) HIP / THIGH / CALF
+            # Use ABSOLUTE masses
+            link_masses = self.mass_groups[:, 1:]   # [N, 3]
+
+            # [[hip_min, hip_max],
+            # [thigh_min, thigh_max],
+            # [calf_min, calf_max]]
+            lm_ranges = torch.tensor(
+                self.cfg.normalization.link_mass_ranges,
+                device=self.device,
+                dtype=torch.float
+            )
+
+            lm_min = lm_ranges[:, 0]
+            lm_max = lm_ranges[:, 1]
+
+            lm_shift = 0.5 * (lm_max + lm_min)
+            lm_scale = 2.0 / (lm_max - lm_min + 1e-8)
+
+            mass_groups_norm[:, 1:] = (
+                link_masses - lm_shift
+            ) * lm_scale
+
+            # DEBUG
+            # if self.common_step_counter % 100 == 0:
+
+            #     print("\n===== LINK MASS DEBUG =====")
+
+            #     for env_id in range(min(5, self.num_envs)):
+
+            #         print(f"\nENV {env_id}")
+
+            #         print("Current groups:")
+            #         print(self.mass_groups[env_id])
+
+            #         print("Normalized:")
+            #         print(mass_groups_norm[env_id])
+
+            self.privileged_obs_buf = torch.cat(
+                (self.privileged_obs_buf, mass_groups_norm),
+                dim=1
+            )
+
+            self.next_privileged_obs_buf = torch.cat(
+                (self.next_privileged_obs_buf, mass_groups_norm),
+                dim=1
+            )
 
         if self.cfg.env.priv_observe_com_displacement:
             com_displacements_scale, com_displacements_shift = get_scale_shift(
@@ -866,6 +918,33 @@ class LeggedRobot(BaseTask):
             # self.payloads[env_ids] = -1.0
             self.payloads[env_ids] = torch.rand(len(env_ids), dtype=torch.float, device=self.device,
                                                 requires_grad=False) * (max_payload - min_payload) + min_payload
+
+        if cfg.domain_rand.randomize_link_masses:
+
+            self.hip_masses[env_ids] = torch.rand(
+                len(env_ids),
+                device=self.device
+            ) * (
+                cfg.domain_rand.hip_mass_range[1]
+                - cfg.domain_rand.hip_mass_range[0]
+            ) + cfg.domain_rand.hip_mass_range[0]
+
+            self.thigh_masses[env_ids] = torch.rand(
+                len(env_ids),
+                device=self.device
+            ) * (
+                cfg.domain_rand.thigh_mass_range[1]
+                - cfg.domain_rand.thigh_mass_range[0]
+            ) + cfg.domain_rand.thigh_mass_range[0]
+
+            self.calf_masses[env_ids] = torch.rand(
+                len(env_ids),
+                device=self.device
+            ) * (
+                cfg.domain_rand.calf_mass_range[1]
+                - cfg.domain_rand.calf_mass_range[0]
+            ) + cfg.domain_rand.calf_mass_range[0]
+
         if cfg.domain_rand.randomize_com_displacement:
             min_com_displacement, max_com_displacement = cfg.domain_rand.com_displacement_range
             self.com_displacements[env_ids, :] = torch.rand(len(env_ids), 3, dtype=torch.float, device=self.device,
@@ -916,16 +995,107 @@ class LeggedRobot(BaseTask):
                                                      requires_grad=False).unsqueeze(1) * (
                                                   max_Kd_factor - min_Kd_factor) + min_Kd_factor
 
-    def _process_rigid_body_props(self, props, env_id):
-        self.default_body_mass = props[0].mass
+    # def _process_rigid_body_props(self, props, env_id):
+    #     self.default_body_mass = props[0].mass
 
+    #     props[0].mass = self.default_body_mass + self.payloads[env_id]
+    #     props[0].com = gymapi.Vec3(self.com_displacements[env_id, 0], self.com_displacements[env_id, 1],
+    #                                self.com_displacements[env_id, 2])
+    #     # Use per-env rigid body masses for CoM privileged feature
+    #     self.rigid_body_masses[env_id] = torch.tensor([prop.mass for prop in props], dtype=torch.float,
+    #                                                   device=self.device)
+    #     return props
+
+    def _process_rigid_body_props(self, props, env_id):
+
+        # Store nominal/default masses ONCE
+        if env_id == 0:
+
+            print(f"Body Names: {self.body_names}")
+
+            self.default_body_mass = props[0].mass
+
+            self.default_rigid_body_masses = torch.tensor(
+                [p.mass for p in props],
+                device=self.device,
+                dtype=torch.float
+            )
+
+        # Base mass randomization
         props[0].mass = self.default_body_mass + self.payloads[env_id]
-        props[0].com = gymapi.Vec3(self.com_displacements[env_id, 0], self.com_displacements[env_id, 1],
-                                   self.com_displacements[env_id, 2])
-        # Use per-env rigid body masses for CoM privileged feature
-        self.rigid_body_masses[env_id] = torch.tensor([prop.mass for prop in props], dtype=torch.float,
-                                                      device=self.device)
+
+        # COM randomization
+        props[0].com = gymapi.Vec3(
+            self.com_displacements[env_id, 0],
+            self.com_displacements[env_id, 1],
+            self.com_displacements[env_id, 2]
+        )
+
+        # Link mass randomization
+        if self.cfg.domain_rand.randomize_link_masses:
+
+            hip_mass = self.hip_masses[env_id]
+            thigh_mass = self.thigh_masses[env_id]
+            calf_mass = self.calf_masses[env_id]
+
+            for i, p in enumerate(props):
+
+                body_name = self.body_names[i].lower()
+
+                if "hip" in body_name:
+                    p.mass = hip_mass.item()
+
+                elif "thigh" in body_name:
+                    p.mass = thigh_mass.item()
+
+                elif "calf" in body_name:
+                    p.mass = calf_mass.item()
+
+        # Store current rigid body masses
+        self.rigid_body_masses[env_id] = torch.tensor(
+            [p.mass for p in props],
+            device=self.device,
+            dtype=torch.float
+        )
+
+        # Compute grouped masses
+        m_body, m_hip, m_thigh, m_calf = \
+            self._compute_mass_groups_from_body_props(props)
+
+        self.mass_groups[env_id, 0] = m_body
+        self.mass_groups[env_id, 1] = m_hip
+        self.mass_groups[env_id, 2] = m_thigh
+        self.mass_groups[env_id, 3] = m_calf
+
+        # Store default grouped masses ONCE
+        if env_id == 0:
+
+            self.mass_groups_default[0] = m_body
+            self.mass_groups_default[1] = m_hip
+            self.mass_groups_default[2] = m_thigh
+            self.mass_groups_default[3] = m_calf
+
+            print("\n===== DEFAULT MASS GROUPS =====")
+            print(self.mass_groups_default)
+
+        # DEBUG
+        # print(f"\n===== ENV {env_id} =====")
+        # print("Payload:", self.payloads[env_id].item())
+        # print("Hip delta  :", self.hip_masses[env_id].item())
+        # print("Thigh delta:", self.thigh_masses[env_id].item())
+        # print("Calf delta :", self.calf_masses[env_id].item())
+        #
+        # print("\nCurrent grouped masses:")
+        # print(self.mass_groups[env_id])
+        #
+        # print("\nDefault grouped masses:")
+        # print(self.mass_groups_default)
+        #
+        # print("\nActual grouped deltas:")
+        # print(self.mass_groups[env_id] - self.mass_groups_default)
+
         return props
+
 
     def _post_physics_step_callback(self):
         """ Callback called before computing terminations, rewards, and observations
@@ -1758,6 +1928,12 @@ class LeggedRobot(BaseTask):
                                                                   requires_grad=False)
         self.payloads = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
 
+        # link mass randomization deltas
+        self.hip_masses = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+
+        self.thigh_masses = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+
+        self.calf_masses = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
 
         self.mass_groups = torch.zeros(self.num_envs, 4, dtype=torch.float, device=self.device, requires_grad=False)
         # defaults for normalization/reference
@@ -2035,30 +2211,30 @@ class LeggedRobot(BaseTask):
         rigid_shape_props_asset = self.gym.get_asset_rigid_shape_properties(self.robot_asset)
 
         # save body names from the asset
-        body_names = self.gym.get_asset_rigid_body_names(self.robot_asset)
+        self.body_names = self.gym.get_asset_rigid_body_names(self.robot_asset)
         self.dof_names = self.gym.get_asset_dof_names(self.robot_asset)
-        self.num_bodies = len(body_names)
+        self.num_bodies = len(self.body_names)
         self.num_dofs = len(self.dof_names)
-        self.feet_names = [s for s in body_names if self.cfg.asset.foot_name in s]
+        self.feet_names = [s for s in self.body_names if self.cfg.asset.foot_name in s]
 
         # asset_body_props = self.gym.get_asset_rigid_body_properties(self.robot_asset)
         # self.body_masses = torch.tensor([prop.mass for prop in asset_body_props], device=self.device, dtype=torch.float)
 
         self.mass_group_indices = {
-            "body":  [i for i, n in enumerate(body_names) if ("trunk" in n or n == "base")],
-            "hip":   [i for i, n in enumerate(body_names) if ("_hip" in n)],
-            "thigh": [i for i, n in enumerate(body_names) if ("_thigh" in n)],
-            "calf":  [i for i, n in enumerate(body_names) if ("_calf" in n)],
+            "body":  [i for i, n in enumerate(self.body_names) if ("trunk" in n or n == "base")],
+            "hip":   [i for i, n in enumerate(self.body_names) if ("_hip" in n)],
+            "thigh": [i for i, n in enumerate(self.body_names) if ("_thigh" in n)],
+            "calf":  [i for i, n in enumerate(self.body_names) if ("_calf" in n)],
         }
         print("mass_group_indices:", {k: len(v) for k, v in self.mass_group_indices.items()})
 
 
         penalized_contact_names = []
         for name in self.cfg.asset.penalize_contacts_on:
-            penalized_contact_names.extend([s for s in body_names if name in s])
+            penalized_contact_names.extend([s for s in self.body_names if name in s])
         termination_contact_names = []
         for name in self.cfg.asset.terminate_after_contacts_on:
-            termination_contact_names.extend([s for s in body_names if name in s])
+            termination_contact_names.extend([s for s in self.body_names if name in s])
 
         base_init_state_list = self.cfg.init_state.pos + self.cfg.init_state.rot + self.cfg.init_state.lin_vel + self.cfg.init_state.ang_vel
         self.base_init_state = to_torch(base_init_state_list, device=self.device, requires_grad=False)
@@ -2107,11 +2283,13 @@ class LeggedRobot(BaseTask):
             # self.mass_groups[i, 2] = sum/mean masses for thighs
             # self.mass_groups[i, 3] = sum/mean masses for calves
 
-            m_body, m_hip, m_thigh, m_calf = self._compute_mass_groups_from_body_props(body_props)
-            self.mass_groups[i, 0] = m_body
-            self.mass_groups[i, 1] = m_hip
-            self.mass_groups[i, 2] = m_thigh
-            self.mass_groups[i, 3] = m_calf
+            # m_body, m_hip, m_thigh, m_calf = self._compute_mass_groups_from_body_props(body_props)
+            # self.mass_groups[i, 0] = m_body
+            # self.mass_groups[i, 1] = m_hip
+            # self.mass_groups[i, 2] = m_thigh
+            # self.mass_groups[i, 3] = m_calf
+
+            # print(f"Link Masses: {self.mass_groups}")
 
             self.gym.set_actor_rigid_body_properties(env_handle, anymal_handle, body_props, recomputeInertia=True)
             self.envs.append(env_handle)
