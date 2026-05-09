@@ -74,9 +74,9 @@ class BaseCfg(PrefixProto, cli=False):
         num_scalar_observations = 42
         # if not None a privilige_obs_buf will be returned by step() (critic obs for assymetric training). None is returned otherwise
         # Default privileged layout with current flags:
-        # friction(1) + restitution(1) + com_displacement(3) + Kp(12) + Kd(12) + foot_forces(12) + foot_contact_states(4)
-        # com_position(3)
-        num_privileged_obs = 45
+        # com_displacement(3) + Kp(12) + Kd(12) + foot_forces(12) + foot_contact_states(4)
+        # com_position(3) + link masses (4)
+        num_privileged_obs = 48
         privileged_future_horizon = 1
         observe_gaits = False
         num_actions = 12
@@ -119,7 +119,7 @@ class BaseCfg(PrefixProto, cli=False):
         priv_observe_friction_indep = False
         priv_observe_ground_friction = False
         priv_observe_ground_friction_per_foot = False
-        priv_observe_base_mass = True
+        priv_observe_base_mass = False
         priv_observe_link_masses = False
         priv_observe_motor_strength = False
         priv_observe_motor_offset = False
@@ -392,8 +392,8 @@ class BaseCfg(PrefixProto, cli=False):
         hop_symmetry = 0.0
 
     class normalization(PrefixProto, cli=False):
-        clip_observations = 5#100.
-        clip_actions = 1.0 #10.
+        clip_observations = 100. #5
+        clip_actions = 10.       #1
 
         friction_range = [0, 1.0]
         ground_friction_range = [1, 1.0]
