@@ -49,8 +49,8 @@ class RunnerArgs(PrefixProto, cli=False):
     max_iterations = 1500  # number of policy updates
 
     # logging
-    save_interval = 400  # check for potential saves every this many iterations
-    save_video_interval = 400
+    save_interval = 300  # check for potential saves every this many iterations
+    save_video_interval = 300
     log_freq = 10
 
     # load and resume
@@ -142,10 +142,15 @@ class Runner:
                     actions_train = self.alg.act(obs[:num_train_envs], privileged_obs[:num_train_envs],
                                                  obs_history[:num_train_envs])
                     if eval_expert:
-                        actions_eval = self.alg.actor_critic.act_teacher(obs_history[num_train_envs:],
+                        # actions_eval = self.alg.actor_critic.act_teacher(obs_history[num_train_envs:],
+                        #                                                  privileged_obs[num_train_envs:])
+                        actions_eval = self.alg.actor_critic.act_teacher(obs[num_train_envs:],
                                                                          privileged_obs[num_train_envs:])
+
                     else:
-                        actions_eval = self.alg.actor_critic.act_student(obs_history[num_train_envs:])
+                        # actions_eval = self.alg.actor_critic.act_student(obs_history[num_train_envs:])
+                        actions_eval = self.alg.actor_critic.act_student(obs[num_train_envs:],
+                                                                        obs_history[num_train_envs:])
                     ret = self.env.step(torch.cat((actions_train, actions_eval), dim=0))
                     obs_dict, rewards, dones, infos = ret
                     obs, privileged_obs, obs_history = obs_dict["obs"], obs_dict["privileged_obs"], obs_dict[
@@ -190,7 +195,8 @@ class Runner:
 
                 # Learning step
                 start = stop
-                self.alg.compute_returns(obs_history[:num_train_envs], privileged_obs[:num_train_envs])
+                # self.alg.compute_returns(obs_history[:num_train_envs], privileged_obs[:num_train_envs])
+                self.alg.compute_returns(obs[:num_train_envs], privileged_obs[:num_train_envs])
 
                 if it % curriculum_dump_freq == 0:
                     logger.save_pkl({"iteration": it,
@@ -203,7 +209,7 @@ class Runner:
                                          "distribution": distribution},
                                          path=f"curriculum/distribution.pkl", append=True)
 
-            mean_value_loss, mean_surrogate_loss, mean_adaptation_module_loss, mean_decoder_loss, mean_decoder_loss_student, mean_adaptation_module_test_loss, mean_decoder_test_loss, mean_decoder_test_loss_student = self.alg.update()
+            mean_value_loss, mean_surrogate_loss, mean_adaptation_module_loss, mean_mass_mse, mean_decoder_loss, mean_decoder_loss_student, mean_adaptation_module_test_loss, mean_decoder_test_loss, mean_decoder_test_loss_student = self.alg.update()
             stop = time.time()
             learn_time = stop - start
 
@@ -212,6 +218,7 @@ class Runner:
                 time_elapsed=logger.since('start'),
                 time_iter=logger.split('epoch'),
                 adaptation_loss=mean_adaptation_module_loss,
+                mean_mass_loss = mean_mass_mse,
                 mean_value_loss=mean_value_loss,
                 mean_surrogate_loss=mean_surrogate_loss,
                 mean_decoder_loss=mean_decoder_loss,
