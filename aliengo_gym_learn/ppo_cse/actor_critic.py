@@ -12,7 +12,7 @@ class AC_Args(PrefixProto, cli=False):
     activation = 'elu'  # can be elu, relu, selu, crelu, lrelu, tanh, sigmoid
 
     adaptation_module_branch_hidden_dims = [256, 128]
-    estimator_mass_dim = 0 #4
+    estimator_mass_dim = 4 # (base/trunk, hip, thigh, calf)
 
     use_decoder = False
 
@@ -63,6 +63,7 @@ class ActorCritic(nn.Module):
         self.decoder = AC_Args.use_decoder
         super().__init__()
 
+        self.num_obs = num_obs
         self.num_obs_history = num_obs_history
         self.num_privileged_obs = num_privileged_obs
 
@@ -84,6 +85,7 @@ class ActorCritic(nn.Module):
         # self.adaptation_module = nn.Sequential(*adaptation_module_layers)
 
         self.estimator_mass_dim = min(max(AC_Args.estimator_mass_dim, 0), self.num_privileged_obs)
+        # Input of EE is obs_history
         self.adaptation_module = EstimatorEncoder(
             input_dim=self.num_obs_history,
             hidden_dims=AC_Args.adaptation_module_branch_hidden_dims,
@@ -94,7 +96,7 @@ class ActorCritic(nn.Module):
 
         # Policy
         actor_layers = []
-        actor_layers.append(nn.Linear(self.num_privileged_obs + self.num_obs_history, AC_Args.actor_hidden_dims[0]))
+        actor_layers.append(nn.Linear(self.num_obs + self.num_privileged_obs, AC_Args.actor_hidden_dims[0]))
         actor_layers.append(activation)
         for l in range(len(AC_Args.actor_hidden_dims)):
             if l == len(AC_Args.actor_hidden_dims) - 1:
@@ -106,7 +108,7 @@ class ActorCritic(nn.Module):
 
         # Value function
         critic_layers = []
-        critic_layers.append(nn.Linear(self.num_privileged_obs + self.num_obs_history, AC_Args.critic_hidden_dims[0]))
+        critic_layers.append(nn.Linear(self.num_obs + self.num_privileged_obs, AC_Args.critic_hidden_dims[0]))
         critic_layers.append(activation)
         for l in range(len(AC_Args.critic_hidden_dims)):
             if l == len(AC_Args.critic_hidden_dims) - 1:
@@ -150,40 +152,52 @@ class ActorCritic(nn.Module):
     def entropy(self):
         return self.distribution.entropy().sum(dim=-1)
 
-    def update_distribution(self, observation_history):
-        latent = self.adaptation_module(observation_history)
-        mean = self.actor_body(torch.cat((observation_history, latent), dim=-1))
+    def update_distribution(self, obs, observation_history):
+        # Estimator Encoder output (concatenated predicted link masses and latent vector)
+        ee_output = self.adaptation_module(observation_history)
+        mean = self.actor_body(torch.cat((obs, ee_output), dim=-1))
         self.distribution = Normal(mean, mean * 0. + self.std)
 
-    def act(self, observation_history, **kwargs):
-        self.update_distribution(observation_history)
+    def act(self, obs, observation_history, **kwargs):
+        self.update_distribution(obs, observation_history)
         return self.distribution.sample()
 
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
     def act_expert(self, ob, policy_info={}):
-        return self.act_teacher(ob["obs_history"], ob["privileged_obs"])
+        return self.act_teacher(
+            ob["obs"],
+            ob["privileged_obs"],
+            policy_info=policy_info
+        )
 
     def act_inference(self, ob, policy_info={}):
-        return self.act_student(ob["obs_history"], policy_info=policy_info)
+        return self.act_student(
+            ob["obs"],
+            ob["obs_history"],
+            policy_info=policy_info
+        )
 
-    def act_student(self, observation_history, policy_info={}):
-        latent = self.adaptation_module(observation_history)
-        actions_mean = self.actor_body(torch.cat((observation_history, latent), dim=-1))
-        policy_info["latents"] = latent.detach().cpu().numpy()
+    def act_student(self, obs, observation_history, policy_info={}):
+        ee_output = self.adaptation_module(observation_history)
+        actor_input = torch.cat((obs, ee_output), dim=-1)
+        actions_mean = self.actor_body(actor_input)
+        policy_info["ee_output"] = ee_output.detach().cpu().numpy()
         return actions_mean
 
-    def act_teacher(self, observation_history, privileged_info, policy_info={}):
-        actions_mean = self.actor_body(torch.cat((observation_history, privileged_info), dim=-1))
-        policy_info["latents"] = privileged_info
+    def act_teacher(self, obs, privileged_info, policy_info={}):
+        actor_input = torch.cat((obs, privileged_info), dim=-1)
+        actions_mean = self.actor_body(actor_input)
+        policy_info["ee_output"] = privileged_info
         return actions_mean
 
-    def evaluate(self, observation_history, privileged_observations, **kwargs):
-        value = self.critic_body(torch.cat((observation_history, privileged_observations), dim=-1))
+    def evaluate(self, obs, privileged_observations, **kwargs):
+        critic_input = torch.cat((obs, privileged_observations), dim=-1)
+        value = self.critic_body(critic_input)
         return value
 
-    def get_student_latent(self, observation_history):
+    def get_student_estimator_output(self, observation_history):
         return self.adaptation_module(observation_history)
 
     def get_estimator_outputs(self, observation_history):
