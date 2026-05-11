@@ -76,7 +76,8 @@ class BaseCfg(PrefixProto, cli=False):
         # Default privileged layout with current flags:
         # com_displacement(3) + Kp(12) + Kd(12) + foot_forces(12) + foot_contact_states(4)
         # com_position(3) + link masses (4)
-        num_privileged_obs = 48
+        # CORRECTION - Kp (1), kd(1) => same for all joints
+        num_privileged_obs = 26
         privileged_future_horizon = 1
         observe_gaits = False
         num_actions = 12
@@ -107,13 +108,13 @@ class BaseCfg(PrefixProto, cli=False):
         all_agents_share = False
 
         priv_observe_friction = True
-        priv_observe_com_position = True
-        priv_observe_com_displacement = False
+        priv_observe_com_position = False       # actual instantaneous COM position
+        priv_observe_com_displacement = False   # randomized COM offset
         # priv_observe_foot_contact_states = True
-        priv_observe_Kp_factor = True
-        priv_observe_Kd_factor = True
-        priv_observe_contact_forces = True
-        priv_observe_contact_states = True
+        priv_observe_Kp_factor = False
+        priv_observe_Kd_factor = False
+        priv_observe_contact_forces = False
+        priv_observe_contact_states = False
         priv_observe_heightmap = False #True
         priv_observe_restitution = False
         priv_observe_friction_indep = False
