@@ -61,7 +61,7 @@ class LeggedRobot(BaseTask):
         self.debug_rewards = True
         self.debug_counter = 0
 
-        self.max_video_frames = 500
+        self.max_video_frames = self.cfg.env.max_video_frames
 
     def step(self, actions):
         """ Apply actions, simulate, call self.post_physics_step()
@@ -205,7 +205,31 @@ class LeggedRobot(BaseTask):
         # 1. No contact-based termination for recovery
         self.reset_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
-        # 2. Timeout
+        # 2. Stable standing condition
+        g_z = self.projected_gravity[:, 2]
+        upright = g_z < -0.9
+        stable_height = self.root_states[:, 2] > 0.28
+        low_lin_vel = torch.norm(self.base_lin_vel[:, :2], dim=1) < 0.15
+        low_ang_vel = torch.norm(self.base_ang_vel, dim=1) < 0.3
+        posture_error = torch.norm(self.dof_pos - self.default_dof_pos, dim=1)
+        good_posture = posture_error < 1.0
+        stable_standing = (
+                upright
+                & stable_height
+                & low_lin_vel
+                & low_ang_vel
+                & good_posture
+            )
+
+        # Count consecutive stable standing steps
+        self.standing_steps[stable_standing] += 1
+        self.standing_steps[~stable_standing] = 0
+
+        # Success termination
+        success_reset = self.standing_steps >= 100
+        self.reset_buf |= success_reset
+
+        # 3. Timeout
         self.time_out_buf = self.episode_length_buf > self.cfg.env.max_episode_length
         self.reset_buf |= self.time_out_buf
 
@@ -304,6 +328,7 @@ class LeggedRobot(BaseTask):
         if self.cfg.env.train_recovery:
             self.commands[env_ids] = 0.0
             self.recovery_counter[env_ids] = 0.0
+            self.standing_steps[env_ids] = 0
         else:
             self._resample_commands(env_ids)
 
@@ -553,18 +578,18 @@ class LeggedRobot(BaseTask):
                                                       (self.friction_coeffs[:, 0].unsqueeze(
                                                           1) - friction_coeffs_shift) * friction_coeffs_scale),
                                                      dim=1)
-        if self.cfg.env.priv_observe_ground_friction:
-            self.ground_friction_coeffs = self._get_ground_frictions(range(self.num_envs))
-            ground_friction_coeffs_scale, ground_friction_coeffs_shift = get_scale_shift(
-                self.cfg.normalization.ground_friction_range)
-            self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
-                                                 (self.ground_friction_coeffs.unsqueeze(
-                                                     1) - ground_friction_coeffs_shift) * ground_friction_coeffs_scale),
-                                                dim=1)
-            self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
-                                                      (self.ground_friction_coeffs.unsqueeze(
-                                                      1) - ground_friction_coeffs_shift) * ground_friction_coeffs_scale),
-                                                      dim=1)
+        # if self.cfg.env.priv_observe_ground_friction:
+        #     self.ground_friction_coeffs = self._get_ground_frictions(range(self.num_envs))
+        #     ground_friction_coeffs_scale, ground_friction_coeffs_shift = get_scale_shift(
+        #         self.cfg.normalization.ground_friction_range)
+        #     self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
+        #                                          (self.ground_friction_coeffs.unsqueeze(
+        #                                              1) - ground_friction_coeffs_shift) * ground_friction_coeffs_scale),
+        #                                         dim=1)
+        #     self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
+        #                                               (self.ground_friction_coeffs.unsqueeze(
+        #                                               1) - ground_friction_coeffs_shift) * ground_friction_coeffs_scale),
+        #                                               dim=1)
 
         if self.cfg.env.priv_observe_restitution:
             restitutions_scale, restitutions_shift = get_scale_shift(self.cfg.normalization.restitution_range)
@@ -589,22 +614,13 @@ class LeggedRobot(BaseTask):
 
             # [N, 4]
             # [trunk_mass_norm, hip_mass_norm, thigh_mass_norm, calf_mass_norm]
-            mass_groups_norm = torch.zeros(
-                self.num_envs,
-                4,
-                device=self.device,
-                dtype=torch.float
-            )
+            mass_groups_norm = torch.zeros(self.num_envs, 4, device=self.device, dtype=torch.float)
 
             # 0) TRUNK / BASE MASS
             # Current absolute trunk mass
             trunk_mass = self.mass_groups[:, 0]
 
-            trunk_range = torch.tensor(
-                self.cfg.normalization.trunk_mass_range,
-                device=self.device,
-                dtype=torch.float
-            )
+            trunk_range = torch.tensor(self.cfg.normalization.trunk_mass_range, device=self.device, dtype=torch.float)
 
             trunk_min = trunk_range[0]
             trunk_max = trunk_range[1]
@@ -612,9 +628,7 @@ class LeggedRobot(BaseTask):
             trunk_shift = 0.5 * (trunk_max + trunk_min)
             trunk_scale = 2.0 / (trunk_max - trunk_min + 1e-8)
 
-            mass_groups_norm[:, 0] = (
-                trunk_mass - trunk_shift
-            ) * trunk_scale
+            mass_groups_norm[:, 0] = (trunk_mass - trunk_shift) * trunk_scale
 
             # 1..3) HIP / THIGH / CALF
             # Use ABSOLUTE masses
@@ -623,11 +637,7 @@ class LeggedRobot(BaseTask):
             # [[hip_min, hip_max],
             # [thigh_min, thigh_max],
             # [calf_min, calf_max]]
-            lm_ranges = torch.tensor(
-                self.cfg.normalization.link_mass_ranges,
-                device=self.device,
-                dtype=torch.float
-            )
+            lm_ranges = torch.tensor(self.cfg.normalization.link_mass_ranges, device=self.device, dtype=torch.float)
 
             lm_min = lm_ranges[:, 0]
             lm_max = lm_ranges[:, 1]
@@ -635,9 +645,7 @@ class LeggedRobot(BaseTask):
             lm_shift = 0.5 * (lm_max + lm_min)
             lm_scale = 2.0 / (lm_max - lm_min + 1e-8)
 
-            mass_groups_norm[:, 1:] = (
-                link_masses - lm_shift
-            ) * lm_scale
+            mass_groups_norm[:, 1:] = (link_masses - lm_shift) * lm_scale
 
             # DEBUG
             # if self.common_step_counter % 100 == 0:
@@ -654,19 +662,12 @@ class LeggedRobot(BaseTask):
             #         print("Normalized:")
             #         print(mass_groups_norm[env_id])
 
-            self.privileged_obs_buf = torch.cat(
-                (self.privileged_obs_buf, mass_groups_norm),
-                dim=1
-            )
-
-            self.next_privileged_obs_buf = torch.cat(
-                (self.next_privileged_obs_buf, mass_groups_norm),
-                dim=1
-            )
+            self.privileged_obs_buf = torch.cat((self.privileged_obs_buf, mass_groups_norm), dim=1)
+            self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf, mass_groups_norm),dim=1)
 
         if self.cfg.env.priv_observe_com_displacement:
-            com_displacements_scale, com_displacements_shift = get_scale_shift(
-                self.cfg.normalization.com_displacement_range)
+            # randomized COM offset parameter injected into simulation
+            com_displacements_scale, com_displacements_shift = get_scale_shift(self.cfg.normalization.com_displacement_range)
             self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
                                                  (self.com_displacements - com_displacements_shift) * com_displacements_scale),
                                                 dim=1)
@@ -695,6 +696,7 @@ class LeggedRobot(BaseTask):
                                                      dim=1)
 
         if self.cfg.env.priv_observe_com_position:
+            # center of mass position relative to the base frame
             body_positions_world = self.rigid_body_state.view(self.num_envs, self.num_bodies, 13)[:, :, :3]
             body_masses = self.rigid_body_masses.unsqueeze(-1)
             # body_masses = self.body_masses.unsqueeze(0).unsqueeze(-1)
@@ -707,22 +709,40 @@ class LeggedRobot(BaseTask):
             self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf, normalized_com_position), dim=1)
 
 
-        if self.cfg.env.priv_observe_Kp_factor:
+        # if self.cfg.env.priv_observe_Kp_factor:
+        #     Kp_factor_scale, Kp_factor_shift = get_scale_shift(self.cfg.normalization.Kp_factor_range)
+        #     self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
+        #                                          (self.Kp_factors - Kp_factor_shift) * Kp_factor_scale),
+        #                                         dim=1)
+        #     self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
+        #                                               (self.Kp_factors - Kp_factor_shift) * Kp_factor_scale),
+        #                                              dim=1)
+        # if self.cfg.env.priv_observe_Kd_factor:
+        #     Kd_factor_scale, Kd_factor_shift = get_scale_shift(self.cfg.normalization.Kd_factor_range)
+        #     self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
+        #                                          (self.Kd_factors - Kd_factor_shift) * Kd_factor_scale),
+        #                                         dim=1)
+        #     self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
+        #                                               (self.Kd_factors - Kd_factor_shift) * Kd_factor_scale),
+        #                                              dim=1)
+
+        if self.cfg.env.priv_observe_Kpd_factor:
+            # Current implementation randomizes:
+            # - one shared Kp factor per environment
+            # - one shared Kd factor per environment
+            #
+            # Although tensors are shape [N, 12], all joint values are identical.
+            # Therefore expose only 2 privileged dimensions:
+            # [normalized_Kp_factor, normalized_Kd_factor]
+
             Kp_factor_scale, Kp_factor_shift = get_scale_shift(self.cfg.normalization.Kp_factor_range)
-            self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
-                                                 (self.Kp_factors - Kp_factor_shift) * Kp_factor_scale),
-                                                dim=1)
-            self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
-                                                      (self.Kp_factors - Kp_factor_shift) * Kp_factor_scale),
-                                                     dim=1)
-        if self.cfg.env.priv_observe_Kd_factor:
             Kd_factor_scale, Kd_factor_shift = get_scale_shift(self.cfg.normalization.Kd_factor_range)
-            self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
-                                                 (self.Kd_factors - Kd_factor_shift) * Kd_factor_scale),
-                                                dim=1)
-            self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
-                                                      (self.Kd_factors - Kd_factor_shift) * Kd_factor_scale),
-                                                     dim=1)
+            normalized_Kp_factor = (self.Kp_factors[:, 0:1] - Kp_factor_shift) * Kp_factor_scale
+            normalized_Kd_factor = (self.Kd_factors[:, 0:1] - Kd_factor_shift) * Kd_factor_scale
+            normalized_Kpd_factors = torch.cat((normalized_Kp_factor, normalized_Kd_factor), dim=1)
+            self.privileged_obs_buf = torch.cat((self.privileged_obs_buf, normalized_Kpd_factors), dim=1)
+            self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf, normalized_Kpd_factors), dim=1)
+
         if self.cfg.env.priv_observe_contact_forces:
             contact_forces_scale, contact_forces_shift = get_scale_shift(self.cfg.normalization.contact_force_range)
             foot_contact_forces = self.contact_forces[:, self.feet_indices, :].reshape(self.num_envs, -1)
@@ -989,11 +1009,14 @@ class LeggedRobot(BaseTask):
             self.Kp_factors[env_ids, :] = torch.rand(len(env_ids), dtype=torch.float, device=self.device,
                                                      requires_grad=False).unsqueeze(1) * (
                                                   max_Kp_factor - min_Kp_factor) + min_Kp_factor
+            # print(f"Randomized Kp_factors: {self.Kp_factors}")
+
         if cfg.domain_rand.randomize_Kd_factor:
             min_Kd_factor, max_Kd_factor = cfg.domain_rand.Kd_factor_range
             self.Kd_factors[env_ids, :] = torch.rand(len(env_ids), dtype=torch.float, device=self.device,
                                                      requires_grad=False).unsqueeze(1) * (
                                                   max_Kd_factor - min_Kd_factor) + min_Kd_factor
+            # print(f"Randomized Kd_factors: {self.Kd_factors}")
 
     # def _process_rigid_body_props(self, props, env_id):
     #     self.default_body_mass = props[0].mass
@@ -1795,6 +1818,7 @@ class LeggedRobot(BaseTask):
 
         if self.cfg.env.train_recovery:
             self.recovery_counter = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
+            self.standing_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device, requires_grad=False)
 
         # initialize some data used later on
         self.common_step_counter = 0
@@ -2318,7 +2342,7 @@ class LeggedRobot(BaseTask):
             self.camera_props = gymapi.CameraProperties()
             self.camera_props.width = 360
             self.camera_props.height = 240
-            self.camera_props.enable_tensors = False # True (on gcp headless) #False (local)
+            self.camera_props.enable_tensors = True # True (on gcp headless) #False (local)
             self.rendering_camera = self.gym.create_camera_sensor(self.envs[0], self.camera_props)
 
             if self.rendering_camera == -1:
@@ -2380,6 +2404,9 @@ class LeggedRobot(BaseTask):
                 gymapi.IMAGE_COLOR
             )
 
+            # if img is not None:
+            #     print("IMG SIZE:", img.size)
+
             if img is None or img.size == 0:
                 return
 
@@ -2390,6 +2417,11 @@ class LeggedRobot(BaseTask):
 
             if len(self.video_frames) < self.max_video_frames:
                 self.video_frames.append(frame)
+
+            # if len(self.video_frames) < self.max_video_frames:
+            #     print("APPEND FRAME")
+            #     self.video_frames.append(frame)
+            #     print("NEW LEN:", len(self.video_frames))
 
         # EVAL
         if self.record_now and self.eval_cfg is not None:
