@@ -121,7 +121,10 @@ class CoRLRewards:
         contact_forces = self.env.contact_forces[:, self.env.feet_indices, :]
         contact_norm = torch.norm(contact_forces, dim=-1)   # (N, 4)
         contacts = (contact_norm > 1.0).float()             # threshold 1–5N
-        return torch.sum(contacts, dim=1)
+        upright = (self.env.projected_gravity[:, 2] < -0.9).float()
+
+        return torch.sum(contacts, dim=1) * upright
+        # return torch.sum(contacts, dim=1)
 
     def _reward_posture(self):
         """Counts successful fall-recovery events per episode.
@@ -151,7 +154,15 @@ class CoRLRewards:
         body_height = self.env.root_states[:, 2]
         target_height = self.env.cfg.rewards.base_height_target
 
-        return torch.exp(-torch.square(target_height - body_height) / 0.04)
+        upright = (self.env.projected_gravity[:, 2] < -0.8).float()
+
+        reward = torch.exp(
+            -torch.square(target_height - body_height) / 0.04
+        )
+
+        return reward * upright
+
+        # return torch.exp(-torch.square(target_height - body_height) / 0.04)
 
 
     #############################################################
