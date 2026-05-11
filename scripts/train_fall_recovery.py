@@ -4,7 +4,8 @@ def train_aliengo(headless=True):
     assert isaacgym
     import torch
 
-    from aliengo_gym.envs.base.fall_recovery_config import FallRecoveryConfig as Cfg
+    from aliengo_gym.envs.base.fall_recovery_config_go1 import FallRecoveryConfig as Cfg
+    # from aliengo_gym.envs.base.fall_recovery_config import FallRecoveryConfig as Cfg
     # from aliengo_gym.envs.aliengo.aliengo_config import config_aliengo
     from aliengo_gym.envs.aliengo.velocity_tracking import VelocityTrackingEasyEnv
 
@@ -25,17 +26,41 @@ def train_aliengo(headless=True):
     env = HistoryWrapper(env)
     gpu_id = 0
     runner = Runner(env, device=f"cuda:{gpu_id}")
-    runner.learn(num_learning_iterations=50000, init_at_random_ep_len=True, eval_freq=100)
+    runner.learn(num_learning_iterations=10000, init_at_random_ep_len=True, eval_freq=100)
 
 
 if __name__ == '__main__':
     from pathlib import Path
     from ml_logger import logger
     from aliengo_gym import MINI_GYM_ROOT_DIR
+    import subprocess
+    import os
 
     stem = Path(__file__).stem
     logger.configure(logger.utcnow(f'gait-conditioned-agility/%Y-%m-%d/{stem}/%H%M%S.%f'),
                      root=Path(f"{MINI_GYM_ROOT_DIR}/runs").resolve(), )
+
+
+    run_dir = Path(logger.root) / logger.prefix
+    checkpoint_dir = run_dir / "checkpoints"
+
+    msg = (
+        f"📁 Run Directory:\n{run_dir}\n\n"
+        # f"💾 Checkpoints:\n{checkpoint_dir}"
+    )
+
+    try:
+        subprocess.run(
+            [
+                "python",
+                "tracebot/send_telegram.py",
+                msg
+            ],
+            check=False
+        )
+    except Exception as e:
+        print(f"[TELEGRAM ERROR] {e}")
+
     logger.log_text("""
                 charts:
                 - yKey: train/episode/rew_total/mean
@@ -65,4 +90,4 @@ if __name__ == '__main__':
                 """, filename=".charts.yml", dedent=True)
 
     # to see the environment rendering, set headless=False
-    train_aliengo(headless=False)
+    train_aliengo(headless=True)
