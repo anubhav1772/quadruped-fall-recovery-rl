@@ -14,7 +14,8 @@ from aliengo_gym.envs.base.base_task import BaseTask
 from aliengo_gym.utils.math_utils import quat_apply_yaw, wrap_to_pi, get_scale_shift
 from aliengo_gym.utils.terrain import Terrain
 # from .legged_robot_config import BaseCfg as Cfg
-from .fall_recovery_config import FallRecoveryConfig as Cfg
+# from .fall_recovery_config import FallRecoveryConfig as Cfg
+from .fall_recovery_config_go1 import FallRecoveryConfig as Cfg
 
 
 class LeggedRobot(BaseTask):
@@ -151,10 +152,11 @@ class LeggedRobot(BaseTask):
         self.dof_acc[:] = (self.dof_vel[:] - self.last_dof_vel[:]) / self.dt
 
         self.compute_reward()
-        env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
-        self.reset_idx(env_ids)
 
         self.check_recovery_success()
+
+        env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
+        self.reset_idx(env_ids)
 
         # if self.common_step_counter % 1000 == 0:
         #     forces = self.contact_forces[:, self.base_contact_indices, :]
@@ -272,22 +274,26 @@ class LeggedRobot(BaseTask):
         g_z = self.projected_gravity[:, 2]
 
         upright = g_z < -0.9
-        stable_height = self.root_states[:, 2] > 0.28
-        low_velocity = torch.norm(self.base_lin_vel, dim=1) < 0.1
-        low_ang_vel = torch.norm(self.base_ang_vel, dim=1) < 0.2
+        if self.cfg.env.robot == "go1":
+            stable_height = self.root_states[:, 2] > 0.30
+        else:
+            stable_height = self.root_states[:, 2] > 0.42
+        low_velocity = torch.norm(self.base_lin_vel, dim=1) < 0.3
+        low_ang_vel = torch.norm(self.base_ang_vel, dim=1) < 0.5
 
         posture_error = torch.norm(
             self.dof_pos - self.default_dof_pos, dim=1
         )
-        good_posture = posture_error < 1.0
+        good_posture = posture_error < 1.5
 
         recovered = upright & stable_height & low_velocity & low_ang_vel & good_posture
 
         # persistence
-        self.recovery_counter += recovered.float()
+        # self.recovery_counter += recovered.float()
+        self.recovery_counter[recovered] += 1
         self.recovery_counter[~recovered] = 0
 
-        stable_recovery = self.recovery_counter > 20
+        stable_recovery = self.recovery_counter >= 30
 
         new_recovery = stable_recovery & (~self.recovered_flag)
 
@@ -1902,7 +1908,7 @@ class LeggedRobot(BaseTask):
         self.default_dof_pos = self.default_dof_pos.unsqueeze(0)
 
         if self.cfg.control.control_type == "actuator_net":
-            actuator_path = f'{os.path.dirname(os.path.dirname(os.path.realpath(__file__)))}/../../resources/actuator_nets/unitree_aliengo.pt'
+            actuator_path = f'{os.path.dirname(os.path.dirname(os.path.realpath(__file__)))}/../../resources/actuator_nets/unitree_go1.pt'
             actuator_network = torch.jit.load(actuator_path).to(self.device)
 
             def eval_actuator_network(joint_pos, joint_pos_last, joint_pos_last_last, joint_vel, joint_vel_last,
