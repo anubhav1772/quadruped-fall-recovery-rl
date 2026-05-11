@@ -45,11 +45,11 @@ caches = DataCaches(1)
 class RunnerArgs(PrefixProto, cli=False):
     # runner
     algorithm_class_name = 'RMA'
-    num_steps_per_env = 96 #24  # per iteration
+    num_steps_per_env = 24  # per iteration
     max_iterations = 1500  # number of policy updates
 
     # logging
-    save_interval = 300  # check for potential saves every this many iterations
+    save_interval = 400  # check for potential saves every this many iterations
     save_video_interval = 300
     log_freq = 10
 
@@ -297,6 +297,7 @@ class Runner:
 
             self.last_recording_it = it
 
+        # print(f"Num vid frames {len(self.env.video_frames)}")
         # STOP + SAVE RECORDING
         if self.env.record_now and len(self.env.video_frames) >= self.env.max_video_frames:
             print(f"[VIDEO] Saving video at iter {it}")
