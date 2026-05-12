@@ -86,10 +86,18 @@ class FallRecoveryConfig(BaseCfg):
         priv_observe_heightmap = False
 
     class domain_rand(BaseCfg.domain_rand):
-        trunk_mass_range = [-2.0, 2.0]
-        hip_mass_range   = [0.3, 0.7]
-        thigh_mass_range = [0.15, 0.5]
-        calf_mass_range  = [0.05, 0.15]
+        # trunk_mass_range = [4.0, 28.0]
+        # hip_mass_range   = [0.3, 0.7]
+        # thigh_mass_range = [0.4, 4.0]
+        # calf_mass_range  = [0.1, 0.8]
+
+        trunk_mass_range = [6.0, 16.0]
+
+        hip_mass_range   = [0.45, 0.70]
+        thigh_mass_range = [1.0, 2.5]
+        calf_mass_range  = [0.15, 0.45]
+
+        added_mass_range = [-1., 3.]
         randomize_link_masses = True
 
     class reward_scales(BaseCfg.reward_scales):
@@ -102,14 +110,14 @@ class FallRecoveryConfig(BaseCfg):
 
         action = -1.0e-2
         torques = -5.0e-4
-        dof_acc = -2.5e-6
-        dof_vel = -1.0e-2
+        dof_acc = -1.0e-6 #-2.5e-6
+        dof_vel = -1.0e-3 #-1.0e-2
 
         # base_height = 2.0
         base_contact = -0.2
         dof_pos_limits = -1.0
 
-        ang_vel_limit = -0.02
+        ang_vel_limit = -0.002 #-0.02
         action_smoothness_1 = -0.005
         action_smoothness_2 = -0.005
 
@@ -118,10 +126,18 @@ class FallRecoveryConfig(BaseCfg):
 
     class normalization(BaseCfg.normalization):
         com_displacement_range = [-0.05, 0.05]
-        trunk_mass_range = [4.0, 28.0]
+        # trunk_mass_range = [1.5, 30.5]
+
+        # link_mass_ranges = [
+        #     [0.3, 0.7],    # hip
+        #     [0.4, 4.0],   # thigh
+        #     [0.1, 0.8],  # calf
+        # ]
+        #
+        trunk_mass_range = [5., 18.]
 
         link_mass_ranges = [
-            [0.3, 0.7],    # hip
-            [0.4, 4.0],   # thigh
-            [0.1, 0.8],  # calf
+            [0.45, 0.70],    # hip
+            [1.0, 2.5],   # thigh
+            [0.15, 0.45],  # calf
         ]
