@@ -7,7 +7,8 @@ from isaacgym import gymapi
 class CoRLRewards:
     def __init__(self, env):
         self.env = env
-        self.eps = 0.5
+        self.eps_orien = 0.25
+        self.eps_posture = 0.25
 
     def load_env(self, env):
         self.env = env
@@ -24,7 +25,7 @@ class CoRLRewards:
         """Rewards alignment of the base with gravity (upright posture)."""
         return torch.exp(
             -torch.square(self.env.projected_gravity[:, 2] + 1.0)
-            / (2 * self.eps ** 2)
+            / (2 * self.eps_orien ** 2)
         )
 
     def _reward_height_alignment(self):
@@ -144,8 +145,9 @@ class CoRLRewards:
 
         g_z = self.env.projected_gravity[:, 2]
 
+        # posture reward activates roughly when −1 ≤ g_z ≤ (−1+eps_posture)
         upright = (
-            torch.abs(g_z + 1.0) < self.eps
+            torch.abs(g_z + 1.0) < self.eps_posture
         ).float()
 
         return r_posture * upright
