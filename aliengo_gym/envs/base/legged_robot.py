@@ -574,48 +574,6 @@ class LeggedRobot(BaseTask):
         self.privileged_obs_buf = torch.empty(self.num_envs, 0).to(self.device)
         self.next_privileged_obs_buf = torch.empty(self.num_envs, 0).to(self.device)
 
-        if self.cfg.env.priv_observe_friction:
-            friction_coeffs_scale, friction_coeffs_shift = get_scale_shift(self.cfg.normalization.friction_range)
-            self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
-                                                 (self.friction_coeffs[:, 0].unsqueeze(
-                                                     1) - friction_coeffs_shift) * friction_coeffs_scale),
-                                                dim=1)
-            self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
-                                                      (self.friction_coeffs[:, 0].unsqueeze(
-                                                          1) - friction_coeffs_shift) * friction_coeffs_scale),
-                                                     dim=1)
-        # if self.cfg.env.priv_observe_ground_friction:
-        #     self.ground_friction_coeffs = self._get_ground_frictions(range(self.num_envs))
-        #     ground_friction_coeffs_scale, ground_friction_coeffs_shift = get_scale_shift(
-        #         self.cfg.normalization.ground_friction_range)
-        #     self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
-        #                                          (self.ground_friction_coeffs.unsqueeze(
-        #                                              1) - ground_friction_coeffs_shift) * ground_friction_coeffs_scale),
-        #                                         dim=1)
-        #     self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
-        #                                               (self.ground_friction_coeffs.unsqueeze(
-        #                                               1) - ground_friction_coeffs_shift) * ground_friction_coeffs_scale),
-        #                                               dim=1)
-
-        if self.cfg.env.priv_observe_restitution:
-            restitutions_scale, restitutions_shift = get_scale_shift(self.cfg.normalization.restitution_range)
-            self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
-                                                 (self.restitutions[:, 0].unsqueeze(
-                                                     1) - restitutions_shift) * restitutions_scale),
-                                                dim=1)
-            self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
-                                                      (self.restitutions[:, 0].unsqueeze(
-                                                          1) - restitutions_shift) * restitutions_scale),
-                                                     dim=1)
-        if self.cfg.env.priv_observe_base_mass:
-            payloads_scale, payloads_shift = get_scale_shift(self.cfg.normalization.added_mass_range)
-            self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
-                                                 (self.payloads.unsqueeze(1) - payloads_shift) * payloads_scale),
-                                                dim=1)
-            self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
-                                                      (self.payloads.unsqueeze(1) - payloads_shift) * payloads_scale),
-                                                     dim=1)
-
         if self.cfg.env.priv_observe_link_masses:
 
             # [N, 4]
@@ -670,6 +628,48 @@ class LeggedRobot(BaseTask):
 
             self.privileged_obs_buf = torch.cat((self.privileged_obs_buf, mass_groups_norm), dim=1)
             self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf, mass_groups_norm),dim=1)
+
+        if self.cfg.env.priv_observe_friction:
+            friction_coeffs_scale, friction_coeffs_shift = get_scale_shift(self.cfg.normalization.friction_range)
+            self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
+                                                 (self.friction_coeffs[:, 0].unsqueeze(
+                                                     1) - friction_coeffs_shift) * friction_coeffs_scale),
+                                                dim=1)
+            self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
+                                                      (self.friction_coeffs[:, 0].unsqueeze(
+                                                          1) - friction_coeffs_shift) * friction_coeffs_scale),
+                                                     dim=1)
+        # if self.cfg.env.priv_observe_ground_friction:
+        #     self.ground_friction_coeffs = self._get_ground_frictions(range(self.num_envs))
+        #     ground_friction_coeffs_scale, ground_friction_coeffs_shift = get_scale_shift(
+        #         self.cfg.normalization.ground_friction_range)
+        #     self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
+        #                                          (self.ground_friction_coeffs.unsqueeze(
+        #                                              1) - ground_friction_coeffs_shift) * ground_friction_coeffs_scale),
+        #                                         dim=1)
+        #     self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
+        #                                               (self.ground_friction_coeffs.unsqueeze(
+        #                                               1) - ground_friction_coeffs_shift) * ground_friction_coeffs_scale),
+        #                                               dim=1)
+
+        if self.cfg.env.priv_observe_restitution:
+            restitutions_scale, restitutions_shift = get_scale_shift(self.cfg.normalization.restitution_range)
+            self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
+                                                 (self.restitutions[:, 0].unsqueeze(
+                                                     1) - restitutions_shift) * restitutions_scale),
+                                                dim=1)
+            self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
+                                                      (self.restitutions[:, 0].unsqueeze(
+                                                          1) - restitutions_shift) * restitutions_scale),
+                                                     dim=1)
+        if self.cfg.env.priv_observe_base_mass:
+            payloads_scale, payloads_shift = get_scale_shift(self.cfg.normalization.added_mass_range)
+            self.privileged_obs_buf = torch.cat((self.privileged_obs_buf,
+                                                 (self.payloads.unsqueeze(1) - payloads_shift) * payloads_scale),
+                                                dim=1)
+            self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf,
+                                                      (self.payloads.unsqueeze(1) - payloads_shift) * payloads_scale),
+                                                     dim=1)
 
         if self.cfg.env.priv_observe_com_displacement:
             # randomized COM offset parameter injected into simulation
@@ -817,6 +817,8 @@ class LeggedRobot(BaseTask):
                 dim=1
             )
 
+        # print(f"masses: {self.privileged_obs_buf[:, :4]}")
+
         # print(f"priv obs shape: {self.privileged_obs_buf.shape}")
         assert self.privileged_obs_buf.shape[
                    1] == self.cfg.env.num_privileged_obs, f"num_privileged_obs ({self.cfg.env.num_privileged_obs}) != the number of privileged observations ({self.privileged_obs_buf.shape[1]}), you will discard data from the student!"
@@ -947,6 +949,14 @@ class LeggedRobot(BaseTask):
 
         if cfg.domain_rand.randomize_link_masses:
 
+            self.trunk_masses[env_ids] = torch.rand(
+                len(env_ids),
+                device=self.device
+            ) * (
+                cfg.domain_rand.trunk_mass_range[1]
+                - cfg.domain_rand.trunk_mass_range[0]
+            ) + cfg.domain_rand.trunk_mass_range[0]
+
             self.hip_masses[env_ids] = torch.rand(
                 len(env_ids),
                 device=self.device
@@ -1040,45 +1050,75 @@ class LeggedRobot(BaseTask):
         # Store nominal/default masses ONCE
         if env_id == 0:
 
-            print(f"Body Names: {self.body_names}")
+            nominal_body, nominal_hip, nominal_thigh, nominal_calf = \
+                    self._compute_mass_groups_from_body_props(props)
 
-            self.default_body_mass = props[0].mass
-
-            self.default_rigid_body_masses = torch.tensor(
-                [p.mass for p in props],
+            self.mass_groups_default = torch.tensor(
+                [
+                    nominal_body,
+                    nominal_hip,
+                    nominal_thigh,
+                    nominal_calf
+                ],
                 device=self.device,
                 dtype=torch.float
             )
 
-        # Base mass randomization
-        props[0].mass = self.default_body_mass + self.payloads[env_id]
+            print("\n===== NOMINAL MASS GROUPS =====")
+            print(self.mass_groups_default)
+
+            print(f"Body Names: {self.body_names}")
+
+            self.default_body_mass = props[0].mass
+
+            # self.default_rigid_body_masses = torch.tensor(
+            #     [p.mass for p in props],
+            #     device=self.device,
+            #     dtype=torch.float
+            # )
+
+        # Base / payload randomization
+        payload = self.payloads[env_id].item()
+
+        # Start from nominal base mass
+        base_mass = self.default_body_mass + payload
+
+        # Optional trunk mass override
+        if self.cfg.domain_rand.randomize_link_masses:
+            base_mass = self.trunk_masses[env_id].item() + payload
+
+        props[0].mass = base_mass
 
         # COM randomization
         props[0].com = gymapi.Vec3(
-            self.com_displacements[env_id, 0],
-            self.com_displacements[env_id, 1],
-            self.com_displacements[env_id, 2]
+            self.com_displacements[env_id, 0].item(),
+            self.com_displacements[env_id, 1].item(),
+            self.com_displacements[env_id, 2].item()
         )
 
         # Link mass randomization
         if self.cfg.domain_rand.randomize_link_masses:
 
-            hip_mass = self.hip_masses[env_id]
-            thigh_mass = self.thigh_masses[env_id]
-            calf_mass = self.calf_masses[env_id]
+            hip_mass = self.hip_masses[env_id].item()
+            thigh_mass = self.thigh_masses[env_id].item()
+            calf_mass = self.calf_masses[env_id].item()
 
             for i, p in enumerate(props):
 
                 body_name = self.body_names[i].lower()
 
+                # Skip base/trunk
+                if "base" in body_name or "trunk" in body_name:
+                    continue
+
                 if "hip" in body_name:
-                    p.mass = hip_mass.item()
+                    p.mass = hip_mass
 
                 elif "thigh" in body_name:
-                    p.mass = thigh_mass.item()
+                    p.mass = thigh_mass
 
                 elif "calf" in body_name:
-                    p.mass = calf_mass.item()
+                    p.mass = calf_mass
 
         # Store current rigid body masses
         self.rigid_body_masses[env_id] = torch.tensor(
@@ -1086,6 +1126,7 @@ class LeggedRobot(BaseTask):
             device=self.device,
             dtype=torch.float
         )
+
 
         # Compute grouped masses
         m_body, m_hip, m_thigh, m_calf = \
@@ -1096,32 +1137,41 @@ class LeggedRobot(BaseTask):
         self.mass_groups[env_id, 2] = m_thigh
         self.mass_groups[env_id, 3] = m_calf
 
-        # Store default grouped masses ONCE
-        if env_id == 0:
-
-            self.mass_groups_default[0] = m_body
-            self.mass_groups_default[1] = m_hip
-            self.mass_groups_default[2] = m_thigh
-            self.mass_groups_default[3] = m_calf
-
-            print("\n===== DEFAULT MASS GROUPS =====")
-            print(self.mass_groups_default)
-
         # DEBUG
-        # print(f"\n===== ENV {env_id} =====")
-        # print("Payload:", self.payloads[env_id].item())
-        # print("Hip delta  :", self.hip_masses[env_id].item())
-        # print("Thigh delta:", self.thigh_masses[env_id].item())
-        # print("Calf delta :", self.calf_masses[env_id].item())
-        #
-        # print("\nCurrent grouped masses:")
-        # print(self.mass_groups[env_id])
-        #
-        # print("\nDefault grouped masses:")
-        # print(self.mass_groups_default)
-        #
-        # print("\nActual grouped deltas:")
-        # print(self.mass_groups[env_id] - self.mass_groups_default)
+        # if env_id < 3:
+
+        #     print(f"\n===== ENV {env_id} MASS DEBUG =====")
+
+        #     print("\n--- BASE ---")
+
+        #     print(f"Default base mass : {self.default_body_mass:.4f}")
+
+        #     print(f"Payload           : {payload:.4f}")
+
+        #     if self.cfg.domain_rand.randomize_link_masses:
+        #         print(f"Sampled trunk mass: {self.trunk_masses[env_id].item():.4f}")
+
+        #     print(f"Final base mass   : {props[0].mass:.4f}")
+
+        #     print("\n--- LINKS ---")
+
+        #     if self.cfg.domain_rand.randomize_link_masses:
+
+        #         print(f"Hip mass   : {hip_mass:.4f}")
+        #         print(f"Thigh mass : {thigh_mass:.4f}")
+        #         print(f"Calf mass  : {calf_mass:.4f}")
+
+        #     print("\n--- GROUP MASSES ---")
+
+        #     print(f"Body  group: {m_body:.4f}")
+        #     print(f"Hip   group: {m_hip:.4f}")
+        #     print(f"Thigh group: {m_thigh:.4f}")
+        #     print(f"Calf  group: {m_calf:.4f}")
+
+        #     print("\n--- ALL BODY MASSES ---")
+
+        #     for i, p in enumerate(props):
+        #         print(f"{i:02d} | {self.body_names[i]:20s} | {p.mass:.4f}")
 
         return props
 
@@ -1488,7 +1538,9 @@ class LeggedRobot(BaseTask):
             )
 
             # mask = g[:, 2] < -0.7
-            mask = g[:, 2] < -0.5 # rejection condition (no semi-standing states)
+            # mask = g[:, 2] < -0.5 # rejection condition (no semi-standing states)
+            # mask = g[:, 2] < 0.0
+            mask = g[:, 2] < 0.3
 
         ###########
 
@@ -1548,7 +1600,7 @@ class LeggedRobot(BaseTask):
         # zero torques
         zero_torques = torch.zeros_like(self.torques)
 
-        for _ in range(5):   # 5–10 steps
+        for _ in range(10):   # 5–10 steps
             self.gym.set_dof_actuation_force_tensor(
                 self.sim, gymtorch.unwrap_tensor(zero_torques)
             )
@@ -1958,7 +2010,8 @@ class LeggedRobot(BaseTask):
                                                                   requires_grad=False)
         self.payloads = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
 
-        # link mass randomization deltas
+        # link mass randomization
+        self.trunk_masses = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
         self.hip_masses = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
 
         self.thigh_masses = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
