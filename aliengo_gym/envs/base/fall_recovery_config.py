@@ -29,10 +29,12 @@ class FallRecoveryConfig(BaseCfg):
         priv_observe_heightmap = False
 
     class domain_rand(BaseCfg.domain_rand):
-        trunk_mass_range = [-2.0, 2.0]
-        hip_mass_range   = [0.3, 0.7]
-        thigh_mass_range = [0.15, 0.5]
-        calf_mass_range  = [0.05, 0.15]
+        trunk_mass_range = [19.0, 21.5]
+        hip_mass_range   = [0.4, 0.7]
+        thigh_mass_range = [1.0 2.5]
+        calf_mass_range  = [0.15, 0.45]
+
+        added_mass_range = [-1., 3.]
         randomize_link_masses = True
 
     class reward_scales(BaseCfg.reward_scales):
@@ -76,10 +78,10 @@ class FallRecoveryConfig(BaseCfg):
 
     class normalization(BaseCfg.normalization):
         com_displacement_range = [-0.05, 0.05]
-        trunk_mass_range = [7.0, 12.5]
+        trunk_mass_range = [18.0, 24.5]
 
         link_mass_ranges = [
-            [0.3, 0.7],    # hip
-            [0.15, 0.5],   # thigh
-            [0.05, 0.15],  # calf
+            [0.4, 0.7],    # hip
+            [1.0, 2.5],    # thigh
+            [0.15, 0.45],  # calf
         ]
