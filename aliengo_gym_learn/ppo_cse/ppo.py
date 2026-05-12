@@ -18,9 +18,9 @@ class PPO_Args(PrefixProto):
     entropy_coef = 0.01
     num_learning_epochs = 5
     num_mini_batches = 4  # mini batch size = num_envs*nsteps / nminibatches
-    learning_rate = 5e-4 #1.e-3
+    learning_rate = 1.e-3
 
-    adaptation_module_learning_rate = 5e-4 #1.e-3
+    adaptation_module_learning_rate = 1.e-3
     num_adaptation_module_substeps = 1
     schedule = 'adaptive'  # could be adaptive, fixed
     gamma = 0.99
