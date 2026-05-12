@@ -232,8 +232,40 @@ class Runner:
                 self.log_video(it)
 
             self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
+            # if logger.every(RunnerArgs.log_freq, "iteration", start_on=1):
+            #     # if it % Config.log_freq == 0:
+            #     logger.log_metrics_summary(key_values={"timesteps": self.tot_timesteps, "iterations": it})
+            #     logger.job_running()
+            #
             if logger.every(RunnerArgs.log_freq, "iteration", start_on=1):
-                # if it % Config.log_freq == 0:
+
+                reward_names = [
+                    k for k in self.env.episode_sums.keys()
+                    if k not in ["total", "recovery_success"]
+                ]
+
+                abs_total = 0.0
+
+                for name in reward_names:
+                    abs_total += torch.mean(
+                        torch.abs(self.env.episode_sums[name])
+                    )
+
+                print("\n===== Reward Contribution =====")
+
+                for name in reward_names:
+
+                    mean_abs = torch.mean(
+                        torch.abs(self.env.episode_sums[name])
+                    )
+
+                    contrib = mean_abs / (abs_total + 1e-8)
+
+                    print(
+                        f"{name:<25}: "
+                        f"{100*contrib.item():6.2f}%"
+                    )
+
                 logger.log_metrics_summary(key_values={"timesteps": self.tot_timesteps, "iterations": it})
                 logger.job_running()
 
