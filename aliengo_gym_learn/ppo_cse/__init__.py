@@ -253,6 +253,8 @@ class Runner:
 
                 print("\n===== Reward Contribution =====")
 
+                reward_contrib_metrics = {}
+
                 for name in reward_names:
 
                     mean_abs = torch.mean(
@@ -261,12 +263,54 @@ class Runner:
 
                     contrib = mean_abs / (abs_total + 1e-8)
 
+                    contrib_percent = 100 * contrib.item()
+
                     print(
                         f"{name:<25}: "
-                        f"{100*contrib.item():6.2f}%"
+                        f"{contrib_percent:6.2f}%"
                     )
 
-                logger.log_metrics_summary(key_values={"timesteps": self.tot_timesteps, "iterations": it})
+                    # store for dashboard
+                    reward_contrib_metrics[f"reward_contrib/{name}"] = contrib_percent
+
+                # =========================================================
+                # Recovery debug statistics
+                # =========================================================
+
+                recovery_metrics = {}
+
+                if hasattr(self.env, "extras") and "recovery_debug" in self.env.extras:
+
+                    dbg = self.env.extras["recovery_debug"]
+
+                    print("\n===== Recovery Debug =====")
+
+                    for k, v in dbg.items():
+
+                        if torch.is_tensor(v):
+                            v = v.item()
+
+                        print(f"{k:<25}: {v:8.4f}")
+
+                        # store for dashboard
+                        recovery_metrics[f"recovery/{k}"] = v
+
+                # =========================================================
+                # Store all metrics
+                # =========================================================
+
+                logger.store_metrics(
+                    **reward_contrib_metrics,
+                    **recovery_metrics
+                )
+
+                logger.log_metrics_summary(
+                    key_values={
+                        "timesteps": self.tot_timesteps,
+                        "iterations": it
+                    }
+                )
+
                 logger.job_running()
 
             if it % RunnerArgs.save_interval == 0:
