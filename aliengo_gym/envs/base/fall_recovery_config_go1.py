@@ -70,11 +70,11 @@ class FallRecoveryConfig(BaseCfg):
         num_observations = 42  # ang_vel(3) in base + observe_only_ang_vel adds 3 more + gravity(3) + dof_pos(12) + dof_vel(12) + actions(12)
         num_scalar_observations = 42
         num_privileged_obs = 26
-        episode_length_s = 6  # longer episodes to allow full recovery sequences (6/4*0.005 = 300)
+        episode_length_s = 9  # longer episodes to allow full recovery sequences (9/4*0.005 = 450)
         observe_only_ang_vel = True  # prepend ang_vel again for emphasis in recovery task (gives 45 obs total)
 
         record_video = True
-        max_video_frames = 250
+        max_video_frames = 400 # (for episode length of 450)
 
         priv_observe_friction = True
         priv_observe_ground_friction = False
@@ -125,9 +125,9 @@ class FallRecoveryConfig(BaseCfg):
         dof_acc = -1.0e-7 #-1.0e-6 #-2.5e-6
         dof_vel = -5.0e-4 #1.0e-3 #-1.0e-2
 
-        # base_height = 2.0
+        base_height = 0.0
         base_contact = -0.2
-        dof_pos_limits = -1.0
+        dof_pos_limits = -0.4 #-1.0
 
         ang_vel_limit = -0.002 #-0.02
         action_smoothness_1 = -0.005
