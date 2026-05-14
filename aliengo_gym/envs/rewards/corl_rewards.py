@@ -8,10 +8,27 @@ class CoRLRewards:
     def __init__(self, env):
         self.env = env
         self.eps_orien = 0.25
-        self.eps_posture = 0.25
+        self.eps_posture = 0.35 #0.25
 
     def load_env(self, env):
         self.env = env
+
+    ######## sparse terminal success reward ########
+    def _reward_recovery_success(self):
+
+        g_z = self.env.projected_gravity[:, 2]
+
+        upright = g_z < -0.9
+        height = self.env.root_states[:, 2] > 0.28
+
+        low_vel = torch.norm(
+            self.env.base_lin_vel[:, :2],
+            dim=1
+        ) < 0.5
+
+        success = upright & height & low_vel
+
+        return success.float()
 
     ###############################################
     ############ ORIENTATION & POSTURE ############
@@ -21,21 +38,70 @@ class CoRLRewards:
         """Penalize base tilt (roll/pitch deviation from upright)."""
         return torch.sum(torch.square(self.env.projected_gravity[:, :2]), dim=1)
 
+    # def _reward_upright_orientation(self):
+    #     """Rewards alignment of the base with gravity (upright posture)."""
+    #     return torch.exp(
+    #         -torch.square(self.env.projected_gravity[:, 2] + 1.0)
+    #         / (2 * self.eps_orien ** 2)
+    #     )
+    #
+
     def _reward_upright_orientation(self):
-        """Rewards alignment of the base with gravity (upright posture)."""
-        return torch.exp(
-            -torch.square(self.env.projected_gravity[:, 2] + 1.0)
+        """
+        Rewards upright orientation only when the robot exhibits
+        stable standing characteristics, including sufficient body
+        height and multi-foot ground support. This prevents
+        reward exploitation through transient flipping or
+        upside-down rolling motions.
+        """
+
+        g_z = self.env.projected_gravity[:, 2]
+
+        upright_reward = torch.exp(
+            -torch.square(g_z + 1.0)
             / (2 * self.eps_orien ** 2)
         )
+
+        body_height = self.env.root_states[:, 2]
+
+        if self.env.cfg.env.robot == "go1":
+            stable_height = (body_height > 0.24).float()
+        else:
+            stable_height = (body_height > 0.40).float()
+
+        foot_contacts = (
+            self.env.contact_forces[
+                :, self.env.feet_indices, 2
+            ] > 1.0
+        ).sum(dim=1).float()
+
+        stable_contacts = foot_contacts / 4.0
+
+        stability_factor = (
+            0.25
+            + 0.35 * stable_height
+            + 0.40 * stable_contacts
+        )
+
+        return upright_reward * stability_factor
 
     def _reward_height_alignment(self):
         """Rewards maintaining the desired base height."""
         body_height = self.env.root_states[:, 2]
         target_height = self.env.cfg.rewards.base_height_target
 
-        return torch.exp(
+        g_z = self.env.projected_gravity[:,2]
+
+        # prevents the agent from farming height while upside down
+        upright_factor = torch.clamp(-g_z, 0.0, 1.0)
+
+        return upright_factor * torch.exp(
             -torch.square(target_height - body_height)
         )
+
+        # return torch.exp(
+        #     -torch.square(target_height - body_height)
+        # )
 
     ###############################################
     ################ MOTOR CONTROL ################
@@ -112,8 +178,23 @@ class CoRLRewards:
             dim=1
         )
 
+    # def _reward_feet_on_ground(self):
+    #     """Rewards foot-ground contacts."""
+    #     contact_forces = self.env.contact_forces[
+    #         :, self.env.feet_indices, :
+    #     ]
+
+    #     contact_norm = torch.norm(contact_forces, dim=-1)
+
+    #     contacts = (contact_norm > 1.0).float()
+
+    #     return torch.sum(contacts, dim=1)
+
     def _reward_feet_on_ground(self):
-        """Rewards foot-ground contacts."""
+        """
+        Rewards stable foot support only when approximately upright.
+        """
+
         contact_forces = self.env.contact_forces[
             :, self.env.feet_indices, :
         ]
@@ -122,7 +203,16 @@ class CoRLRewards:
 
         contacts = (contact_norm > 1.0).float()
 
-        return torch.sum(contacts, dim=1)
+        num_contacts = torch.sum(contacts, dim=1)
+
+        g_z = self.env.projected_gravity[:, 2]
+
+        upright = (g_z < -0.7).float()
+
+        return (
+            torch.clamp(num_contacts - 2, min=0.0)
+            / 2.0
+        ) * upright
 
     def _reward_posture(self):
         """
