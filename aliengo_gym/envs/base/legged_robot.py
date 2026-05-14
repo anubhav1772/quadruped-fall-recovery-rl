@@ -1687,7 +1687,7 @@ class LeggedRobot(BaseTask):
         # zero torques
         zero_torques = torch.zeros_like(self.torques)
 
-        for _ in range(10):   # 5–10 steps
+        for _ in range(3):
             self.gym.set_dof_actuation_force_tensor(
                 self.sim, gymtorch.unwrap_tensor(zero_torques)
             )
