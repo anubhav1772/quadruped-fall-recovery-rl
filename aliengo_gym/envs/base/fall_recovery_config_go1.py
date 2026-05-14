@@ -100,18 +100,30 @@ class FallRecoveryConfig(BaseCfg):
         added_mass_range = [-1., 3.]
         randomize_link_masses = True
 
+        randomize_com_displacement = True
+        com_displacement_range = [-0.05, 0.05]
+
+        randomize_Kp_factor = True
+        Kp_factor_range = [0.9, 1.1]
+
+        randomize_Kd_factor = True
+        Kd_factor_range = [0.9, 1.1]
+
     class reward_scales(BaseCfg.reward_scales):
+
+        recovery_success = 100.0
+
         base_orientation = -0.5
         upright_orientation = 6.0
         height_alignment = 1.0
 
-        feet_on_ground = 0.3
+        feet_on_ground = 1.0 #0.3
         posture = 4.0
 
-        action = -1.0e-2
+        action = -1.0e-3 #1.0e-2
         torques = -5.0e-4
-        dof_acc = -1.0e-6 #-2.5e-6
-        dof_vel = -1.0e-3 #-1.0e-2
+        dof_acc = -1.0e-7 #-1.0e-6 #-2.5e-6
+        dof_vel = -5.0e-4 #1.0e-3 #-1.0e-2
 
         # base_height = 2.0
         base_contact = -0.2
