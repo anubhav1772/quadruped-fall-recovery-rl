@@ -8,7 +8,7 @@ class CoRLRewards:
     def __init__(self, env):
         self.env = env
         self.eps_orien = 0.25
-        self.eps_posture = 0.35 #0.25
+        self.eps_posture = 0.20 #0.25
 
     def load_env(self, env):
         self.env = env
@@ -26,7 +26,7 @@ class CoRLRewards:
             dim=1
         ) < 0.5
 
-        success = upright & height & low_vel
+        success = upright & height #& low_vel
 
         return success.float()
 
@@ -207,7 +207,7 @@ class CoRLRewards:
 
         g_z = self.env.projected_gravity[:, 2]
 
-        upright = (g_z < -0.7).float()
+        upright = (g_z < -0.85).float()
 
         return (
             torch.clamp(num_contacts - 2, min=0.0)
