@@ -136,6 +136,22 @@ class LeggedRobot(BaseTask):
         self.base_ang_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:self.num_envs, 10:13])
         self.projected_gravity[:] = quat_rotate_inverse(self.base_quat, self.gravity_vec)
 
+        # if self.common_step_counter % 200 == 0:
+
+        #     env_id = 0
+
+        #     g = self.projected_gravity[env_id]
+
+        #     print("\n===== GRAVITY DEBUG =====")
+        #     print("projected gravity:", g.cpu().numpy())
+        #     print("base height:", self.root_states[env_id, 2].item())
+
+        #     print("lin vel:",
+        #           torch.norm(self.base_lin_vel[env_id]).item())
+
+        #     print("ang vel:",
+        #           torch.norm(self.base_ang_vel[env_id]).item())
+
         self.foot_velocities = self.rigid_body_state.view(self.num_envs, self.num_bodies, 13
                                                           )[:, self.feet_indices, 7:10]
         self.foot_positions = self.rigid_body_state.view(self.num_envs, self.num_bodies, 13)[:, self.feet_indices,
@@ -278,22 +294,84 @@ class LeggedRobot(BaseTask):
             stable_height = self.root_states[:, 2] > 0.30
         else:
             stable_height = self.root_states[:, 2] > 0.42
-        low_velocity = torch.norm(self.base_lin_vel, dim=1) < 0.3
-        low_ang_vel = torch.norm(self.base_ang_vel, dim=1) < 0.5
+        # low_velocity = torch.norm(self.base_lin_vel, dim=1) < 0.3
+        low_velocity = torch.norm(self.base_lin_vel[:, :2], dim=1) < 0.3
+        low_ang_vel = torch.norm(self.base_ang_vel, dim=1) < 0.9 #0.5
 
         posture_error = torch.norm(
             self.dof_pos - self.default_dof_pos, dim=1
         )
         good_posture = posture_error < 1.5
 
-        recovered = upright & stable_height & low_velocity & low_ang_vel & good_posture
+        foot_contacts = (self.contact_forces[:, self.feet_indices, 2] > 1.0).sum(dim=1)
+        stable_contacts = foot_contacts >= 3
+
+        recovered = upright & stable_height & low_velocity & low_ang_vel & good_posture & stable_contacts
 
         # persistence
         # self.recovery_counter += recovered.float()
         self.recovery_counter[recovered] += 1
         self.recovery_counter[~recovered] = 0
 
-        stable_recovery = self.recovery_counter >= 30
+        stable_recovery = self.recovery_counter >= 10 #30
+
+        # =========================================================
+        # Recovery debug statistics (mean across all envs)
+        # =========================================================
+        #
+        self.rollout_upright |= upright
+
+        self.rollout_recovered |= recovered
+
+        self.rollout_max_counter = torch.maximum(
+            self.rollout_max_counter,
+            self.recovery_counter.float()
+        )
+
+        if not hasattr(self, "extras"):
+            self.extras = {}
+
+        if "recovery_debug" not in self.extras:
+            self.extras["recovery_debug"] = {}
+
+        self.extras["recovery_debug"]["rollout_upright"] = \
+            self.rollout_upright.float().mean()
+
+        self.extras["recovery_debug"]["rollout_recovered"] = \
+            self.rollout_recovered.float().mean()
+
+        self.extras["recovery_debug"]["rollout_max_counter_mean"] = \
+            self.rollout_max_counter.mean()
+
+        self.extras["recovery_debug"]["rollout_max_counter_max"] = \
+            self.rollout_max_counter.max()
+
+        self.extras["recovery_debug"]["upright"] = \
+            upright.float().mean()
+
+        self.extras["recovery_debug"]["stable_height"] = \
+            stable_height.float().mean()
+
+        self.extras["recovery_debug"]["low_velocity"] = \
+            low_velocity.float().mean()
+
+        self.extras["recovery_debug"]["low_ang_vel"] = \
+            low_ang_vel.float().mean()
+
+        self.extras["recovery_debug"]["good_posture"] = \
+            good_posture.float().mean()
+
+        self.extras["recovery_debug"]["recovered"] = \
+            recovered.float().mean()
+
+        self.extras["recovery_debug"]["stable_recovery"] = \
+            stable_recovery.float().mean()
+
+        self.extras["recovery_debug"]["recovery_counter_mean"] = \
+            self.recovery_counter.float().mean()
+
+        self.extras["recovery_debug"]["recovery_counter_max"] = \
+            self.recovery_counter.max().float()
 
         new_recovery = stable_recovery & (~self.recovered_flag)
 
@@ -335,6 +413,10 @@ class LeggedRobot(BaseTask):
             self.commands[env_ids] = 0.0
             self.recovery_counter[env_ids] = 0.0
             self.standing_steps[env_ids] = 0
+            self.recovered_flag[env_ids] = False
+            self.rollout_upright[env_ids] = False
+            self.rollout_recovered[env_ids] = False
+            self.rollout_max_counter[env_ids] = 0
         else:
             self._resample_commands(env_ids)
 
@@ -415,8 +497,6 @@ class LeggedRobot(BaseTask):
 
         for i in range(len(self.lag_buffer)):
             self.lag_buffer[i][env_ids, :] = 0
-
-        self.recovered_flag[env_ids] = False
 
     def set_idx_pose(self, env_ids, dof_pos, base_state):
         if len(env_ids) == 0:
@@ -1539,19 +1619,26 @@ class LeggedRobot(BaseTask):
 
             # mask = g[:, 2] < -0.7
             # mask = g[:, 2] < -0.5 # rejection condition (no semi-standing states)
+            # mask = g[:, 2] < -0.3
+            mask = g[:, 2] < 0.1
             # mask = g[:, 2] < 0.0
-            mask = g[:, 2] < 0.3
+            # mask = g[:, 2] < 0.3
 
         ###########
 
-        ############# DEBUG ################
+        ############ PRE-SETTLE DEBUG ##############
         g_z = g[:, 2]
 
         sideways = ((g_z > -0.7) & (g_z < 0.3)).float().mean()
         fallen   = (g_z > 0.3).float().mean()
         upright  = (g_z < -0.7).float().mean()
 
-        print(f"[RESET DEBUG] upright {upright:.2f}, sideways {sideways:.2f}, fallen {fallen:.2f}")
+        print(
+            f"[PRE-SETTLE DEBUG] "
+            f"upright {upright:.2f}, "
+            f"sideways {sideways:.2f}, "
+            f"fallen {fallen:.2f}"
+        )
         ####################################
 
         self.root_states[env_ids, 3:7] = quat
@@ -1610,6 +1697,25 @@ class LeggedRobot(BaseTask):
         # refresh after settling
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_dof_state_tensor(self.sim)
+
+        ############ POST-SETTLE DEBUG ##############
+        g_post = quat_rotate_inverse(
+            self.root_states[env_ids, 3:7],
+            self.gravity_vec[env_ids]
+        )
+
+        g_z = g_post[:, 2]
+
+        sideways = ((g_z > -0.7) & (g_z < 0.3)).float().mean()
+        fallen   = (g_z > 0.3).float().mean()
+        upright  = (g_z < -0.7).float().mean()
+
+        print(
+            f"[POST-SETTLE DEBUG] "
+            f"upright {upright:.2f}, "
+            f"sideways {sideways:.2f}, "
+            f"fallen {fallen:.2f}"
+        )
 
         if cfg.env.record_video and 0 in env_ids:
             if self.complete_video_frames is None:
@@ -1877,6 +1983,19 @@ class LeggedRobot(BaseTask):
         if self.cfg.env.train_recovery:
             self.recovery_counter = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
             self.standing_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device, requires_grad=False)
+            self.recovered_flag = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+            # =========================================================
+            # Rollout-level recovery debug statistics
+            # =========================================================
+            # Has env EVER been upright during rollout?
+            self.rollout_upright = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+            # Has env EVER satisfied recovered condition?
+            self.rollout_recovered = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+            # Maximum persistence counter reached during rollout
+            self.rollout_max_counter = torch.zeros(self.num_envs, device=self.device)
 
         # initialize some data used later on
         self.common_step_counter = 0
@@ -2179,8 +2298,6 @@ class LeggedRobot(BaseTask):
         self.episode_sums["total"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device,
                                                  requires_grad=False)
         self.episode_sums["recovery_success"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
-
-        self.recovered_flag = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         self.episode_sums_eval = {
             name: -1 * torch.ones(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
