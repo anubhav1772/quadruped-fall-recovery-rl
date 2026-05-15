@@ -85,17 +85,22 @@ class FallRecoveryConfig(BaseCfg):
         priv_observe_contact_states = True
         priv_observe_heightmap = False
 
+    class terrain(BaseCfg.terrain):
+        mesh_type = "trimesh" # none, plane, heightfield or trimesh
+        static_friction = 1.0
+        dynamic_friction = 1.0
+
     class domain_rand(BaseCfg.domain_rand):
         # trunk_mass_range = [4.0, 28.0]
         # hip_mass_range   = [0.3, 0.7]
         # thigh_mass_range = [0.4, 4.0]
         # calf_mass_range  = [0.1, 0.8]
 
-        trunk_mass_range = [6.0, 16.0]
+        trunk_mass_range = [9.5,12.5]
 
-        hip_mass_range   = [0.45, 0.70]
-        thigh_mass_range = [1.0, 2.5]
-        calf_mass_range  = [0.15, 0.45]
+        hip_mass_range   = [0.45, 0.65]
+        thigh_mass_range = [1.2, 2.0]
+        calf_mass_range  = [0.18, 0.40]
 
         added_mass_range = [-1., 3.]
         randomize_link_masses = True
@@ -109,35 +114,16 @@ class FallRecoveryConfig(BaseCfg):
         randomize_Kd_factor = True
         Kd_factor_range = [0.9, 1.1]
 
-    class reward_scales(BaseCfg.reward_scales):
+        randomize_friction = True
+        friction_range = [0.5, 1.8]
 
-        recovery_success = 100.0
-
-        base_orientation = -0.5
-        upright_orientation = 6.0
-        height_alignment = 1.0
-
-        feet_on_ground = 1.0 #0.3
-        posture = 4.0
-
-        action = -1.0e-3 #1.0e-2
-        torques = -5.0e-4
-        dof_acc = -1.0e-7 #-1.0e-6 #-2.5e-6
-        dof_vel = -5.0e-4 #1.0e-3 #-1.0e-2
-
-        base_height = 0.0
-        base_contact = -0.2
-        dof_pos_limits = -0.4 #-1.0
-
-        ang_vel_limit = -0.002 #-0.02
-        action_smoothness_1 = -0.005
-        action_smoothness_2 = -0.005
-
-    class rewards(BaseCfg.rewards):
-        base_height_target = 0.34
+        randomize_restitution = False
 
     class normalization(BaseCfg.normalization):
         com_displacement_range = [-0.05, 0.05]
+        friction_range = [0.5, 1.8]
+        Kp_factor_range = [0.9, 1.1]
+        Kd_factor_range = [0.9, 1.1]
         # trunk_mass_range = [1.5, 30.5]
 
         # link_mass_ranges = [
@@ -146,10 +132,40 @@ class FallRecoveryConfig(BaseCfg):
         #     [0.1, 0.8],  # calf
         # ]
         #
-        trunk_mass_range = [5., 18.]
+        trunk_mass_range = [8.5, 15.5]
 
         link_mass_ranges = [
-            [0.45, 0.70],    # hip
-            [1.0, 2.5],   # thigh
-            [0.15, 0.45],  # calf
+            [0.45, 0.65],    # hip
+            [1.2, 2.0],   # thigh
+            [0.18, 0.40],  # calf
         ]
+
+    class rewards(BaseCfg.rewards):
+        base_height_target = 0.34
+
+    class reward_scales(BaseCfg.reward_scales):
+
+        recovery_success = 100.0
+
+        base_orientation = -0.5
+        upright_orientation = 6.0
+        height_alignment = 1.0
+
+        base_ang_vel = -0.02
+        feet_on_ground = 2.0 #1.0
+        posture = 6.0 #4.0
+        feet_slip = -0.02
+        body_slip = -0.05
+
+        action = -2.0e-3 #-1.0e-3
+        torques = -5.0e-4
+        dof_acc = -1.0e-7 #-1.0e-6 #-2.5e-6
+        dof_vel = -5.0e-4 #1.0e-3 #-1.0e-2
+
+        base_height = 0.0
+        base_contact = -0.2
+        dof_pos_limits = -0.8 #-0.4 #-1.0
+
+        joint_vel_limit = -0.002 #-0.02
+        action_smoothness_1 = -0.005
+        action_smoothness_2 = -0.001
