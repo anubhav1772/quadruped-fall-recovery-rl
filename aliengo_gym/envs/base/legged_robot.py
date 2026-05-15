@@ -1602,7 +1602,9 @@ class LeggedRobot(BaseTask):
         g = quat_rotate_inverse(quat, gravity)
 
         # reject near-upright or semi-upright states
-        mask = g[:, 2] < -0.3
+        # mask = g[:, 2] < -0.3
+        # mask = g[:, 2] < 0.1
+        mask = (g[:,2] < -0.1) | (g[:,2] > 0.8)
 
         while mask.any():
             idx = mask.nonzero(as_tuple=False).flatten()
@@ -1610,6 +1612,16 @@ class LeggedRobot(BaseTask):
             # resample HARD orientations
             roll[idx] = (torch.rand(len(idx), device=self.device) * 2 - 1) * torch.pi
             pitch[idx] = (torch.rand(len(idx), device=self.device) * 2 - 1) * torch.pi
+
+            # roll[idx] = (
+            #     (torch.rand(len(idx), device=self.device) * 2 - 1)
+            #     * max_roll
+            # )
+
+            # pitch[idx] = (
+            #     (torch.rand(len(idx), device=self.device) * 2 - 1)
+            #     * max_pitch
+            # )
 
             quat[idx] = quat_from_euler_xyz(roll[idx], pitch[idx], yaw[idx])
             g[idx] = quat_rotate_inverse(
@@ -1620,9 +1632,11 @@ class LeggedRobot(BaseTask):
             # mask = g[:, 2] < -0.7
             # mask = g[:, 2] < -0.5 # rejection condition (no semi-standing states)
             # mask = g[:, 2] < -0.3
-            mask = g[:, 2] < 0.1
+            # mask = g[:, 2] < 0.1
             # mask = g[:, 2] < 0.0
             # mask = g[:, 2] < 0.3
+            # mask[idx] = g[idx, 2] < 0.1
+            mask = (g[:, 2] < -0.1) | (g[:, 2] > 0.8)
 
         ###########
 
@@ -1697,6 +1711,15 @@ class LeggedRobot(BaseTask):
         # refresh after settling
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_dof_state_tensor(self.sim)
+
+        g_post = self.projected_gravity[env_ids]
+
+        print(
+            "post-settle gz:",
+            g_post[:,2].mean().item(),
+            g_post[:,2].min().item(),
+            g_post[:,2].max().item()
+        )
 
         ############ POST-SETTLE DEBUG ##############
         g_post = quat_rotate_inverse(
@@ -2518,7 +2541,7 @@ class LeggedRobot(BaseTask):
             self.camera_props = gymapi.CameraProperties()
             self.camera_props.width = 360
             self.camera_props.height = 240
-            self.camera_props.enable_tensors = True # True (on gcp headless) #False (local)
+            self.camera_props.enable_tensors = False # True (on gcp headless) #False (local)
             self.rendering_camera = self.gym.create_camera_sensor(self.envs[0], self.camera_props)
 
             if self.rendering_camera == -1:
