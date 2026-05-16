@@ -15,10 +15,10 @@ class PPO_Args(PrefixProto):
     value_loss_coef = 1.0
     use_clipped_value_loss = True
     clip_param = 0.2
-    entropy_coef = 0.01
+    entropy_coef = 0.005 #0.01
     num_learning_epochs = 5
     num_mini_batches = 4  # mini batch size = num_envs*nsteps / nminibatches
-    learning_rate = 3e-4
+    learning_rate = 1e-3
     adaptation_module_learning_rate = 1e-3
     num_adaptation_module_substeps = 1
     schedule = 'adaptive'  # could be adaptive, fixed
