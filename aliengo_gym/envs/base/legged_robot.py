@@ -164,7 +164,8 @@ class LeggedRobot(BaseTask):
 
         # Compute Energy Consumption
         self.energy_consume = torch.sum(torch.abs(self.dof_vel * self.torques), dim=1).detach().clone()
-        self.cot = torch.sum(torch.multiply(self.torques, self.dof_vel), dim=1) / (21.5 * 9.81 * torch.norm(self.base_lin_vel[:, 0:2], dim=1))
+        robot_mass = 12.0 if self.cfg.env.robot == "go1" else 21.5
+        self.cot = torch.sum(torch.multiply(self.torques, self.dof_vel), dim=1) / (robot_mass * 9.81 * torch.norm(self.base_lin_vel[:, 0:2], dim=1))
         self.dof_acc[:] = (self.dof_vel[:] - self.last_dof_vel[:]) / self.dt
 
         self.compute_reward()
@@ -225,12 +226,12 @@ class LeggedRobot(BaseTask):
 
         # 2. Stable standing condition
         g_z = self.projected_gravity[:, 2]
-        upright = g_z < -0.9
+        upright = g_z < -0.8 #-0.9
         stable_height = self.root_states[:, 2] > 0.28
-        low_lin_vel = torch.norm(self.base_lin_vel[:, :2], dim=1) < 0.15
-        low_ang_vel = torch.norm(self.base_ang_vel, dim=1) < 0.3
+        low_lin_vel = torch.norm(self.base_lin_vel[:, :2], dim=1) < 0.2
+        low_ang_vel = torch.norm(self.base_ang_vel, dim=1) < 0.5
         posture_error = torch.norm(self.dof_pos - self.default_dof_pos, dim=1)
-        good_posture = posture_error < 1.0
+        good_posture = posture_error < 1.5
         stable_standing = (
                 upright
                 & stable_height
@@ -244,7 +245,7 @@ class LeggedRobot(BaseTask):
         self.standing_steps[~stable_standing] = 0
 
         # Success termination
-        success_reset = self.standing_steps >= 100
+        success_reset = self.standing_steps >= 25 #50 #100
         self.reset_buf |= success_reset
 
         # 3. Timeout
@@ -289,9 +290,9 @@ class LeggedRobot(BaseTask):
 
         g_z = self.projected_gravity[:, 2]
 
-        upright = g_z < -0.9
+        upright = g_z < -0.8
         if self.cfg.env.robot == "go1":
-            stable_height = self.root_states[:, 2] > 0.30
+            stable_height = self.root_states[:, 2] > 0.27
         else:
             stable_height = self.root_states[:, 2] > 0.42
         # low_velocity = torch.norm(self.base_lin_vel, dim=1) < 0.3
@@ -308,6 +309,8 @@ class LeggedRobot(BaseTask):
 
         recovered = upright & stable_height & low_velocity & low_ang_vel & good_posture & stable_contacts
 
+        self.recovery_rate_ema = 0.95 * self.recovery_rate_ema + 0.05 * recovered.float().mean().item()
+
         # persistence
         # self.recovery_counter += recovered.float()
         self.recovery_counter[recovered] += 1
@@ -321,7 +324,9 @@ class LeggedRobot(BaseTask):
         #
         self.rollout_upright |= upright
 
-        self.rollout_recovered |= recovered
+        # self.rollout_recovered |= recovered # transient recoveries
+        # curriculum progression depends on stable recoveries
+        self.rollout_recovered |= stable_recovery
 
         self.rollout_max_counter = torch.maximum(
             self.rollout_max_counter,
@@ -334,47 +339,27 @@ class LeggedRobot(BaseTask):
         if "recovery_debug" not in self.extras:
             self.extras["recovery_debug"] = {}
 
-        self.extras["recovery_debug"]["rollout_upright"] = \
-            self.rollout_upright.float().mean()
+        self.extras["recovery_debug"]["rollout_upright"] = self.rollout_upright.float().mean()
 
-        self.extras["recovery_debug"]["rollout_recovered"] = \
-            self.rollout_recovered.float().mean()
-
-        self.extras["recovery_debug"]["rollout_max_counter_mean"] = \
-            self.rollout_max_counter.mean()
-
-        self.extras["recovery_debug"]["rollout_max_counter_max"] = \
-            self.rollout_max_counter.max()
-
-        self.extras["recovery_debug"]["upright"] = \
-            upright.float().mean()
-
-        self.extras["recovery_debug"]["stable_height"] = \
-            stable_height.float().mean()
-
-        self.extras["recovery_debug"]["low_velocity"] = \
-            low_velocity.float().mean()
-
-        self.extras["recovery_debug"]["low_ang_vel"] = \
-            low_ang_vel.float().mean()
-
-        self.extras["recovery_debug"]["good_posture"] = \
-            good_posture.float().mean()
-
-        self.extras["recovery_debug"]["recovered"] = \
-            recovered.float().mean()
-
-        self.extras["recovery_debug"]["stable_recovery"] = \
-            stable_recovery.float().mean()
-
-        self.extras["recovery_debug"]["recovery_counter_mean"] = \
-            self.recovery_counter.float().mean()
-
-        self.extras["recovery_debug"]["recovery_counter_max"] = \
-            self.recovery_counter.max().float()
+        self.extras["recovery_debug"]["recovery_rate_ema"]        = self.recovery_rate_ema
+        self.extras["recovery_debug"]["rollout_upright"]          = self.rollout_upright.float().mean().item()
+        self.extras["recovery_debug"]["rollout_recovered"]        = self.rollout_recovered.float().mean().item()
+        self.extras["recovery_debug"]["rollout_max_counter_mean"] = self.rollout_max_counter.mean().item()
+        self.extras["recovery_debug"]["rollout_max_counter_max"]  = self.rollout_max_counter.max().item()
+        self.extras["recovery_debug"]["upright"]                  = upright.float().mean().item()
+        self.extras["recovery_debug"]["stable_height"]            = stable_height.float().mean().item()
+        self.extras["recovery_debug"]["low_velocity"]             = low_velocity.float().mean().item()
+        self.extras["recovery_debug"]["low_ang_vel"]              = low_ang_vel.float().mean().item()
+        self.extras["recovery_debug"]["good_posture"]             = good_posture.float().mean().item()
+        self.extras["recovery_debug"]["recovered"]                = recovered.float().mean().item()
+        self.extras["recovery_debug"]["stable_recovery"]          = stable_recovery.float().mean().item()
+        self.extras["recovery_debug"]["recovery_counter_mean"]    = self.recovery_counter.float().mean().item()
+        self.extras["recovery_debug"]["recovery_counter_max"]     = self.recovery_counter.max().float().item()
+        self.extras["recovery_debug"]["curriculum_phase"]         = (
+                                                                    1 if self.recovery_rate_ema < 0.25 else
+                                                                    2 if self.recovery_rate_ema < 0.55 else 3)
 
         new_recovery = stable_recovery & (~self.recovered_flag)
-
         self.recovered_flag |= stable_recovery
         self.episode_sums["recovery_success"] += new_recovery.float()
 
@@ -417,6 +402,8 @@ class LeggedRobot(BaseTask):
             self.rollout_upright[env_ids] = False
             self.rollout_recovered[env_ids] = False
             self.rollout_max_counter[env_ids] = 0
+            self.last_torques[env_ids] = 0.   # prevents torque penalty spike at step 1
+            self.torques[env_ids] = 0.
         else:
             self._resample_commands(env_ids)
 
@@ -1534,162 +1521,338 @@ class LeggedRobot(BaseTask):
         torques = torques * self.motor_strengths
         return torch.clip(torques, -self.torque_limits, self.torque_limits)
 
+    # def _reset_dofs(self, env_ids, cfg):
+    #     """ Resets DOF position and velocities of selected environmments
+    #     Positions are randomly selected within 0.5:1.5 x default positions.
+    #     Velocities are set to zero.
+
+    #     Args:
+    #         env_ids (List[int]): Environemnt ids
+    #     """
+
+    #     if self.cfg.env.train_recovery:
+    #         self.dof_pos[env_ids] = self.default_dof_pos + 0.5 * torch.randn(len(env_ids), self.num_dof, device=self.device)
+    #         self.dof_vel[env_ids] = 0.5 * torch.randn(len(env_ids), self.num_dof, device=self.device)
+    #         # self.dof_vel[env_ids] = 0.
+    #     else:
+    #         self.dof_pos[env_ids] = self.default_dof_pos * torch_rand_float(0.5, 1.5, (len(env_ids), self.num_dof),
+    #                                                                         device=self.device)
+    #         self.dof_vel[env_ids] = 0.
+
+    #     env_ids_int32 = env_ids.to(dtype=torch.int32)
+    #     self.gym.set_dof_state_tensor_indexed(self.sim,
+    #                                           gymtorch.unwrap_tensor(self.dof_state),
+    #                                           gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+
     def _reset_dofs(self, env_ids, cfg):
-        """ Resets DOF position and velocities of selected environmments
-        Positions are randomly selected within 0.5:1.5 x default positions.
-        Velocities are set to zero.
-
-        Args:
-            env_ids (List[int]): Environemnt ids
-        """
-
         if self.cfg.env.train_recovery:
-            self.dof_pos[env_ids] = self.default_dof_pos + 0.5 * torch.randn(len(env_ids), self.num_dof, device=self.device)
-            self.dof_vel[env_ids] = 0.5 * torch.randn(len(env_ids), self.num_dof, device=self.device)
-            # self.dof_vel[env_ids] = 0.
+            noise = 0.1 * torch.randn(len(env_ids), self.num_dof, device=self.device)
+            self.dof_pos[env_ids] = torch.clamp(self.default_dof_pos + noise, self.dof_pos_limits[:, 0], self.dof_pos_limits[:, 1])
+            self.dof_vel[env_ids] = 0.
         else:
-            self.dof_pos[env_ids] = self.default_dof_pos * torch_rand_float(0.5, 1.5, (len(env_ids), self.num_dof),
-                                                                            device=self.device)
+            self.dof_pos[env_ids] = self.default_dof_pos * torch_rand_float(0.5, 1.5, (len(env_ids), self.num_dof), device=self.device)
             self.dof_vel[env_ids] = 0.
 
         env_ids_int32 = env_ids.to(dtype=torch.int32)
-        self.gym.set_dof_state_tensor_indexed(self.sim,
-                                              gymtorch.unwrap_tensor(self.dof_state),
-                                              gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+        self.gym.set_dof_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.dof_state),
+            gymtorch.unwrap_tensor(env_ids_int32),
+            len(env_ids_int32)
+        )
+
+
+    # def _reset_root_states_fall_recovery(self, env_ids, cfg):
+    #     """Reset robots to fallen poses for recovery training.
+    #     Uses a curriculum that starts with easy falls (small tilt) and progressively
+    #     increases difficulty (larger tilt angles) as training advances.
+    #     """
+
+    #     num_resets = len(env_ids)
+
+    #     # 1. Position (ONLY x,y from terrain)
+    #     self.root_states[env_ids, 0:2] = self.env_origins[env_ids, 0:2]
+
+    #     # No need to copy base_init_state (as for locomotion in _reset_root_states)
+    #     # 2. Curriculum (roll, pitch)
+    #     progress = torch.clamp(
+    #         torch.tensor(self.common_step_counter, device=self.device) / 5e6,
+    #         0.0, 1.0
+    #     )
+
+    #     min_roll = 0.6 + 0.4 * progress
+    #     min_pitch = 0.4 + 0.4 * progress
+
+    #     max_roll = 0.8 + 1.2 * progress
+    #     max_pitch = 0.5 + 0.8 * progress
+
+    #     mag_roll = min_roll + (max_roll - min_roll) * torch.rand(num_resets, device=self.device)**0.5
+    #     mag_pitch = min_pitch + (max_pitch - min_pitch) * torch.rand(num_resets, device=self.device)**0.5
+
+    #     sign_roll = torch.where(torch.rand(num_resets, device=self.device) > 0.5, 1.0, -1.0)
+    #     sign_pitch = torch.where(torch.rand(num_resets, device=self.device) > 0.5, 1.0, -1.0)
+
+    #     roll = sign_roll * mag_roll
+    #     pitch = sign_pitch * mag_pitch
+    #     yaw = torch.rand(num_resets, device=self.device) * 2 * torch.pi - torch.pi
+
+    #     # Avoid near-zero cases
+    #     mask = (torch.abs(roll) < 0.4) & (torch.abs(pitch) < 0.3)
+    #     roll[mask] = sign_roll[mask] * min_roll
+    #     pitch[mask] = sign_pitch[mask] * min_pitch
+
+    #     quat = quat_from_euler_xyz(roll, pitch, yaw)
+
+    #     gravity = self.gravity_vec[env_ids]
+    #     g = quat_rotate_inverse(quat, gravity)
+
+    #     # reject near-upright or semi-upright states
+    #     # mask = g[:, 2] < -0.3
+    #     # mask = g[:, 2] < 0.1
+    #     mask = (g[:,2] < -0.1) | (g[:,2] > 0.8)
+
+    #     while mask.any():
+    #         idx = mask.nonzero(as_tuple=False).flatten()
+
+    #         # resample HARD orientations
+    #         roll[idx] = (torch.rand(len(idx), device=self.device) * 2 - 1) * torch.pi
+    #         pitch[idx] = (torch.rand(len(idx), device=self.device) * 2 - 1) * torch.pi
+
+    #         # roll[idx] = (
+    #         #     (torch.rand(len(idx), device=self.device) * 2 - 1)
+    #         #     * max_roll
+    #         # )
+
+    #         # pitch[idx] = (
+    #         #     (torch.rand(len(idx), device=self.device) * 2 - 1)
+    #         #     * max_pitch
+    #         # )
+
+    #         quat[idx] = quat_from_euler_xyz(roll[idx], pitch[idx], yaw[idx])
+    #         g[idx] = quat_rotate_inverse(
+    #             quat[idx],
+    #             gravity[idx]
+    #         )
+
+    #         # mask = g[:, 2] < -0.7
+    #         # mask = g[:, 2] < -0.5 # rejection condition (no semi-standing states)
+    #         # mask = g[:, 2] < -0.3
+    #         # mask = g[:, 2] < 0.1
+    #         # mask = g[:, 2] < 0.0
+    #         # mask = g[:, 2] < 0.3
+    #         # mask[idx] = g[idx, 2] < 0.1
+    #         mask = (g[:, 2] < -0.1) | (g[:, 2] > 0.8)
+
+    #     ###########
+
+    #     ############ PRE-SETTLE DEBUG ##############
+    #     g_z = g[:, 2]
+
+    #     sideways = ((g_z > -0.7) & (g_z < 0.3)).float().mean()
+    #     fallen   = (g_z > 0.3).float().mean()
+    #     upright  = (g_z < -0.7).float().mean()
+
+    #     print(
+    #         f"[PRE-SETTLE DEBUG] "
+    #         f"upright {upright:.2f}, "
+    #         f"sideways {sideways:.2f}, "
+    #         f"fallen {fallen:.2f}"
+    #     )
+    #     ####################################
+
+    #     self.root_states[env_ids, 3:7] = quat
+
+    #     # 3. Height
+    #     # base_height = 0.28
+    #     # self.root_states[env_ids, 2] = base_height + 0.02 * torch.rand(num_resets, device=self.device)
+    #     self.root_states[env_ids, 2] = 0.18 + 0.10 * torch.rand(num_resets, device=self.device)
+
+    #     # 4. Velocities
+    #     vel = torch.zeros(num_resets, 6, device=self.device)
+
+    #     # small linear noise
+    #     vel[:, 0:3] = 0.05 * torch.randn(num_resets, 3, device=self.device)
+    #     vel[:, 2] = torch.clamp(vel[:, 2], -0.1, 0.0)
+
+    #     # NO angular velocity
+    #     # vel[:, 3:6] = 0.0
+    #     vel[:, 3:6] = torch.clamp(
+    #         1.0 * torch.randn(num_resets, 3, device=self.device),
+    #         -2.0, 2.0
+    #     )
+
+    #     self.root_states[env_ids, 7:13] = vel
+
+    #     ########################### DEBUG CODE ############################
+    #     # roll, pitch, _ = get_euler_xyz(self.root_states[env_ids, 3:7])
+    #     # roll = torch.atan2(torch.sin(roll), torch.cos(roll))
+    #     # pitch = torch.atan2(torch.sin(pitch), torch.cos(pitch))
+    #     # print("RESET (recovery):")
+    #     # print("roll mean:", roll.mean().item())
+    #     # print("pitch mean:", pitch.mean().item())
+    #     # print("height mean:", self.root_states[env_ids, 2].mean().item())
+    #     ###################################################################
+
+    #     # 5. Push to sim
+    #     env_ids_int32 = env_ids.to(dtype=torch.int32)
+
+    #     self.gym.set_actor_root_state_tensor_indexed(
+    #         self.sim,
+    #         gymtorch.unwrap_tensor(self.root_states),
+    #         gymtorch.unwrap_tensor(env_ids_int32),
+    #         len(env_ids_int32)
+    #     )
+
+    #     # zero torques
+    #     zero_torques = torch.zeros_like(self.torques)
+
+    #     for _ in range(3):
+    #         self.gym.set_dof_actuation_force_tensor(
+    #             self.sim, gymtorch.unwrap_tensor(zero_torques)
+    #         )
+    #         self.gym.simulate(self.sim)
+    #         self.gym.fetch_results(self.sim, True)
+
+    #     # refresh after settling
+    #     self.gym.refresh_actor_root_state_tensor(self.sim)
+    #     self.gym.refresh_dof_state_tensor(self.sim)
+
+    #     g_post = self.projected_gravity[env_ids]
+
+    #     print(
+    #         "post-settle gz:",
+    #         g_post[:,2].mean().item(),
+    #         g_post[:,2].min().item(),
+    #         g_post[:,2].max().item()
+    #     )
+
+    #     ############ POST-SETTLE DEBUG ##############
+    #     g_post = quat_rotate_inverse(
+    #         self.root_states[env_ids, 3:7],
+    #         self.gravity_vec[env_ids]
+    #     )
+
+    #     g_z = g_post[:, 2]
+
+    #     sideways = ((g_z > -0.7) & (g_z < 0.3)).float().mean()
+    #     fallen   = (g_z > 0.3).float().mean()
+    #     upright  = (g_z < -0.7).float().mean()
+
+    #     print(
+    #         f"[POST-SETTLE DEBUG] "
+    #         f"upright {upright:.2f}, "
+    #         f"sideways {sideways:.2f}, "
+    #         f"fallen {fallen:.2f}"
+    #     )
+
+    #     if cfg.env.record_video and 0 in env_ids:
+    #         if self.complete_video_frames is None:
+    #             self.complete_video_frames = []
+    #         else:
+    #             self.complete_video_frames = self.video_frames[:]
+    #         self.video_frames = []
+
+    #     if cfg.env.record_video and self.eval_cfg is not None and self.num_train_envs in env_ids:
+    #         if self.complete_video_frames_eval is None:
+    #             self.complete_video_frames_eval = []
+    #         else:
+    #             self.complete_video_frames_eval = self.video_frames_eval[:]
+    #         self.video_frames_eval = []
 
     def _reset_root_states_fall_recovery(self, env_ids, cfg):
-        """Reset robots to fallen poses for recovery training.
-        Uses a curriculum that starts with easy falls (small tilt) and progressively
-        increases difficulty (larger tilt angles) as training advances.
-        """
-
         num_resets = len(env_ids)
 
-        # 1. Position (ONLY x,y from terrain)
+        # 1. XY position from terrain origins
         self.root_states[env_ids, 0:2] = self.env_origins[env_ids, 0:2]
 
-        # No need to copy base_init_state (as for locomotion in _reset_root_states)
-        # 2. Curriculum (roll, pitch)
+        # 2. Orientation curriculum
         progress = torch.clamp(
             torch.tensor(self.common_step_counter, device=self.device) / 5e6,
             0.0, 1.0
         )
 
-        min_roll = 0.6 + 0.4 * progress
+        min_roll  = 0.6 + 0.4 * progress
         min_pitch = 0.4 + 0.4 * progress
-
-        max_roll = 0.8 + 1.2 * progress
+        max_roll  = 0.8 + 1.2 * progress
         max_pitch = 0.5 + 0.8 * progress
 
-        mag_roll = min_roll + (max_roll - min_roll) * torch.rand(num_resets, device=self.device)**0.5
-        mag_pitch = min_pitch + (max_pitch - min_pitch) * torch.rand(num_resets, device=self.device)**0.5
+        mag_roll  = min_roll  + (max_roll  - min_roll)  * torch.rand(num_resets, device=self.device) ** 0.5
+        mag_pitch = min_pitch + (max_pitch - min_pitch) * torch.rand(num_resets, device=self.device) ** 0.5
 
-        sign_roll = torch.where(torch.rand(num_resets, device=self.device) > 0.5, 1.0, -1.0)
-        sign_pitch = torch.where(torch.rand(num_resets, device=self.device) > 0.5, 1.0, -1.0)
+        sign_roll  = torch.where(torch.rand(num_resets, device=self.device) > 0.5,  1.0, -1.0)
+        sign_pitch = torch.where(torch.rand(num_resets, device=self.device) > 0.5,  1.0, -1.0)
 
-        roll = sign_roll * mag_roll
+        roll  = sign_roll  * mag_roll
         pitch = sign_pitch * mag_pitch
-        yaw = torch.rand(num_resets, device=self.device) * 2 * torch.pi - torch.pi
+        yaw   = torch.rand(num_resets, device=self.device) * 2 * torch.pi - torch.pi
 
-        # Avoid near-zero cases
-        mask = (torch.abs(roll) < 0.4) & (torch.abs(pitch) < 0.3)
-        roll[mask] = sign_roll[mask] * min_roll
-        pitch[mask] = sign_pitch[mask] * min_pitch
-
-        quat = quat_from_euler_xyz(roll, pitch, yaw)
-
+        quat    = quat_from_euler_xyz(roll, pitch, yaw)
         gravity = self.gravity_vec[env_ids]
-        g = quat_rotate_inverse(quat, gravity)
+        g       = quat_rotate_inverse(quat, gravity)
 
-        # reject near-upright or semi-upright states
-        # mask = g[:, 2] < -0.3
-        # mask = g[:, 2] < 0.1
-        mask = (g[:,2] < -0.1) | (g[:,2] > 0.8)
+        # Reject near-upright (gz < -0.1) AND fully supine (gz > 0.8)
+        # Keep sideways + partial falls: gz in [-0.1, 0.8]
+        # mask = (g[:, 2] < -0.1) | (g[:, 2] > 0.8)
+        # Use rollout_recovered as curriculum signal (already tracked in your debug)
+        # recovery_rate = self.rollout_recovered.float().mean().item()
+        recovery_rate = self.recovery_rate_ema
 
-        while mask.any():
-            idx = mask.nonzero(as_tuple=False).flatten()
-
-            # resample HARD orientations
-            roll[idx] = (torch.rand(len(idx), device=self.device) * 2 - 1) * torch.pi
-            pitch[idx] = (torch.rand(len(idx), device=self.device) * 2 - 1) * torch.pi
-
-            # roll[idx] = (
-            #     (torch.rand(len(idx), device=self.device) * 2 - 1)
-            #     * max_roll
-            # )
-
-            # pitch[idx] = (
-            #     (torch.rand(len(idx), device=self.device) * 2 - 1)
-            #     * max_pitch
-            # )
-
-            quat[idx] = quat_from_euler_xyz(roll[idx], pitch[idx], yaw[idx])
-            g[idx] = quat_rotate_inverse(
-                quat[idx],
-                gravity[idx]
-            )
-
-            # mask = g[:, 2] < -0.7
-            # mask = g[:, 2] < -0.5 # rejection condition (no semi-standing states)
-            # mask = g[:, 2] < -0.3
-            # mask = g[:, 2] < 0.1
-            # mask = g[:, 2] < 0.0
-            # mask = g[:, 2] < 0.3
-            # mask[idx] = g[idx, 2] < 0.1
+        if recovery_rate < 0.25:
+            # Phase 1: supine only - easiest, symmetric
+            mask = g[:, 2] < 0.1 #0.3
+        elif recovery_rate < 0.55:
+            # Phase 2: all fallen states including sideways
+            mask = g[:, 2] < -0.1
+        else:
+            # Phase 3: exclude easy supine, force harder sideways
             mask = (g[:, 2] < -0.1) | (g[:, 2] > 0.8)
 
-        ###########
+        max_iters = 20
+        for _ in range(max_iters):
+            if not mask.any():
+                break
+            idx = mask.nonzero(as_tuple=False).flatten()
+            roll[idx]  = (torch.rand(len(idx), device=self.device) * 2 - 1) * torch.pi
+            pitch[idx] = (torch.rand(len(idx), device=self.device) * 2 - 1) * torch.pi
+            quat[idx]  = quat_from_euler_xyz(roll[idx], pitch[idx], yaw[idx])
+            g[idx]     = quat_rotate_inverse(quat[idx], gravity[idx])
+            # mask       = (g[:, 2] < -0.1) | (g[:, 2] > 0.8)
+            if recovery_rate < 0.25:
+                # Phase 1: supine only — easiest, symmetric
+                mask = g[:, 2] < 0.3
+            elif recovery_rate < 0.55:
+                # Phase 2: all fallen states including sideways
+                mask = g[:, 2] < -0.1
+            else:
+                # Phase 3: exclude easy supine, force harder sideways
+                mask = (g[:, 2] < -0.1) | (g[:, 2] > 0.8)
 
-        ############ PRE-SETTLE DEBUG ##############
-        g_z = g[:, 2]
+        # 3. Height: low enough to land quickly, varied
+        # Robot-aware spawn height
+        if self.cfg.env.robot == "go1":
+            self.root_states[env_ids, 2] = 0.15 + 0.06 * torch.rand(num_resets, device=self.device)
+        else:  # aliengo
+            self.root_states[env_ids, 2] = 0.18 + 0.08 * torch.rand(num_resets, device=self.device)
 
-        sideways = ((g_z > -0.7) & (g_z < 0.3)).float().mean()
-        fallen   = (g_z > 0.3).float().mean()
-        upright  = (g_z < -0.7).float().mean()
-
-        print(
-            f"[PRE-SETTLE DEBUG] "
-            f"upright {upright:.2f}, "
-            f"sideways {sideways:.2f}, "
-            f"fallen {fallen:.2f}"
-        )
-        ####################################
-
+        # 4. Orientation
         self.root_states[env_ids, 3:7] = quat
 
-        # 3. Height
-        # base_height = 0.28
-        # self.root_states[env_ids, 2] = base_height + 0.02 * torch.rand(num_resets, device=self.device)
-        self.root_states[env_ids, 2] = 0.18 + 0.10 * torch.rand(num_resets, device=self.device)
-
-        # 4. Velocities
+        # 5. Velocities — small linear only, NO angular at reset
         vel = torch.zeros(num_resets, 6, device=self.device)
-
-        # small linear noise
         vel[:, 0:3] = 0.05 * torch.randn(num_resets, 3, device=self.device)
-        vel[:, 2] = torch.clamp(vel[:, 2], -0.1, 0.0)
-
-        # NO angular velocity
-        # vel[:, 3:6] = 0.0
-        vel[:, 3:6] = torch.clamp(
-            1.0 * torch.randn(num_resets, 3, device=self.device),
-            -2.0, 2.0
-        )
-
+        vel[:, 2]   = torch.clamp(vel[:, 2], -0.1, 0.0)
+        # vel[:, 3:6] = 0  ← keep zero, don't add angular vel at reset
         self.root_states[env_ids, 7:13] = vel
 
-        ########################### DEBUG CODE ############################
-        # roll, pitch, _ = get_euler_xyz(self.root_states[env_ids, 3:7])
-        # roll = torch.atan2(torch.sin(roll), torch.cos(roll))
-        # pitch = torch.atan2(torch.sin(pitch), torch.cos(pitch))
-        # print("RESET (recovery):")
-        # print("roll mean:", roll.mean().item())
-        # print("pitch mean:", pitch.mean().item())
-        # print("height mean:", self.root_states[env_ids, 2].mean().item())
-        ###################################################################
-
-        # 5. Push to sim
+        # 6. Push to sim
         env_ids_int32 = env_ids.to(dtype=torch.int32)
+
+        self.gym.set_dof_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.dof_state),
+            gymtorch.unwrap_tensor(env_ids_int32),
+            len(env_ids_int32)
+        )
 
         self.gym.set_actor_root_state_tensor_indexed(
             self.sim,
@@ -1698,47 +1861,32 @@ class LeggedRobot(BaseTask):
             len(env_ids_int32)
         )
 
-        # zero torques
+        # 7. Settle — enough steps for body to land and stop bouncing
+        #    dt=0.005s × 25 steps = 125ms — sufficient for ~0.2m drop
         zero_torques = torch.zeros_like(self.torques)
-
-        for _ in range(3):
+        settle_steps = 20 if self.cfg.env.robot == "go1" else 25
+        for _ in range(settle_steps):
             self.gym.set_dof_actuation_force_tensor(
                 self.sim, gymtorch.unwrap_tensor(zero_torques)
             )
             self.gym.simulate(self.sim)
             self.gym.fetch_results(self.sim, True)
 
-        # refresh after settling
         self.gym.refresh_actor_root_state_tensor(self.sim)
+        self.gym.refresh_net_contact_force_tensor(self.sim)
         self.gym.refresh_dof_state_tensor(self.sim)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
 
-        g_post = self.projected_gravity[env_ids]
+        # 8. Debug — recompute gz from fresh quat
+        fresh_quat = self.root_states[env_ids, 3:7]
+        g_post     = quat_rotate_inverse(fresh_quat, self.gravity_vec[env_ids])
+        gz         = g_post[:, 2]
 
-        print(
-            "post-settle gz:",
-            g_post[:,2].mean().item(),
-            g_post[:,2].min().item(),
-            g_post[:,2].max().item()
-        )
-
-        ############ POST-SETTLE DEBUG ##############
-        g_post = quat_rotate_inverse(
-            self.root_states[env_ids, 3:7],
-            self.gravity_vec[env_ids]
-        )
-
-        g_z = g_post[:, 2]
-
-        sideways = ((g_z > -0.7) & (g_z < 0.3)).float().mean()
-        fallen   = (g_z > 0.3).float().mean()
-        upright  = (g_z < -0.7).float().mean()
-
-        print(
-            f"[POST-SETTLE DEBUG] "
-            f"upright {upright:.2f}, "
-            f"sideways {sideways:.2f}, "
-            f"fallen {fallen:.2f}"
-        )
+        sideways = ((gz > -0.7) & (gz < 0.3)).float().mean()
+        fallen   = (gz >= 0.3).float().mean()
+        upright  = (gz < -0.7).float().mean()
+        print(f"[POST-SETTLE] upright={upright:.2f} sideways={sideways:.2f} fallen={fallen:.2f} | "
+              f"gz min={gz.min():.3f} mean={gz.mean():.3f} max={gz.max():.3f}")
 
         if cfg.env.record_video and 0 in env_ids:
             if self.complete_video_frames is None:
@@ -1769,11 +1917,11 @@ class LeggedRobot(BaseTask):
         # linear velocity
         self.root_states[env_ids, 7:10] = 0.5 * torch.randn(num_resets, 3, device=self.device)
 
-        # angular velocity (important!)
-        self.root_states[env_ids, 10:13] = torch.clamp(
-            1.0 * torch.randn(num_resets, 3, device=self.device),
-            -2.0, 2.0
-        )
+        # angular velocity
+        # self.root_states[env_ids, 10:13] = torch.clamp(
+        #     1.0 * torch.randn(num_resets, 3, device=self.device),
+        #     -2.0, 2.0
+        # )
 
         # push to sim
         env_ids_int32 = env_ids.to(dtype=torch.int32)
@@ -2016,6 +2164,7 @@ class LeggedRobot(BaseTask):
 
             # Has env EVER satisfied recovered condition?
             self.rollout_recovered = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            self.recovery_rate_ema = 0.0
 
             # Maximum persistence counter reached during rollout
             self.rollout_max_counter = torch.zeros(self.num_envs, device=self.device)
@@ -2541,7 +2690,7 @@ class LeggedRobot(BaseTask):
             self.camera_props = gymapi.CameraProperties()
             self.camera_props.width = 360
             self.camera_props.height = 240
-            self.camera_props.enable_tensors = False # True (on gcp headless) #False (local)
+            self.camera_props.enable_tensors = True # True (on gcp headless) #False (local)
             self.rendering_camera = self.gym.create_camera_sensor(self.envs[0], self.camera_props)
 
             if self.rendering_camera == -1:
