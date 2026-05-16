@@ -145,7 +145,7 @@ class FallRecoveryConfig(BaseCfg):
 
     class reward_scales(BaseCfg.reward_scales):
 
-        recovery_success = 100.0
+        recovery_success = 200.0
 
         base_orientation = -0.5
         upright_orientation = 6.0
@@ -155,7 +155,7 @@ class FallRecoveryConfig(BaseCfg):
         feet_on_ground = 2.0 #1.0
         posture = 6.0 #4.0
         feet_slip = -0.02
-        body_slip = -0.05
+        body_slip = -0.02 #-0.05
 
         action = -2.0e-3 #-1.0e-3
         torques = -5.0e-4
@@ -164,7 +164,7 @@ class FallRecoveryConfig(BaseCfg):
 
         base_height = 0.0
         base_contact = -0.2
-        dof_pos_limits = -0.8 #-0.4 #-1.0
+        dof_pos_limits = -0.3 #-0.4 #-1.0
 
         joint_vel_limit = -0.002 #-0.02
         action_smoothness_1 = -0.005
