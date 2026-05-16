@@ -317,7 +317,7 @@ class BaseCfg(PrefixProto, cli=False):
 
     class rewards(PrefixProto, cli=False):
         only_positive_rewards = False  # if true negative total rewards are clipped at zero (avoids early termination problems)
-        only_positive_rewards_ji22_style = True
+        only_positive_rewards_ji22_style = False
         sigma_rew_neg = 0.02
         reward_container_name = "CoRLRewards"
         tracking_sigma = 0.25  # tracking reward = exp(-error^2/sigma)
@@ -401,7 +401,7 @@ class BaseCfg(PrefixProto, cli=False):
         restitution_range = [0, 1.0]
         added_mass_range = [-1., 3.]
         com_displacement_range = [-0.05, 0.05]
-        com_position_range = [-0.3, 0.3] # [-0.2, 0.2]
+        com_position_range = [-0.05, 0.05] # [-0.2, 0.2]
         motor_strength_range = [0.9, 1.1]
         motor_offset_range = [-0.05, 0.05]
         Kp_factor_range = [0.8, 1.3]
