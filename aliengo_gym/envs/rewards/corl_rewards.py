@@ -13,13 +13,17 @@ class CoRLRewards:
     def load_env(self, env):
         self.env = env
 
-    ######## sparse terminal success reward ########
+    ######## dense success reward ########
     def _reward_recovery_success(self):
 
         g_z = self.env.projected_gravity[:, 2]
 
         upright = g_z < -0.9
-        height = self.env.root_states[:, 2] > 0.28
+
+        if self.env.cfg.env.robot == "go1":
+            height = self.env.root_states[:, 2] > 0.28
+        else:
+            height = self.env.root_states[:, 2] > 0.42
 
         low_vel = torch.norm(
             self.env.base_lin_vel[:, :2],
@@ -29,6 +33,11 @@ class CoRLRewards:
         success = upright & height #& low_vel
 
         return success.float()
+
+    ######## sparse success reward ########
+    def _reward_recovery_bonus(self):
+        return self.env.recovery_bonus_buf
+
 
     ###############################################
     ############ ORIENTATION & POSTURE ############
