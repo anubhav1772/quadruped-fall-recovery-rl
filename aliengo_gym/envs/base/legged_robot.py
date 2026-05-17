@@ -117,6 +117,8 @@ class LeggedRobot(BaseTask):
 
         self.episode_length_buf += 1
         self.common_step_counter += 1
+        # clear sparse reward buffer
+        self.recovery_bonus_buf[:] = 0.0
 
         # if self.debug_rewards and self.common_step_counter % 1000 == 0:
         #     base_height = self.root_states[:, 2]
@@ -168,9 +170,8 @@ class LeggedRobot(BaseTask):
         self.cot = torch.sum(torch.multiply(self.torques, self.dof_vel), dim=1) / (robot_mass * 9.81 * torch.norm(self.base_lin_vel[:, 0:2], dim=1))
         self.dof_acc[:] = (self.dof_vel[:] - self.last_dof_vel[:]) / self.dt
 
-        self.compute_reward()
-
         self.check_recovery_success()
+        self.compute_reward()
 
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self.reset_idx(env_ids)
@@ -290,19 +291,19 @@ class LeggedRobot(BaseTask):
 
         g_z = self.projected_gravity[:, 2]
 
-        upright = g_z < -0.8
+        upright = g_z < -0.9
         if self.cfg.env.robot == "go1":
-            stable_height = self.root_states[:, 2] > 0.27
+            stable_height = self.root_states[:, 2] > 0.28
         else:
             stable_height = self.root_states[:, 2] > 0.42
         # low_velocity = torch.norm(self.base_lin_vel, dim=1) < 0.3
         low_velocity = torch.norm(self.base_lin_vel[:, :2], dim=1) < 0.3
-        low_ang_vel = torch.norm(self.base_ang_vel, dim=1) < 0.9 #0.5
+        low_ang_vel = torch.norm(self.base_ang_vel, dim=1) < 1.2
 
         posture_error = torch.norm(
             self.dof_pos - self.default_dof_pos, dim=1
         )
-        good_posture = posture_error < 1.5
+        good_posture = posture_error < 2.0
 
         foot_contacts = (self.contact_forces[:, self.feet_indices, 2] > 1.0).sum(dim=1)
         stable_contacts = foot_contacts >= 3
@@ -360,6 +361,10 @@ class LeggedRobot(BaseTask):
                                                                     2 if self.recovery_rate_ema < 0.55 else 3)
 
         new_recovery = stable_recovery & (~self.recovered_flag)
+
+        # self.recovery_bonus_buf[:] = 0.0
+        self.recovery_bonus_buf[new_recovery] = 1.0
+
         self.recovered_flag |= stable_recovery
         self.episode_sums["recovery_success"] += new_recovery.float()
 
@@ -2168,6 +2173,8 @@ class LeggedRobot(BaseTask):
 
             # Maximum persistence counter reached during rollout
             self.rollout_max_counter = torch.zeros(self.num_envs, device=self.device)
+
+            self.recovery_bonus_buf = torch.zeros(self.num_envs, device=self.device)
 
         # initialize some data used later on
         self.common_step_counter = 0
