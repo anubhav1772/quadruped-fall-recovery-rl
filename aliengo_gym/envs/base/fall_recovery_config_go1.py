@@ -143,30 +143,93 @@ class FallRecoveryConfig(BaseCfg):
     class rewards(BaseCfg.rewards):
         base_height_target = 0.34
 
+        # fall-recovery height thresholds
+        recovery_height_min = 0.18       # no/low height reward below this
+        recovery_height_success = 0.28   # strict success gate
+        recovery_height_target = 0.34    # full standing height reward
+
+        upright_sigma_strict = 0.25
+        upright_sigma_soft = 0.35
+
+        # Hard recovery success thresholds
+        recovery_upright_threshold = -0.9
+        recovery_lin_vel_threshold = 0.3
+        recovery_ang_vel_threshold = 1.2
+        recovery_posture_threshold = 2.0
+        recovery_contact_force_threshold = 1.0
+        recovery_min_foot_contacts = 3
+        recovery_success_steps = 10
+
+        # Optional shaping thresholds
+        feet_contact_upright_threshold = -0.7
+        posture_upright_epsilon = 0.20
+
     class reward_scales(BaseCfg.reward_scales):
 
-        recovery_success = 50.0
-        recovery_bonus = 100.0
+        # Sparse recovery success
+        recovery_bonus = 200.0
 
-        base_orientation = -0.5
+        # Soft dense recovery progress
+        recovery_success = 30.0
+
+        # Standing/recovery shaping
         upright_orientation = 6.0
-        height_alignment = 1.0
+        height_alignment = 2.0
+        feet_on_ground = 2.0
+        posture = 6.0
 
+        # Stability
+        base_orientation = -0.3
         base_ang_vel = -0.02
-        feet_on_ground = 2.0 #1.0
-        posture = 6.0 #4.0
-        feet_slip = -0.02
-        body_slip = -0.02 #-0.05
 
-        action = -2.0e-3 #-1.0e-3
-        torques = -5.0e-4
-        dof_acc = -2.0e-7 #-1.0e-6 #-2.5e-6
-        dof_vel = -5.0e-4 #1.0e-3 #-1.0e-2
+        # Motor regularization
+        action = -1.0e-3
+        torques = -2.0e-4
+        dof_acc = -5.0e-8
+        dof_vel = -1.0e-4
+
+        # Safety / physical realism
+        dof_pos_limits = -0.1
+        joint_vel_limit = -5.0e-4
+        base_contact = -0.05
+
+        # Slip / smoothness, kept nonzero but weak
+        feet_slip = -5.0e-3
+        body_slip = -5.0e-3
+        action_smoothness_1 = -1.0e-3
+        action_smoothness_2 = -2.0e-4
 
         base_height = 0.0
-        base_contact = -0.2
-        dof_pos_limits = -0.3 #-0.4 #-1.0
 
-        joint_vel_limit = -0.002 #-0.02
-        action_smoothness_1 = -0.005
-        action_smoothness_2 = -0.001
+    # class reward_scales(BaseCfg.reward_scales):
+
+    #     # Sparse recovery progress
+    #     recovery_bonus = 200.0
+
+    #     # Soft dense progress
+    #     recovery_success = 30.0
+
+    #     # standing rewards
+    #     upright_orientation = 6.0
+    #     height_alignment = 2.0
+    #     feet_on_ground = 2.0
+    #     posture = 6.0
+
+    #     # Light orientation/stability penalties
+    #     base_orientation = -0.5
+    #     base_ang_vel = -0.02
+
+    #     # Light motor regularization
+    #     action = -2.0e-3
+    #     torques = -5.0e-4
+    #     dof_acc = -1.0e-7
+    #     dof_pos_limits = -0.3
+
+    #     base_contact = -0.2
+    #     feet_slip = -0.02
+    #     body_slip = -0.02
+    #     dof_vel = -5.0e-4
+    #     joint_vel_limit = -2.0e-3
+    #     action_smoothness_1 = -0.005
+    #     action_smoothness_2 = -0.001
+    #     base_height = 0.0
