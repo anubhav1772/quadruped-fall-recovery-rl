@@ -45,20 +45,20 @@ caches = DataCaches(1)
 class RunnerArgs(PrefixProto, cli=False):
     # runner
     algorithm_class_name = 'RMA'
-    num_steps_per_env = 24  # per iteration
-    max_iterations = 1500  # number of policy updates
+    num_steps_per_env = 24
+    max_iterations = 1500
 
     # logging
-    save_interval = 400  # check for potential saves every this many iterations
+    save_interval = 400
     save_video_interval = 300
     log_freq = 10
 
-    # load and resume
+    # recovery policy resume
     resume = False
-    load_run = -1  # -1 = last run
-    checkpoint = -1  # -1 = last saved model
-    resume_path = None  # updated from load_run and chkpt
-    resume_curriculum = True
+    resume_path = None
+    checkpoint = "last"          # "last" or iteration number, e.g. 8717
+    resume_optimizer = False     # keep False for recovery fine-tuning
+    resume_iteration = 0         # set manually if you want logs to continue from old iter
 
 
 class Runner:
@@ -75,22 +75,38 @@ class Runner:
                                       self.env.num_actions,
                                       ).to(self.device)
 
+        # Recovery policy resume
         if RunnerArgs.resume:
-            # load pretrained weights from resume_path
             from ml_logger import ML_Logger
-            loader = ML_Logger(root="http://escher.csail.mit.edu:8080",
-                               prefix=RunnerArgs.resume_path)
-            weights = loader.load_torch("checkpoints/ac_weights_last.pt")
-            actor_critic.load_state_dict(state_dict=weights)
 
-            if hasattr(self.env, "curricula") and RunnerArgs.resume_curriculum:
-                # load curriculum state
-                distributions = loader.load_pkl("curriculum/distribution.pkl")
-                distribution_last = distributions[-1]["distribution"]
-                gait_names = [key[8:] if key.startswith("weights_") else None for key in distribution_last.keys()]
-                for gait_id, gait_name in enumerate(self.env.category_names):
-                    self.env.curricula[gait_id].weights = distribution_last[f"weights_{gait_name}"]
-                    print(gait_name)
+            assert RunnerArgs.resume_path is not None, \
+                "RunnerArgs.resume=True but RunnerArgs.resume_path is None"
+
+            loader = ML_Logger(
+                root="http://escher.csail.mit.edu:8080",
+                prefix=RunnerArgs.resume_path
+            )
+
+            if RunnerArgs.checkpoint == "last" or RunnerArgs.checkpoint == -1:
+                checkpoint_path = "checkpoints/ac_weights_last.pt"
+            else:
+                checkpoint_path = f"checkpoints/ac_weights_{int(RunnerArgs.checkpoint):06d}.pt"
+            print(f"[Recovery Resume] Loading actor-critic from: {RunnerArgs.resume_path}/{checkpoint_path}")
+
+            state_dict = loader.load_torch(checkpoint_path, map_location=self.device)
+            missing_keys, unexpected_keys = actor_critic.load_state_dict(state_dict, strict=False)
+
+            if len(missing_keys) > 0:
+                print("[Recovery Resume] Missing keys:")
+                for k in missing_keys:
+                    print("  ", k)
+
+            if len(unexpected_keys) > 0:
+                print("[Recovery Resume] Unexpected keys:")
+                for k in unexpected_keys:
+                    print("  ", k)
+
+            print("[Recovery Resume] Actor-critic weights loaded.")
 
         self.alg = PPO(actor_critic, device=self.device)
         self.num_steps_per_env = RunnerArgs.num_steps_per_env
@@ -99,10 +115,25 @@ class Runner:
         self.alg.init_storage(self.env.num_train_envs, self.num_steps_per_env, [self.env.num_obs],
                               [self.env.num_privileged_obs], [self.env.num_obs_history], [self.env.num_actions])
 
-        self.tot_timesteps = 0
+        # self.tot_timesteps = 0
+        # self.tot_time = 0
+        # self.current_learning_iteration = 0
+        # self.last_recording_it = 0
+
+        if RunnerArgs.resume:
+            self.current_learning_iteration = RunnerArgs.resume_iteration
+            self.tot_timesteps = (
+                RunnerArgs.resume_iteration
+                * self.num_steps_per_env
+                * self.env.num_envs
+            )
+            self.last_recording_it = RunnerArgs.resume_iteration
+        else:
+            self.current_learning_iteration = 0
+            self.tot_timesteps = 0
+            self.last_recording_it = 0
+
         self.tot_time = 0
-        self.current_learning_iteration = 0
-        self.last_recording_it = 0
 
         self.env.reset()
 
@@ -335,7 +366,8 @@ class Runner:
                     logger.upload_file(file_path=adaptation_module_path, target_path=f"checkpoints/", once=False)
                     logger.upload_file(file_path=body_path, target_path=f"checkpoints/", once=False)
 
-            self.current_learning_iteration += num_learning_iterations
+            # self.current_learning_iteration += num_learning_iterations
+            self.current_learning_iteration = it + 1
 
         with logger.Sync():
             logger.torch_save(self.alg.actor_critic.state_dict(), f"checkpoints/ac_weights_{it:06d}.pt")
