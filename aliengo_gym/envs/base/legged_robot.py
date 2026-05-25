@@ -53,6 +53,22 @@ class LeggedRobot(BaseTask):
         self._init_buffers()
 
         self._prepare_reward_function()
+
+        # DEBUG: To get the default foot positions
+        # self.debug_static_default_foot_xy()
+        # if not self.headless:
+        #     print("Debug stand pose loaded. Viewer will stay open. Press ESC to quit.")
+
+        #     while True:
+        #         self.render_gui(sync_frame_time=True)
+        #
+        # if not self.headless:
+        #     print("Debug stand pose loaded. Viewer will stay open. Press ESC to quit.")
+        #     while not self.gym.query_viewer_has_closed(self.viewer):
+        #         self.render_gui(sync_frame_time=True)
+
+        # exit()
+
         self.init_done = True
         self.record_now = self.cfg.env.record_now
         self.record_eval_now = False
@@ -102,6 +118,141 @@ class LeggedRobot(BaseTask):
         # print("reward sample:", self.rew_buf[:5])
 
         return self.obs_buf, self.privileged_obs_buf, self.rew_buf, self.reset_buf, self.extras
+
+    def debug_static_default_foot_xy(self):
+        """
+        Debug-only utility.
+
+        Forces env 0 into the nominal default standing pose, refreshes rigid-body
+        tensors, computes foot positions in the base/body frame, and checks whether
+        the default feet lie inside the stance-region bounds.
+
+        Do not leave this active during training.
+        """
+
+        env_ids = torch.tensor([0], device=self.device, dtype=torch.long)
+        env_ids_int32 = env_ids.to(dtype=torch.int32)
+
+        # -------------------------------------------------
+        # 1. Set joints to default standing configuration
+        # -------------------------------------------------
+        self.dof_pos[env_ids] = self.default_dof_pos[env_ids]
+        self.dof_vel[env_ids] = 0.0
+
+        self.gym.set_dof_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.dof_state),
+            gymtorch.unwrap_tensor(env_ids_int32),
+            len(env_ids_int32)
+        )
+
+        # -------------------------------------------------
+        # 2. Set base to nominal upright pose
+        # -------------------------------------------------
+        self.root_states[env_ids, 0:3] = torch.tensor(
+            self.cfg.init_state.pos,
+            device=self.device,
+            dtype=torch.float
+        )
+
+        self.root_states[env_ids, 3:7] = torch.tensor(
+            self.cfg.init_state.rot,
+            device=self.device,
+            dtype=torch.float
+        )
+
+        # zero base linear/angular velocity
+        self.root_states[env_ids, 7:13] = 0.0
+
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.root_states),
+            gymtorch.unwrap_tensor(env_ids_int32),
+            len(env_ids_int32)
+        )
+
+        # -------------------------------------------------
+        # 3. Step and refresh simulator tensors
+        # -------------------------------------------------
+        self.gym.simulate(self.sim)
+        self.gym.fetch_results(self.sim, True)
+
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+        self.gym.refresh_dof_state_tensor(self.sim)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
+        self.gym.refresh_net_contact_force_tensor(self.sim)
+
+        # -------------------------------------------------
+        # 4. Update local buffers for env 0
+        # -------------------------------------------------
+        self.base_pos[:] = self.root_states[:self.num_envs, 0:3]
+        self.base_quat[:] = self.root_states[:self.num_envs, 3:7]
+
+        self.foot_positions = self.rigid_body_state.view(
+            self.num_envs,
+            self.num_bodies,
+            13
+        )[:, self.feet_indices, 0:3]
+
+        # -------------------------------------------------
+        # 5. Convert foot positions from world frame to body frame
+        # -------------------------------------------------
+        foot_pos_body = quat_rotate_inverse(
+            self.base_quat[0].repeat(4, 1),
+            self.foot_positions[0] - self.base_pos[0].unsqueeze(0)
+        )
+
+        print("\n========== STATIC DEFAULT FOOT DEBUG ==========")
+        print("feet_indices:", self.feet_indices)
+        print("static default foot_pos_body XYZ:")
+        print(foot_pos_body.detach().cpu().numpy())
+        print("static default foot_pos_body XY:")
+        print(foot_pos_body[:, :2].detach().cpu().numpy())
+
+        # -------------------------------------------------
+        # 6. Check stance-region bounds
+        # Foot order: FL, FR, RL, RR
+        # -------------------------------------------------
+        xy = foot_pos_body[:, :2]
+        x = xy[:, 0]
+        y = xy[:, 1]
+
+        x_min = torch.tensor([0.10, 0.10, -0.34, -0.34], device=self.device)
+        x_max = torch.tensor([0.24, 0.24, -0.19, -0.19], device=self.device)
+
+        y_min = torch.tensor([0.12, -0.20, 0.12, -0.20], device=self.device)
+        y_max = torch.tensor([0.20, -0.12, 0.20, -0.12], device=self.device)
+
+        x_violation = (
+            torch.clamp(x_min - x, min=0.0)
+            + torch.clamp(x - x_max, min=0.0)
+        )
+
+        y_violation = (
+            torch.clamp(y_min - y, min=0.0)
+            + torch.clamp(y - y_max, min=0.0)
+        )
+
+        err = x_violation + y_violation
+        raw_stance_region_reward = torch.exp(-5.0 * err.mean())
+
+        inside_x = (x >= x_min) & (x <= x_max)
+        inside_y = (y >= y_min) & (y <= y_max)
+        inside = inside_x & inside_y
+
+        print("\n[STANCE REGION CHECK]")
+        print("x:", x.detach().cpu().numpy())
+        print("y:", y.detach().cpu().numpy())
+
+        print("inside_x:", inside_x.detach().cpu().numpy())
+        print("inside_y:", inside_y.detach().cpu().numpy())
+        print("inside:", inside.detach().cpu().numpy())
+
+        print("stance x_violation:", x_violation.detach().cpu().numpy())
+        print("stance y_violation:", y_violation.detach().cpu().numpy())
+        print("stance err:", err.detach().cpu().numpy())
+        print("raw stance_region reward:", raw_stance_region_reward.item())
+        print("==============================================\n")
 
     def post_physics_step(self):
         """ check terminations, compute observations and rewards
@@ -245,8 +396,23 @@ class LeggedRobot(BaseTask):
         low_ang_vel = (torch.norm(self.base_ang_vel, dim=1) < cfg.recovery_ang_vel_threshold)
         posture_error = torch.norm(self.dof_pos - self.default_dof_pos, dim=1)
         good_posture = (posture_error < cfg.recovery_posture_threshold)
-        foot_contacts = (self.contact_forces[:, self.feet_indices, 2] > cfg.recovery_contact_force_threshold).sum(dim=1)
-        stable_contacts = (foot_contacts >= cfg.recovery_min_foot_contacts)
+
+        # foot_contacts = (self.contact_forces[:, self.feet_indices, 2] > cfg.recovery_contact_force_threshold).sum(dim=1)
+        # stable_contacts = (foot_contacts >= cfg.recovery_min_foot_contacts)
+
+        # FOR FINETUNING
+        foot_contact = (
+            self.contact_forces[:, self.feet_indices, 2]
+            > cfg.recovery_contact_force_threshold
+        )
+
+        foot_xy_vel = torch.norm(self.foot_velocities[:, :, :2], dim=-1)
+
+        non_slipping_feet = foot_contact & (
+            foot_xy_vel < cfg.recovery_foot_slip_vel_threshold
+        )
+
+        stable_contacts = non_slipping_feet.sum(dim=1) >= cfg.recovery_min_foot_contacts
 
         recovered = (
             upright
@@ -306,7 +472,8 @@ class LeggedRobot(BaseTask):
         self.recovery_bonus_buf[new_recovery] = 1.0
         self.recovered_flag |= stable_recovery
 
-        self.episode_sums["recovery_success"] += new_recovery.float()
+        # self.episode_sums["recovery_success"] += new_recovery.float()
+        self.extras["recovery_debug"]["new_recovery_event"] = new_recovery.float().mean().item()
 
 
     def reset_idx(self, env_ids):
@@ -367,15 +534,20 @@ class LeggedRobot(BaseTask):
             #         self.episode_sums[key][train_env_ids])
             #     self.episode_sums[key][train_env_ids] = 0.
             #
+            # for key in self.episode_sums.keys():
+            #     if key == "recovery_success":
+            #         self.extras["train/episode"]["recovery_success"] = torch.mean(
+            #             self.episode_sums[key][train_env_ids]
+            #         )
+            #     else:
+            #         self.extras["train/episode"]['rew_' + key] = torch.mean(
+            #             self.episode_sums[key][train_env_ids]
+            #         )
+            #     self.episode_sums[key][train_env_ids] = 0.
             for key in self.episode_sums.keys():
-                if key == "recovery_success":
-                    self.extras["train/episode"]["recovery_success"] = torch.mean(
-                        self.episode_sums[key][train_env_ids]
-                    )
-                else:
-                    self.extras["train/episode"]['rew_' + key] = torch.mean(
-                        self.episode_sums[key][train_env_ids]
-                    )
+                self.extras["train/episode"]['rew_' + key] = torch.mean(
+                    self.episode_sums[key][train_env_ids]
+                )
                 self.episode_sums[key][train_env_ids] = 0.
         eval_env_ids = env_ids[env_ids >= self.num_train_envs]
         if len(eval_env_ids) > 0:
@@ -1649,6 +1821,67 @@ class LeggedRobot(BaseTask):
                 self.complete_video_frames_eval = self.video_frames_eval[:]
             self.video_frames_eval = []
 
+    def debug_static_default_foot_xy(self):
+        env_ids = torch.tensor([0], device=self.device, dtype=torch.long)
+        env_ids_int32 = env_ids.to(dtype=torch.int32)
+
+        # 1. Set joints to default standing pose
+        self.dof_pos[env_ids] = self.default_dof_pos[env_ids]
+        self.dof_vel[env_ids] = 0.0
+
+        self.gym.set_dof_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.dof_state),
+            gymtorch.unwrap_tensor(env_ids_int32),
+            len(env_ids_int32)
+        )
+
+        # 2. Set base to nominal upright pose
+        self.root_states[env_ids, 0:3] = torch.tensor(
+            self.cfg.init_state.pos,
+            device=self.device,
+            dtype=torch.float
+        )
+        self.root_states[env_ids, 3:7] = torch.tensor(
+            self.cfg.init_state.rot,
+            device=self.device,
+            dtype=torch.float
+        )
+        self.root_states[env_ids, 7:13] = 0.0
+
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.root_states),
+            gymtorch.unwrap_tensor(env_ids_int32),
+            len(env_ids_int32)
+        )
+
+        # 3. Step/refresh tensors
+        self.gym.simulate(self.sim)
+        self.gym.fetch_results(self.sim, True)
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
+
+        # 4. Update local buffers
+        self.base_pos[:] = self.root_states[:self.num_envs, 0:3]
+        self.base_quat[:] = self.root_states[:self.num_envs, 3:7]
+
+        self.foot_positions = self.rigid_body_state.view(
+            self.num_envs, self.num_bodies, 13
+        )[:, self.feet_indices, 0:3]
+
+        # 5. Convert feet to base/body frame
+        foot_pos_body = quat_rotate_inverse(
+            self.base_quat[0].repeat(4, 1),
+            self.foot_positions[0] - self.base_pos[0].unsqueeze(0)
+        )
+
+        print("feet_indices:", self.feet_indices)
+        print("static default foot_pos_body XYZ:")
+        print(foot_pos_body.detach().cpu().numpy())
+        print("static default foot_pos_body XY:")
+        print(foot_pos_body[:, :2].detach().cpu().numpy())
+
     def _reset_root_states_disturbance(self, env_ids, cfg):
         num_resets = len(env_ids)
 
@@ -2217,14 +2450,14 @@ class LeggedRobot(BaseTask):
             for name in self.reward_scales.keys()}
         self.episode_sums["total"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device,
                                                  requires_grad=False)
-        self.episode_sums["recovery_success"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        # self.episode_sums["recovery_success"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
 
         self.episode_sums_eval = {
             name: -1 * torch.ones(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
             for name in self.reward_scales.keys()}
         self.episode_sums_eval["total"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device,
                                                       requires_grad=False)
-        self.episode_sums_eval["recovery_success"] = -1 * torch.ones(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        # self.episode_sums_eval["recovery_success"] = -1 * torch.ones(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
         self.command_sums = {
             name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
             for name in
@@ -2419,6 +2652,11 @@ class LeggedRobot(BaseTask):
         for i in range(len(self.feet_names)):
             self.feet_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0],
                                                                          self.feet_names[i])
+
+        print("feet_indices:", self.feet_indices)
+
+        for i, idx in enumerate(self.feet_indices):
+            print(i, idx, self.gym.get_actor_rigid_body_names(self.envs[0], 0)[idx])
 
         self.penalised_contact_indices = torch.zeros(len(penalized_contact_names), dtype=torch.long, device=self.device,
                                                      requires_grad=False)

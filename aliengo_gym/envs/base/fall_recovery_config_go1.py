@@ -153,16 +153,25 @@ class FallRecoveryConfig(BaseCfg):
 
         # Hard recovery success thresholds
         recovery_upright_threshold = -0.9
-        recovery_lin_vel_threshold = 0.3
-        recovery_ang_vel_threshold = 1.2
-        recovery_posture_threshold = 2.0
+        # recovery_lin_vel_threshold = 0.3
+        # recovery_ang_vel_threshold = 1.2
+        # recovery_posture_threshold = 2.0
         recovery_contact_force_threshold = 1.0
+        # recovery_min_foot_contacts = 3
+        # recovery_success_steps = 10
+
+        # FINETUNE
+        recovery_foot_slip_vel_threshold = 0.08
+        recovery_success_steps = 20
+        recovery_ang_vel_threshold = 0.8
+        recovery_lin_vel_threshold = 0.2
+        recovery_posture_threshold = 1.6
         recovery_min_foot_contacts = 3
-        recovery_success_steps = 10
 
         # Optional shaping thresholds
         feet_contact_upright_threshold = -0.7
         posture_upright_epsilon = 0.20
+
 
     class reward_scales(BaseCfg.reward_scales):
 
@@ -170,23 +179,23 @@ class FallRecoveryConfig(BaseCfg):
         recovery_bonus = 200.0
 
         # Soft dense recovery progress
-        recovery_success = 30.0
+        recovery_progress = 30.0
 
         # Standing/recovery shaping
         upright_orientation = 6.0
         height_alignment = 2.0
         feet_on_ground = 2.0
-        posture = 6.0
+        posture = 8.0 #6.0
 
         # Stability
         base_orientation = -0.3
-        base_ang_vel = -0.02
+        # base_ang_vel = -0.02
 
         # Motor regularization
         action = -1.0e-3
         torques = -2.0e-4
         dof_acc = -5.0e-8
-        dof_vel = -1.0e-4
+        # dof_vel = -1.0e-4
 
         # Safety / physical realism
         dof_pos_limits = -0.1
@@ -194,11 +203,19 @@ class FallRecoveryConfig(BaseCfg):
         base_contact = -0.05
 
         # Slip / smoothness, kept nonzero but weak
-        feet_slip = -5.0e-3
-        body_slip = -5.0e-3
+        # feet_slip = -5.0e-3
+        # body_slip = -5.0e-3
         action_smoothness_1 = -1.0e-3
         action_smoothness_2 = -2.0e-4
 
+        # FINETUNE
+        feet_slip = -2.0e-2
+        body_slip = -1.0e-2
+        base_ang_vel = -5.0e-2
+        dof_vel = -2.0e-4
+        stable_foot_support = 2.0
+        feet_under_body = 0.0
+        stance_region = 0.2
         base_height = 0.0
 
     # class reward_scales(BaseCfg.reward_scales):
