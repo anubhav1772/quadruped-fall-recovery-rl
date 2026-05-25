@@ -54,11 +54,11 @@ class RunnerArgs(PrefixProto, cli=False):
     log_freq = 10
 
     # recovery policy resume
-    resume = False
-    resume_path = None
+    resume = True
+    resume_path = "/home/singh7_anubhav/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-05-18/train_fall_recovery/215844.509038" #None
     checkpoint = "last"          # "last" or iteration number, e.g. 8717
     resume_optimizer = False     # keep False for recovery fine-tuning
-    resume_iteration = 0         # set manually if you want logs to continue from old iter
+    resume_iteration = 19829 #0         # set manually if you want logs to continue from old iter
 
 
 class Runner:
@@ -77,23 +77,21 @@ class Runner:
 
         # Recovery policy resume
         if RunnerArgs.resume:
-            from ml_logger import ML_Logger
+            from pathlib import Path
+            import torch
 
-            assert RunnerArgs.resume_path is not None, \
-                "RunnerArgs.resume=True but RunnerArgs.resume_path is None"
-
-            loader = ML_Logger(
-                root="http://escher.csail.mit.edu:8080",
-                prefix=RunnerArgs.resume_path
-            )
+            resume_dir = Path(RunnerArgs.resume_path).expanduser().resolve()
 
             if RunnerArgs.checkpoint == "last" or RunnerArgs.checkpoint == -1:
-                checkpoint_path = "checkpoints/ac_weights_last.pt"
+                checkpoint_path = resume_dir / "checkpoints" / "ac_weights_last.pt"
             else:
-                checkpoint_path = f"checkpoints/ac_weights_{int(RunnerArgs.checkpoint):06d}.pt"
-            print(f"[Recovery Resume] Loading actor-critic from: {RunnerArgs.resume_path}/{checkpoint_path}")
+                checkpoint_path = resume_dir / "checkpoints" / f"ac_weights_{int(RunnerArgs.checkpoint):06d}.pt"
 
-            state_dict = loader.load_torch(checkpoint_path, map_location=self.device)
+            assert checkpoint_path.exists(), f"Checkpoint not found: {checkpoint_path}"
+
+            print(f"[Recovery Resume] Loading actor-critic from: {checkpoint_path}")
+
+            state_dict = torch.load(checkpoint_path, map_location=self.device)
             missing_keys, unexpected_keys = actor_critic.load_state_dict(state_dict, strict=False)
 
             if len(missing_keys) > 0:

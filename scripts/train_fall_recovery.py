@@ -26,7 +26,8 @@ def train_aliengo(headless=True):
     env = HistoryWrapper(env)
     gpu_id = 0
     runner = Runner(env, device=f"cuda:{gpu_id}")
-    runner.learn(num_learning_iterations=10000, init_at_random_ep_len=True, eval_freq=100)
+    # runner.learn(num_learning_iterations=20000, init_at_random_ep_len=True, eval_freq=100)
+    runner.learn(num_learning_iterations=10000, init_at_random_ep_len=False, eval_freq=100)
 
 
 if __name__ == '__main__':
@@ -65,29 +66,31 @@ if __name__ == '__main__':
                 charts:
                 - yKey: train/episode/rew_total/mean
                   xKey: iterations
-                - yKey: train/episode/rew_tracking_lin_vel/mean
+                - yKey: train/episode/recovery_success/mean
                   xKey: iterations
-                - yKey: train/episode/rew_tracking_contacts_shaped_force/mean
+                - yKey: train/episode/rew_upright_orientation/mean
                   xKey: iterations
-                - yKey: train/episode/rew_action_smoothness_1/mean
+                - yKey: train/episode/rew_height_alignment/mean
                   xKey: iterations
-                - yKey: train/episode/rew_action_smoothness_2/mean
+                - yKey: train/episode/rew_feet_on_ground/mean
                   xKey: iterations
-                - yKey: train/episode/rew_tracking_contacts_shaped_vel/mean
+                - yKey: train/episode/rew_posture/mean
                   xKey: iterations
-                - yKey: train/episode/rew_orientation_control/mean
+                - yKey: train/episode/rew_feet_slip/mean
                   xKey: iterations
-                - yKey: train/episode/rew_dof_pos/mean
+                - yKey: train/episode/rew_body_slip/mean
                   xKey: iterations
-                - yKey: train/episode/command_area_trot/mean
+                - yKey: recovery/stable_contacts/mean
                   xKey: iterations
-                - yKey: train/episode/max_terrain_height/mean
+                - yKey: recovery/stable_recovery/mean
+                  xKey: iterations
+                - yKey: recovery/recovery_counter_max/mean
+                  xKey: iterations
+                - yKey: adaptation_loss/mean
                   xKey: iterations
                 - type: video
                   glob: "videos/*.mp4"
-                - yKey: adaptation_loss/mean
-                  xKey: iterations
                 """, filename=".charts.yml", dedent=True)
 
     # to see the environment rendering, set headless=False
-    train_aliengo(headless=True)
+    train_aliengo(headless=False)
