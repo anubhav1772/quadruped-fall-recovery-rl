@@ -55,10 +55,10 @@ class RunnerArgs(PrefixProto, cli=False):
 
     # recovery policy resume
     resume = True
-    resume_path = "/home/singh7_anubhav/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-05-18/train_fall_recovery/215844.509038" #None
+    resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-05-18/train_fall_recovery/215844.509038" #None
     checkpoint = "last"          # "last" or iteration number, e.g. 8717
     resume_optimizer = False     # keep False for recovery fine-tuning
-    resume_iteration = 19829 #0         # set manually if you want logs to continue from old iter
+    resume_iteration = 19999 #0         # set manually if you want logs to continue from old iter
 
 
 class Runner:
@@ -105,6 +105,23 @@ class Runner:
                     print("  ", k)
 
             print("[Recovery Resume] Actor-critic weights loaded.")
+
+            # # -------------------------------------------------
+            # # Reduce exploration for final-stand refinement.
+            # # This prevents the old recovery policy from injecting
+            # # large stochastic actions near the standing pose.
+            # # -------------------------------------------------
+            # with torch.no_grad():
+            #     actor_critic.std.data[:] = torch.clamp(
+            #         actor_critic.std.data,
+            #         max=0.15,
+            #     )
+
+            # print(
+            #     "[Recovery Resume] Clamped action std:",
+            #     "mean =", actor_critic.std.mean().item(),
+            #     "max =", actor_critic.std.max().item(),
+            # )
 
         self.alg = PPO(actor_critic, device=self.device)
         self.num_steps_per_env = RunnerArgs.num_steps_per_env
@@ -324,13 +341,38 @@ class Runner:
                         # store for dashboard
                         recovery_metrics[f"recovery/{k}"] = v
 
+
+                # =========================================================
+                # Recovery tracking statistics
+                # =========================================================
+
+                recovery_tracking_metrics = {}
+
+                if hasattr(self.env, "extras") and "recovery_tracking" in self.env.extras:
+
+                    tracking = self.env.extras["recovery_tracking"]
+
+                    print("\n===== Recovery Tracking =====")
+
+                    for k, v in tracking.items():
+
+                        if torch.is_tensor(v):
+                            v = v.item()
+
+                        print(f"{k:<30}: {v:8.4f}")
+
+                        # store for dashboard
+                        recovery_tracking_metrics[f"recovery_tracking/{k}"] = v
+
+
                 # =========================================================
                 # Store all metrics
                 # =========================================================
 
                 logger.store_metrics(
                     **reward_contrib_metrics,
-                    **recovery_metrics
+                    **recovery_metrics,
+                    **recovery_tracking_metrics
                 )
 
                 logger.log_metrics_summary(
