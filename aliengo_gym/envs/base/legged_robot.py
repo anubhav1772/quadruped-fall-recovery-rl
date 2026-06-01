@@ -53,22 +53,6 @@ class LeggedRobot(BaseTask):
         self._init_buffers()
 
         self._prepare_reward_function()
-
-        # DEBUG: To get the default foot positions
-        # self.debug_static_default_foot_xy()
-        # if not self.headless:
-        #     print("Debug stand pose loaded. Viewer will stay open. Press ESC to quit.")
-
-        #     while True:
-        #         self.render_gui(sync_frame_time=True)
-        #
-        # if not self.headless:
-        #     print("Debug stand pose loaded. Viewer will stay open. Press ESC to quit.")
-        #     while not self.gym.query_viewer_has_closed(self.viewer):
-        #         self.render_gui(sync_frame_time=True)
-
-        # exit()
-
         self.init_done = True
         self.record_now = self.cfg.env.record_now
         self.record_eval_now = False
@@ -118,141 +102,6 @@ class LeggedRobot(BaseTask):
         # print("reward sample:", self.rew_buf[:5])
 
         return self.obs_buf, self.privileged_obs_buf, self.rew_buf, self.reset_buf, self.extras
-
-    def debug_static_default_foot_xy(self):
-        """
-        Debug-only utility.
-
-        Forces env 0 into the nominal default standing pose, refreshes rigid-body
-        tensors, computes foot positions in the base/body frame, and checks whether
-        the default feet lie inside the stance-region bounds.
-
-        Do not leave this active during training.
-        """
-
-        env_ids = torch.tensor([0], device=self.device, dtype=torch.long)
-        env_ids_int32 = env_ids.to(dtype=torch.int32)
-
-        # -------------------------------------------------
-        # 1. Set joints to default standing configuration
-        # -------------------------------------------------
-        self.dof_pos[env_ids] = self.default_dof_pos[env_ids]
-        self.dof_vel[env_ids] = 0.0
-
-        self.gym.set_dof_state_tensor_indexed(
-            self.sim,
-            gymtorch.unwrap_tensor(self.dof_state),
-            gymtorch.unwrap_tensor(env_ids_int32),
-            len(env_ids_int32)
-        )
-
-        # -------------------------------------------------
-        # 2. Set base to nominal upright pose
-        # -------------------------------------------------
-        self.root_states[env_ids, 0:3] = torch.tensor(
-            self.cfg.init_state.pos,
-            device=self.device,
-            dtype=torch.float
-        )
-
-        self.root_states[env_ids, 3:7] = torch.tensor(
-            self.cfg.init_state.rot,
-            device=self.device,
-            dtype=torch.float
-        )
-
-        # zero base linear/angular velocity
-        self.root_states[env_ids, 7:13] = 0.0
-
-        self.gym.set_actor_root_state_tensor_indexed(
-            self.sim,
-            gymtorch.unwrap_tensor(self.root_states),
-            gymtorch.unwrap_tensor(env_ids_int32),
-            len(env_ids_int32)
-        )
-
-        # -------------------------------------------------
-        # 3. Step and refresh simulator tensors
-        # -------------------------------------------------
-        self.gym.simulate(self.sim)
-        self.gym.fetch_results(self.sim, True)
-
-        self.gym.refresh_actor_root_state_tensor(self.sim)
-        self.gym.refresh_dof_state_tensor(self.sim)
-        self.gym.refresh_rigid_body_state_tensor(self.sim)
-        self.gym.refresh_net_contact_force_tensor(self.sim)
-
-        # -------------------------------------------------
-        # 4. Update local buffers for env 0
-        # -------------------------------------------------
-        self.base_pos[:] = self.root_states[:self.num_envs, 0:3]
-        self.base_quat[:] = self.root_states[:self.num_envs, 3:7]
-
-        self.foot_positions = self.rigid_body_state.view(
-            self.num_envs,
-            self.num_bodies,
-            13
-        )[:, self.feet_indices, 0:3]
-
-        # -------------------------------------------------
-        # 5. Convert foot positions from world frame to body frame
-        # -------------------------------------------------
-        foot_pos_body = quat_rotate_inverse(
-            self.base_quat[0].repeat(4, 1),
-            self.foot_positions[0] - self.base_pos[0].unsqueeze(0)
-        )
-
-        print("\n========== STATIC DEFAULT FOOT DEBUG ==========")
-        print("feet_indices:", self.feet_indices)
-        print("static default foot_pos_body XYZ:")
-        print(foot_pos_body.detach().cpu().numpy())
-        print("static default foot_pos_body XY:")
-        print(foot_pos_body[:, :2].detach().cpu().numpy())
-
-        # -------------------------------------------------
-        # 6. Check stance-region bounds
-        # Foot order: FL, FR, RL, RR
-        # -------------------------------------------------
-        xy = foot_pos_body[:, :2]
-        x = xy[:, 0]
-        y = xy[:, 1]
-
-        x_min = torch.tensor([0.10, 0.10, -0.34, -0.34], device=self.device)
-        x_max = torch.tensor([0.24, 0.24, -0.19, -0.19], device=self.device)
-
-        y_min = torch.tensor([0.12, -0.20, 0.12, -0.20], device=self.device)
-        y_max = torch.tensor([0.20, -0.12, 0.20, -0.12], device=self.device)
-
-        x_violation = (
-            torch.clamp(x_min - x, min=0.0)
-            + torch.clamp(x - x_max, min=0.0)
-        )
-
-        y_violation = (
-            torch.clamp(y_min - y, min=0.0)
-            + torch.clamp(y - y_max, min=0.0)
-        )
-
-        err = x_violation + y_violation
-        raw_stance_region_reward = torch.exp(-5.0 * err.mean())
-
-        inside_x = (x >= x_min) & (x <= x_max)
-        inside_y = (y >= y_min) & (y <= y_max)
-        inside = inside_x & inside_y
-
-        print("\n[STANCE REGION CHECK]")
-        print("x:", x.detach().cpu().numpy())
-        print("y:", y.detach().cpu().numpy())
-
-        print("inside_x:", inside_x.detach().cpu().numpy())
-        print("inside_y:", inside_y.detach().cpu().numpy())
-        print("inside:", inside.detach().cpu().numpy())
-
-        print("stance x_violation:", x_violation.detach().cpu().numpy())
-        print("stance y_violation:", y_violation.detach().cpu().numpy())
-        print("stance err:", err.detach().cpu().numpy())
-        print("raw stance_region reward:", raw_stance_region_reward.item())
-        print("==============================================\n")
 
     def post_physics_step(self):
         """ check terminations, compute observations and rewards
@@ -377,6 +226,405 @@ class LeggedRobot(BaseTask):
         self.time_out_buf = self.episode_length_buf > self.cfg.env.max_episode_length
         self.reset_buf |= self.time_out_buf
 
+    # def log_recovery_tracking_metrics(
+    #     self,
+    #     posture_error,
+    #     foot_contact,
+    #     non_slipping_feet,
+    #     handoff_ready,
+    # ):
+    #     """
+    #     Logs continuous recovery tracking diagnostics.
+
+    #     Foot order assumed:
+    #         0 = FL, 1 = FR, 2 = RL, 3 = RR
+
+    #     For Go1, default left-right foot separation is about 0.31 m.
+    #     Use crossed_frac for severe crossing/collapse diagnostics.
+    #     """
+
+    #     if not hasattr(self, "extras"):
+    #         self.extras = {}
+
+    #     if "recovery_tracking" not in self.extras:
+    #         self.extras["recovery_tracking"] = {}
+
+    #     lin_vel_norm = torch.norm(self.base_lin_vel[:, :2], dim=1)
+    #     ang_vel_norm = torch.norm(self.base_ang_vel, dim=1)
+
+    #     base_height = self.root_states[:, 2]
+    #     base_height_error = torch.abs(
+    #         base_height - self.cfg.rewards.recovery_height_target
+    #     )
+
+    #     # Existing contact metrics
+    #     foot_contact_count = foot_contact.float().sum(dim=1)
+    #     non_slipping_foot_count = non_slipping_feet.float().sum(dim=1)
+
+    #     base_contact_force = torch.norm(
+    #         self.contact_forces[:, self.base_contact_indices, :],
+    #         dim=-1
+    #     )
+
+    #     base_contact_env = (
+    #         base_contact_force.max(dim=1).values
+    #         > self.cfg.rewards.recovery_contact_force_threshold
+    #     )
+
+    #     # foot geometry metrics in base/body frame
+    #     foot_pos_body = quat_rotate_inverse(
+    #         self.base_quat.unsqueeze(1).repeat(1, 4, 1).reshape(-1, 4),
+    #         (self.foot_positions - self.base_pos.unsqueeze(1)).reshape(-1, 3)
+    #     ).reshape(self.num_envs, 4, 3)
+
+    #     # Body-frame lateral foot positions
+    #     y = foot_pos_body[:, :, 1]
+
+    #     # Foot order assumed: FL, FR, RL, RR
+    #     front_sep = y[:, 0] - y[:, 1]   # FL_y - FR_y
+    #     rear_sep = y[:, 2] - y[:, 3]    # RL_y - RR_y
+
+    #     # Strict crossing: left foot goes to the right of right foot
+    #     front_crossed_strict = front_sep < 0.0
+    #     rear_crossed_strict = rear_sep < 0.0
+
+    #     # Practical collapse/interlocking diagnostic.
+    #     # Default Go1 separation is ~0.31 m, so <0.10 means badly collapsed.
+    #     front_crossed = front_sep < 0.10
+    #     rear_crossed = rear_sep < 0.10
+
+    #     # also log foot x positions to detect rear feet too far forward
+    #     x = foot_pos_body[:, :, 0]
+    #     front_x_mean = 0.5 * (x[:, 0] + x[:, 1])
+    #     rear_x_mean = 0.5 * (x[:, 2] + x[:, 3])
+
+    #     base_contact_env_frac = base_contact_env.float().mean()
+
+    #     late_gate = (
+    #         (self.projected_gravity[:, 2] < -0.75)
+    #         & (self.root_states[:, 2] > 0.27)
+    #     )
+
+    #     late_gate_count = late_gate.float().sum()
+
+    #     late_base_contact_frac = (
+    #         (base_contact_env & late_gate).float().sum()
+    #         / late_gate_count.clamp_min(1.0)
+    #     )
+
+    #     self.extras["recovery_tracking"]["base_contact_env_frac"] = base_contact_env_frac.item()
+    #     self.extras["recovery_tracking"]["late_base_contact_frac"] = late_base_contact_frac.item()
+    #     self.extras["recovery_tracking"]["late_gate_frac"] = late_gate.float().mean().item()
+
+    #     self.extras["recovery_tracking"]["posture_error_mean"] = posture_error.mean().item()
+    #     self.extras["recovery_tracking"]["posture_error_min"] = posture_error.min().item()
+    #     self.extras["recovery_tracking"]["posture_error_max"] = posture_error.max().item()
+
+    #     self.extras["recovery_tracking"]["base_height_mean"] = base_height.mean().item()
+    #     self.extras["recovery_tracking"]["base_height_error_mean"] = base_height_error.mean().item()
+
+    #     self.extras["recovery_tracking"]["lin_vel_norm_mean"] = lin_vel_norm.mean().item()
+    #     self.extras["recovery_tracking"]["ang_vel_norm_mean"] = ang_vel_norm.mean().item()
+
+    #     self.extras["recovery_tracking"]["foot_contact_count_mean"] = foot_contact_count.mean().item()
+    #     self.extras["recovery_tracking"]["non_slipping_foot_count_mean"] = non_slipping_foot_count.mean().item()
+
+    #     self.extras["recovery_tracking"]["base_contact_force_mean"] = base_contact_force.mean().item()
+
+    #     self.extras["recovery_tracking"]["handoff_ready_mean"] = handoff_ready.float().mean().item()
+
+    #     # New geometry logs
+    #     self.extras["recovery_tracking"]["front_sep_mean"] = front_sep.mean().item()
+    #     self.extras["recovery_tracking"]["rear_sep_mean"] = rear_sep.mean().item()
+
+    #     self.extras["recovery_tracking"]["front_sep_min"] = front_sep.min().item()
+    #     self.extras["recovery_tracking"]["rear_sep_min"] = rear_sep.min().item()
+
+    #     self.extras["recovery_tracking"]["front_crossed_frac"] = front_crossed.float().mean().item()
+    #     self.extras["recovery_tracking"]["rear_crossed_frac"] = rear_crossed.float().mean().item()
+
+    #     self.extras["recovery_tracking"]["front_crossed_strict_frac"] = front_crossed_strict.float().mean().item()
+    #     self.extras["recovery_tracking"]["rear_crossed_strict_frac"] = rear_crossed_strict.float().mean().item()
+
+    #     self.extras["recovery_tracking"]["front_x_mean"] = front_x_mean.mean().item()
+    #     self.extras["recovery_tracking"]["rear_x_mean"] = rear_x_mean.mean().item()
+
+    def log_recovery_tracking_metrics(
+        self,
+        posture_error,
+        foot_contact,
+        non_slipping_feet,
+        handoff_ready,
+    ):
+        """
+        Logs continuous recovery tracking diagnostics.
+
+        Foot order assumed:
+            0 = FL, 1 = FR, 2 = RL, 3 = RR
+
+        Important naming note:
+            self.base_contact_indices is currently all non-foot bodies,
+            not only the trunk/base. Therefore, base_contact_env_frac is
+            effectively a non-foot-contact fraction.
+
+        Main purpose:
+            - distinguish raw foot contact from non-slipping support
+            - detect rear-leg crossing/interlocking
+            - detect whether non-foot body contact remains after the robot
+              is already near upright and raised
+        """
+
+        if not hasattr(self, "extras"):
+            self.extras = {}
+
+        if "recovery_tracking" not in self.extras:
+            self.extras["recovery_tracking"] = {}
+
+        tracking = self.extras["recovery_tracking"]
+
+        # Basic recovery state metrics
+        lin_vel_norm = torch.norm(self.base_lin_vel[:, :2], dim=1)
+        ang_vel_norm = torch.norm(self.base_ang_vel, dim=1)
+
+        base_height = self.root_states[:, 2]
+        base_height_error = torch.abs(
+            base_height - self.cfg.rewards.recovery_height_target
+        )
+
+        foot_contact_count = foot_contact.float().sum(dim=1)
+        non_slipping_foot_count = non_slipping_feet.float().sum(dim=1)
+
+        # Non-foot (trunk, hips, thighs, and calves) contact metrics
+        # self.base_contact_indices contains all non-foot bodies.
+        # This is useful for checking whether thighs, calves, hips, or trunk
+        # are still touching the ground during/after recovery.
+        base_contact_force = torch.norm(
+            self.contact_forces[:, self.base_contact_indices, :],
+            dim=-1,
+        )
+
+        # Use the same threshold as your base-contact reward if possible.
+        # If your _reward_base_contact() uses 0.2, keep this at 0.2 too.
+        # If you prefer consistency with recovery foot contact, replace 0.2
+        # with self.cfg.rewards.recovery_contact_force_threshold.
+        base_contact_env = (
+            base_contact_force.max(dim=1).values > self.cfg.rewards.nonfoot_contact_threshold
+        )
+
+        base_contact_env_frac = base_contact_env.float().mean()
+
+        # Late gate: only look at environments that are already close to
+        # terminal recovery height/orientation. This avoids over-interpreting
+        # body contact while the robot is still fallen or rolling.
+        late_gate = (
+            (self.projected_gravity[:, 2] < -0.75)
+            & (self.root_states[:, 2] > 0.27)
+        )
+
+        late_gate_count = late_gate.float().sum()
+
+        late_base_contact_frac = (
+            (base_contact_env & late_gate).float().sum()
+            / late_gate_count.clamp_min(1.0)
+        )
+
+        # Foot geometry metrics in base/body frame
+        foot_pos_body = quat_rotate_inverse(
+            self.base_quat.unsqueeze(1).repeat(1, 4, 1).reshape(-1, 4),
+            (self.foot_positions - self.base_pos.unsqueeze(1)).reshape(-1, 3),
+        ).reshape(self.num_envs, 4, 3)
+
+        x = foot_pos_body[:, :, 0]
+        y = foot_pos_body[:, :, 1]
+
+        # Foot order assumed: FL, FR, RL, RR
+        front_sep = y[:, 0] - y[:, 1]   # FL_y - FR_y
+        rear_sep = y[:, 2] - y[:, 3]    # RL_y - RR_y
+
+        # Strict crossing: left foot has crossed to the right side.
+        front_crossed_strict = front_sep < 0.0
+        rear_crossed_strict = rear_sep < 0.0
+
+        # Practical collapse/interlocking diagnostic.
+        # Go1 nominal left-right foot separation is about 0.31 m.
+        # Below 0.10 m usually means severe collapse/interlocking.
+        front_crossed = front_sep < 0.10
+        rear_crossed = rear_sep < 0.10
+
+        # X-position diagnostics:
+        # - front_x_mean too large  -> front feet too far forward
+        # - rear_x_mean too large   -> rear feet too far forward / under body
+        # - rear_x_mean too negative can also indicate over-stretched rear legs
+        front_x_mean = 0.5 * (x[:, 0] + x[:, 1])
+        rear_x_mean = 0.5 * (x[:, 2] + x[:, 3])
+
+        tracking["posture_error_mean"] = posture_error.mean().item()
+        tracking["posture_error_min"] = posture_error.min().item()
+        tracking["posture_error_max"] = posture_error.max().item()
+
+        tracking["base_height_mean"] = base_height.mean().item()
+        tracking["base_height_error_mean"] = base_height_error.mean().item()
+
+        tracking["lin_vel_norm_mean"] = lin_vel_norm.mean().item()
+        tracking["ang_vel_norm_mean"] = ang_vel_norm.mean().item()
+
+        tracking["foot_contact_count_mean"] = foot_contact_count.mean().item()
+        tracking["non_slipping_foot_count_mean"] = non_slipping_foot_count.mean().item()
+
+        tracking["base_contact_force_mean"] = base_contact_force.mean().item()
+
+        # Keep the original names for dashboard compatibility.
+        tracking["base_contact_env_frac"] = base_contact_env_frac.item()
+        tracking["late_base_contact_frac"] = late_base_contact_frac.item()
+        tracking["late_gate_frac"] = late_gate.float().mean().item()
+
+        # Optional clearer aliases. Keep them if your dashboard can show new keys.
+        tracking["nonfoot_contact_env_frac"] = base_contact_env_frac.item()
+        tracking["late_nonfoot_contact_frac"] = late_base_contact_frac.item()
+
+        tracking["handoff_ready_mean"] = handoff_ready.float().mean().item()
+
+        tracking["front_sep_mean"] = front_sep.mean().item()
+        tracking["rear_sep_mean"] = rear_sep.mean().item()
+
+        tracking["front_sep_min"] = front_sep.min().item()
+        tracking["rear_sep_min"] = rear_sep.min().item()
+
+        tracking["front_crossed_frac"] = front_crossed.float().mean().item()
+        tracking["rear_crossed_frac"] = rear_crossed.float().mean().item()
+
+        tracking["front_crossed_strict_frac"] = front_crossed_strict.float().mean().item()
+        tracking["rear_crossed_strict_frac"] = rear_crossed_strict.float().mean().item()
+
+        tracking["front_x_mean"] = front_x_mean.mean().item()
+        tracking["rear_x_mean"] = rear_x_mean.mean().item()
+
+    def compute_handoff_ready(self):
+        """
+        Computes whether each environment is ready to switch from the recovery
+        policy to the locomotion policy.
+
+        This is a diagnostic/runtime gate, not the sparse training success gate.
+        It should be slightly stricter than early training success.
+        """
+
+        cfg = self.cfg.rewards
+
+        foot_contact = (
+            self.contact_forces[:, self.feet_indices, 2]
+            > cfg.recovery_contact_force_threshold
+        )
+
+        foot_xy_vel = torch.norm(
+            self.foot_velocities[:, :, :2],
+            dim=-1
+        )
+
+        non_slipping_feet = foot_contact & (
+            foot_xy_vel < 0.10
+        )
+
+        posture_error = torch.norm(
+            self.dof_pos[:, :self.num_actuated_dof]
+            - self.default_dof_pos[:, :self.num_actuated_dof],
+            dim=1
+        )
+
+        handoff_ready = (
+            (self.projected_gravity[:, 2] < -0.85)
+            & (self.root_states[:, 2] > 0.26)
+            & (torch.norm(self.base_lin_vel[:, :2], dim=1) < 0.25)
+            & (torch.norm(self.base_ang_vel, dim=1) < 1.0)
+            & (posture_error < 1.8)
+            & (non_slipping_feet.sum(dim=1) >= 3)
+        )
+
+        return handoff_ready
+
+    def _write_recovery_grid_snapshot(
+            self,
+            upright,
+            stable_height,
+            low_velocity,
+            low_ang_vel,
+            good_posture,
+            stable_contacts,
+            recovered,
+            stable_recovery,
+        ):
+            """
+            Writes per-environment recovery gate status for dashboard visualization.
+
+            Status code:
+                0 = not upright
+                1 = upright, but height failed
+                2 = upright + height, but velocity failed
+                3 = velocity okay, but posture failed
+                4 = posture okay, but contact/slip failed
+                5 = instant recovered
+                6 = stable recovered
+            """
+
+            # Write infrequently; do not write every physics step.
+            if self.common_step_counter % 50 != 0:
+                return
+
+            status = torch.zeros(self.num_envs, device=self.device, dtype=torch.int32)
+
+            status[~upright] = 0
+
+            status[upright & ~stable_height] = 1
+
+            status[
+                upright
+                & stable_height
+                & ~(low_velocity & low_ang_vel)
+            ] = 2
+
+            status[
+                upright
+                & stable_height
+                & low_velocity
+                & low_ang_vel
+                & ~good_posture
+            ] = 3
+
+            status[
+                upright
+                & stable_height
+                & low_velocity
+                & low_ang_vel
+                & good_posture
+                & ~stable_contacts
+            ] = 4
+
+            status[recovered] = 5
+            status[stable_recovery] = 6
+
+            # Use your run/log directory if available.
+            # Replace this with your actual run directory variable if you have one.
+            import numpy as np
+            from pathlib import Path
+
+            if not hasattr(self, "recovery_grid_path"):
+                # fallback: current working directory
+                self.recovery_grid_path = Path("recovery_grid.npz")
+                print(f"[WARN] recovery_grid_path was not set; using {self.recovery_grid_path.resolve()}")
+
+            np.savez_compressed(
+                self.recovery_grid_path,
+                step=int(self.common_step_counter),
+                status=status.detach().cpu().numpy(),
+                upright=upright.detach().cpu().numpy(),
+                stable_height=stable_height.detach().cpu().numpy(),
+                low_velocity=low_velocity.detach().cpu().numpy(),
+                low_ang_vel=low_ang_vel.detach().cpu().numpy(),
+                good_posture=good_posture.detach().cpu().numpy(),
+                stable_contacts=stable_contacts.detach().cpu().numpy(),
+                recovered=recovered.detach().cpu().numpy(),
+                stable_recovery=stable_recovery.detach().cpu().numpy(),
+            )
+
     def check_recovery_success(self):
         """
         Counts successful fall-recovery events.
@@ -433,6 +681,16 @@ class LeggedRobot(BaseTask):
 
         stable_recovery = (self.recovery_counter >= cfg.recovery_success_steps)
 
+        # Diagnostic / runtime handoff readiness
+        handoff_ready = self.compute_handoff_ready()
+
+        self.log_recovery_tracking_metrics(
+            posture_error=posture_error,
+            foot_contact=foot_contact,
+            non_slipping_feet=non_slipping_feet,
+            handoff_ready=handoff_ready,
+        )
+
         self.rollout_upright |= upright
         self.rollout_recovered |= stable_recovery
 
@@ -449,7 +707,7 @@ class LeggedRobot(BaseTask):
         self.extras["recovery_debug"]["rollout_recovered"] = self.rollout_recovered.float().mean().item()
         self.extras["recovery_debug"]["rollout_max_counter_mean"] = self.rollout_max_counter.mean().item()
         self.extras["recovery_debug"]["rollout_max_counter_max"] = self.rollout_max_counter.max().item()
-
+        self.extras["recovery_debug"]["handoff_ready"] = handoff_ready.float().mean().item()
         self.extras["recovery_debug"]["upright"] = upright.float().mean().item()
         self.extras["recovery_debug"]["stable_height"] = stable_height.float().mean().item()
         self.extras["recovery_debug"]["low_velocity"] = low_velocity.float().mean().item()
@@ -474,6 +732,18 @@ class LeggedRobot(BaseTask):
 
         # self.episode_sums["recovery_success"] += new_recovery.float()
         self.extras["recovery_debug"]["new_recovery_event"] = new_recovery.float().mean().item()
+
+        self._write_recovery_grid_snapshot(
+            upright=upright,
+            stable_height=stable_height,
+            low_velocity=low_velocity,
+            low_ang_vel=low_ang_vel,
+            good_posture=good_posture,
+            stable_contacts=stable_contacts,
+            recovered=recovered,
+            stable_recovery=stable_recovery,
+        )
+
 
 
     def reset_idx(self, env_ids):
@@ -1821,67 +2091,6 @@ class LeggedRobot(BaseTask):
                 self.complete_video_frames_eval = self.video_frames_eval[:]
             self.video_frames_eval = []
 
-    def debug_static_default_foot_xy(self):
-        env_ids = torch.tensor([0], device=self.device, dtype=torch.long)
-        env_ids_int32 = env_ids.to(dtype=torch.int32)
-
-        # 1. Set joints to default standing pose
-        self.dof_pos[env_ids] = self.default_dof_pos[env_ids]
-        self.dof_vel[env_ids] = 0.0
-
-        self.gym.set_dof_state_tensor_indexed(
-            self.sim,
-            gymtorch.unwrap_tensor(self.dof_state),
-            gymtorch.unwrap_tensor(env_ids_int32),
-            len(env_ids_int32)
-        )
-
-        # 2. Set base to nominal upright pose
-        self.root_states[env_ids, 0:3] = torch.tensor(
-            self.cfg.init_state.pos,
-            device=self.device,
-            dtype=torch.float
-        )
-        self.root_states[env_ids, 3:7] = torch.tensor(
-            self.cfg.init_state.rot,
-            device=self.device,
-            dtype=torch.float
-        )
-        self.root_states[env_ids, 7:13] = 0.0
-
-        self.gym.set_actor_root_state_tensor_indexed(
-            self.sim,
-            gymtorch.unwrap_tensor(self.root_states),
-            gymtorch.unwrap_tensor(env_ids_int32),
-            len(env_ids_int32)
-        )
-
-        # 3. Step/refresh tensors
-        self.gym.simulate(self.sim)
-        self.gym.fetch_results(self.sim, True)
-        self.gym.refresh_actor_root_state_tensor(self.sim)
-        self.gym.refresh_rigid_body_state_tensor(self.sim)
-
-        # 4. Update local buffers
-        self.base_pos[:] = self.root_states[:self.num_envs, 0:3]
-        self.base_quat[:] = self.root_states[:self.num_envs, 3:7]
-
-        self.foot_positions = self.rigid_body_state.view(
-            self.num_envs, self.num_bodies, 13
-        )[:, self.feet_indices, 0:3]
-
-        # 5. Convert feet to base/body frame
-        foot_pos_body = quat_rotate_inverse(
-            self.base_quat[0].repeat(4, 1),
-            self.foot_positions[0] - self.base_pos[0].unsqueeze(0)
-        )
-
-        print("feet_indices:", self.feet_indices)
-        print("static default foot_pos_body XYZ:")
-        print(foot_pos_body.detach().cpu().numpy())
-        print("static default foot_pos_body XY:")
-        print(foot_pos_body[:, :2].detach().cpu().numpy())
-
     def _reset_root_states_disturbance(self, env_ids, cfg):
         num_resets = len(env_ids)
 
@@ -2654,9 +2863,7 @@ class LeggedRobot(BaseTask):
                                                                          self.feet_names[i])
 
         print("feet_indices:", self.feet_indices)
-
-        for i, idx in enumerate(self.feet_indices):
-            print(i, idx, self.gym.get_actor_rigid_body_names(self.envs[0], 0)[idx])
+        print("feet body names:", [self.body_names[i] for i in self.feet_indices])
 
         self.penalised_contact_indices = torch.zeros(len(penalized_contact_names), dtype=torch.long, device=self.device,
                                                      requires_grad=False)
