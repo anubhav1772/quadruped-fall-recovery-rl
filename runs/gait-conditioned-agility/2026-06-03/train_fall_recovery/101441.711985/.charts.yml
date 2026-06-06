@@ -1,0 +1,27 @@
+charts:
+- yKey: train/episode/rew_total/mean
+  xKey: iterations
+- yKey: train/episode/recovery_success/mean
+  xKey: iterations
+- yKey: train/episode/rew_upright_orientation/mean
+  xKey: iterations
+- yKey: train/episode/rew_height_alignment/mean
+  xKey: iterations
+- yKey: train/episode/rew_feet_on_ground/mean
+  xKey: iterations
+- yKey: train/episode/rew_posture/mean
+  xKey: iterations
+- yKey: train/episode/rew_feet_slip/mean
+  xKey: iterations
+- yKey: train/episode/rew_body_slip/mean
+  xKey: iterations
+- yKey: recovery/stable_contacts/mean
+  xKey: iterations
+- yKey: recovery/stable_recovery/mean
+  xKey: iterations
+- yKey: recovery/recovery_counter_max/mean
+  xKey: iterations
+- yKey: adaptation_loss/mean
+  xKey: iterations
+- type: video
+  glob: "videos/*.mp4"
