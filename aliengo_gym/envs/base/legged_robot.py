@@ -73,8 +73,107 @@ class LeggedRobot(BaseTask):
         # Store current torques as "last" BEFORE computing new ones
         # self.last_last_torques[:] = self.last_torques[:]
         self.last_torques[:] = self.torques[:]
-        clip_actions = self.cfg.normalization.clip_actions
-        self.actions = torch.clip(actions, -clip_actions, clip_actions).to(self.device)
+
+        if getattr(self.cfg.env, "debug_hold_reset_pose", False):
+            q_default = self._get_default_dof_pos_for_env_ids(
+                torch.arange(self.num_envs, device=self.device)
+            )
+
+            q_hold = self.debug_hold_dof_pos[:, :actions.shape[1]]
+            q_default = q_default[:, :actions.shape[1]]
+
+            action_scale = self.cfg.control.action_scale
+
+            if not torch.is_tensor(action_scale):
+                action_scale = torch.ones_like(actions) * float(action_scale)
+            else:
+                action_scale = action_scale.to(self.device).view(1, -1)
+
+            actions[:] = torch.clamp(
+                (q_hold - q_default) / (action_scale + 1e-6),
+                -1.0,
+                1.0,
+            )
+
+        elif getattr(self.cfg.env, "debug_zero_actions", False):
+            actions[:] = 0.0
+
+        # ------------------------------------------------------------
+        # Multi-zone state-based action limiting
+        # ------------------------------------------------------------
+
+        clip_actions = float(self.cfg.normalization.clip_actions)
+
+        effective_clip = torch.full(
+            (self.num_envs, 1),
+            clip_actions,
+            device=self.device,
+            dtype=actions.dtype,
+        )
+
+        # Gravity in base frame.
+        # Upright robot: g_now[:, 2] close to -1.
+        # Fallen/side/inverted: closer to 0 or positive.
+        g_now = quat_rotate_inverse(
+            self.root_states[:, 3:7],
+            self.gravity_vec,
+        )
+
+        z = self.root_states[:, 2]
+
+        self.near_crouch_clip_frac = torch.tensor(
+            0.0,
+            device=self.device,
+            dtype=torch.float,
+        )
+
+        self.near_stand_clip_frac = torch.tensor(
+            0.0,
+            device=self.device,
+            dtype=torch.float,
+        )
+
+        near_crouch_action_clip = getattr(self.cfg.env, "near_crouch_action_clip", None)
+        near_stand_action_clip = getattr(self.cfg.env, "near_stand_action_clip", None)
+
+        # Transition zone:
+        # robot is not fully standing yet, but it is no longer deeply fallen.
+        # This prevents sudden full [-10, 10] actions during terminal collapse.
+        if near_crouch_action_clip is not None:
+            near_crouch = (
+                (g_now[:, 2] < -0.45)
+                & (z > 0.18)
+            )
+
+            self.near_crouch_clip_frac = near_crouch.float().mean()
+
+            if near_crouch.any():
+                effective_clip[near_crouch] = min(
+                    float(near_crouch_action_clip),
+                    clip_actions,
+                )
+
+        # Strict terminal stabilization zone.
+        if near_stand_action_clip is not None:
+            near_stand = (
+                (g_now[:, 2] < -0.75)
+                & (z > 0.27)
+            )
+
+            self.near_stand_clip_frac = near_stand.float().mean()
+
+            if near_stand.any():
+                effective_clip[near_stand] = min(
+                    float(near_stand_action_clip),
+                    clip_actions,
+                )
+
+        self.actions = torch.clamp(
+            actions,
+            -effective_clip,
+            effective_clip,
+        ).to(self.device)
+
         # step physics and render each frame
         self.prev_base_pos = self.base_pos.clone()
         self.prev_base_quat = self.base_quat.clone()
@@ -161,6 +260,46 @@ class LeggedRobot(BaseTask):
 
         self._post_physics_step_callback()
 
+        # ------------------------------------------------------------
+        # Temporary terminal post-reset stability diagnostic
+        # ------------------------------------------------------------
+        if (
+            getattr(self.cfg.env, "debug_log_terminal_reset", False)
+            and self.common_step_counter % 50 == 0
+            and hasattr(self, "terminal_reset_buf")
+        ):
+            ids = self.terminal_reset_buf.bool()
+
+            if ids.any():
+                foot_contact = (
+                    self.contact_forces[ids][:, self.feet_indices, 2] > 1.0
+                )
+
+                if len(self.base_contact_indices) > 0:
+                    nonfoot_contact_force = torch.norm(
+                        self.contact_forces[ids][:, self.base_contact_indices, :],
+                        dim=-1,
+                    )
+
+                    nonfoot_contact_frac = (
+                        nonfoot_contact_force.max(dim=1).values > 0.2
+                    ).float().mean().item()
+                else:
+                    nonfoot_contact_frac = 0.0
+
+                print(
+                    "[TERMINAL POST-STEP]",
+                    "n", int(ids.sum().item()),
+                    "z mean", self.root_states[ids, 2].mean().item(),
+                    "z min", self.root_states[ids, 2].min().item(),
+                    "z max", self.root_states[ids, 2].max().item(),
+                    "gz mean", self.projected_gravity[ids, 2].mean().item(),
+                    "lin vel mean", torch.norm(self.base_lin_vel[ids, :2], dim=1).mean().item(),
+                    "ang vel mean", torch.norm(self.base_ang_vel[ids], dim=1).mean().item(),
+                    "foot contact mean", foot_contact.float().sum(dim=1).mean().item(),
+                    "nonfoot contact frac", nonfoot_contact_frac,
+                )
+
         # Compute Energy Consumption
         self.energy_consume = torch.sum(torch.abs(self.dof_vel * self.torques), dim=1).detach().clone()
         robot_mass = 12.0 if self.cfg.env.robot == "go1" else 21.5
@@ -214,17 +353,122 @@ class LeggedRobot(BaseTask):
     #                                < self.cfg.rewards.terminal_body_height
     #         self.reset_buf = torch.logical_or(self.body_height_buf, self.reset_buf)
 
+    # def check_termination(self):
+    #     self.reset_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+    #     # Success termination: single source of truth
+    #     if self.cfg.env.train_recovery:
+    #         success_reset = self.recovery_counter >= self.cfg.rewards.recovery_success_steps
+    #         self.reset_buf |= success_reset
+
+    #     # Timeout
+    #     self.time_out_buf = self.episode_length_buf > self.cfg.env.max_episode_length
+    #     self.reset_buf |= self.time_out_buf
+
+    #     root_z = self.root_states[:, 2]
+    #     lin_vel_norm = torch.norm(self.root_states[:, 7:10], dim=1)
+    #     ang_vel_norm = torch.norm(self.root_states[:, 10:13], dim=1)
+
+    #     bad_state = (
+    #         torch.isnan(self.root_states).any(dim=1)
+    #         | torch.isinf(self.root_states).any(dim=1)
+    #         | torch.isnan(self.dof_pos).any(dim=1)
+    #         | torch.isinf(self.dof_pos).any(dim=1)
+    #         | torch.isnan(self.dof_vel).any(dim=1)
+    #         | torch.isinf(self.dof_vel).any(dim=1)
+    #         | (root_z < -1.0)
+    #         | (root_z > 2.0)
+    #         | (lin_vel_norm > 20.0)
+    #         | (ang_vel_norm > 50.0)
+    #     )
+
+    #     self.bad_state_buf = bad_state
+    #     self.reset_buf |= self.bad_state_buf
+    #
+
     def check_termination(self):
-        self.reset_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.reset_buf = torch.zeros(
+            self.num_envs,
+            dtype=torch.bool,
+            device=self.device,
+        )
 
-        # Success termination: single source of truth
+        # ------------------------------------------------------------
+        # Recovery success should be detected in check_recovery_success().
+        # During terminal-stabilizer training, do NOT terminate on success.
+        # The policy must learn to remain stable after reaching recovery.
+        # ------------------------------------------------------------
+        if not hasattr(self, "success_reset_buf"):
+            self.success_reset_buf = torch.zeros(
+                self.num_envs,
+                dtype=torch.bool,
+                device=self.device,
+            )
+
+        self.success_reset_buf[:] = False
+
         if self.cfg.env.train_recovery:
-            success_reset = self.recovery_counter >= self.cfg.rewards.recovery_success_steps
-            self.reset_buf |= success_reset
+            terminate_on_success = getattr(
+                self.cfg.env,
+                "terminate_on_recovery_success",
+                False,
+            )
 
+            if terminate_on_success:
+                success_reset = (
+                    self.recovery_counter
+                    >= self.cfg.rewards.recovery_success_steps
+                )
+                self.success_reset_buf[:] = success_reset
+                self.reset_buf |= success_reset
+
+        # ------------------------------------------------------------
         # Timeout
-        self.time_out_buf = self.episode_length_buf > self.cfg.env.max_episode_length
+        # ------------------------------------------------------------
+        self.time_out_buf = (
+            self.episode_length_buf > self.cfg.env.max_episode_length
+        )
         self.reset_buf |= self.time_out_buf
+
+        # ------------------------------------------------------------
+        # Bad / exploded physics state reset
+        # ------------------------------------------------------------
+        root_z = self.root_states[:, 2]
+        lin_vel_norm = torch.norm(self.root_states[:, 7:10], dim=1)
+        ang_vel_norm = torch.norm(self.root_states[:, 10:13], dim=1)
+
+        bad_state = (
+            torch.isnan(self.root_states).any(dim=1)
+            | torch.isinf(self.root_states).any(dim=1)
+            | torch.isnan(self.dof_pos).any(dim=1)
+            | torch.isinf(self.dof_pos).any(dim=1)
+            | torch.isnan(self.dof_vel).any(dim=1)
+            | torch.isinf(self.dof_vel).any(dim=1)
+            | (root_z < -1.0)
+            | (root_z > 2.0)
+            | (lin_vel_norm > 20.0)
+            | (ang_vel_norm > 50.0)
+        )
+
+        self.bad_state_buf = bad_state
+        self.reset_buf |= self.bad_state_buf
+
+        # ------------------------------------------------------------
+        # Debug logging
+        # ------------------------------------------------------------
+        if not hasattr(self, "extras"):
+            self.extras = {}
+
+        if "recovery_debug" not in self.extras:
+            self.extras["recovery_debug"] = {}
+
+        self.extras["recovery_debug"]["success_reset_frac"] = self.success_reset_buf.float().mean().item()
+        self.extras["recovery_debug"]["timeout_frac"] = self.time_out_buf.float().mean().item()
+        self.extras["recovery_debug"]["bad_state_frac"] = self.bad_state_buf.float().mean().item()
+        self.extras["recovery_debug"]["root_z_min"] = root_z.min().item()
+        self.extras["recovery_debug"]["root_z_max"] = root_z.max().item()
+        self.extras["recovery_debug"]["lin_vel_norm_max"] = lin_vel_norm.max().item()
+        self.extras["recovery_debug"]["ang_vel_norm_max"] = ang_vel_norm.max().item()
 
     # def log_recovery_tracking_metrics(
     #     self,
@@ -350,163 +594,500 @@ class LeggedRobot(BaseTask):
     #     self.extras["recovery_tracking"]["rear_x_mean"] = rear_x_mean.mean().item()
 
     def log_recovery_tracking_metrics(
-        self,
-        posture_error,
-        foot_contact,
-        non_slipping_feet,
-        handoff_ready,
-    ):
-        """
-        Logs continuous recovery tracking diagnostics.
+            self,
+            posture_error,
+            foot_contact,
+            non_slipping_feet,
+            handoff_ready,
+        ):
+            """
+            Logs continuous recovery tracking diagnostics.
 
-        Foot order assumed:
-            0 = FL, 1 = FR, 2 = RL, 3 = RR
+            Expected foot order:
+                0 = FL, 1 = FR, 2 = RL, 3 = RR
 
-        Important naming note:
-            self.base_contact_indices is currently all non-foot bodies,
-            not only the trunk/base. Therefore, base_contact_env_frac is
-            effectively a non-foot-contact fraction.
+            Important interpretation:
+                - foot_contact means the foot has enough vertical contact force.
+                - non_slipping_feet means the foot is in contact and its XY velocity is low.
+                - slipping_feet means the foot is in contact but still moving/sliding.
+                - late_* metrics are conditioned on near-upright + near-raised states.
 
-        Main purpose:
-            - distinguish raw foot contact from non-slipping support
-            - detect rear-leg crossing/interlocking
-            - detect whether non-foot body contact remains after the robot
-              is already near upright and raised
-        """
+            Why late metrics matter:
+                In fall recovery, global averages include fallen/rolling states.
+                Low global foot contact does not necessarily mean the robot never
+                touches the ground. The late_* metrics answer:
 
-        if not hasattr(self, "extras"):
-            self.extras = {}
+                    "When the robot is near recovery, are the feet loaded and stable?"
+            """
 
-        if "recovery_tracking" not in self.extras:
-            self.extras["recovery_tracking"] = {}
+            if not hasattr(self, "extras"):
+                self.extras = {}
 
-        tracking = self.extras["recovery_tracking"]
+            if "recovery_tracking" not in self.extras:
+                self.extras["recovery_tracking"] = {}
 
-        # Basic recovery state metrics
-        lin_vel_norm = torch.norm(self.base_lin_vel[:, :2], dim=1)
-        ang_vel_norm = torch.norm(self.base_ang_vel, dim=1)
+            tracking = self.extras["recovery_tracking"]
+            cfg = self.cfg.rewards
 
-        base_height = self.root_states[:, 2]
-        base_height_error = torch.abs(
-            base_height - self.cfg.rewards.recovery_height_target
-        )
+            # ------------------------------------------------------------
+            # Thresholds
+            # ------------------------------------------------------------
+            foot_contact_threshold = getattr(
+                cfg,
+                "recovery_contact_force_threshold",
+                1.0,
+            )
 
-        foot_contact_count = foot_contact.float().sum(dim=1)
-        non_slipping_foot_count = non_slipping_feet.float().sum(dim=1)
+            # Non-foot contact should usually use a lower threshold than foot contact.
+            # This catches thigh/calf/trunk contact without requiring large impact force.
+            nonfoot_contact_threshold = getattr(
+                cfg,
+                "nonfoot_contact_threshold",
+                0.2,
+            )
 
-        # Non-foot (trunk, hips, thighs, and calves) contact metrics
-        # self.base_contact_indices contains all non-foot bodies.
-        # This is useful for checking whether thighs, calves, hips, or trunk
-        # are still touching the ground during/after recovery.
-        base_contact_force = torch.norm(
-            self.contact_forces[:, self.base_contact_indices, :],
-            dim=-1,
-        )
+            # Useful support load threshold.
+            # This is stricter than visual/contact detection.
+            loaded_foot_force_threshold = getattr(
+                cfg,
+                "loaded_foot_force_threshold",
+                3.0,
+            )
 
-        # Use the same threshold as your base-contact reward if possible.
-        # If your _reward_base_contact() uses 0.2, keep this at 0.2 too.
-        # If you prefer consistency with recovery foot contact, replace 0.2
-        # with self.cfg.rewards.recovery_contact_force_threshold.
-        base_contact_env = (
-            base_contact_force.max(dim=1).values > self.cfg.rewards.nonfoot_contact_threshold
-        )
+            # Geometry diagnostic thresholds for Go1.
+            # These are diagnostics, not necessarily reward thresholds.
+            front_too_wide_threshold = getattr(
+                cfg,
+                "front_too_wide_threshold",
+                0.42,
+            )
 
-        base_contact_env_frac = base_contact_env.float().mean()
+            front_too_forward_threshold = getattr(
+                cfg,
+                "front_too_forward_threshold",
+                0.28,
+            )
 
-        # Late gate: only look at environments that are already close to
-        # terminal recovery height/orientation. This avoids over-interpreting
-        # body contact while the robot is still fallen or rolling.
-        late_gate = (
-            (self.projected_gravity[:, 2] < -0.75)
-            & (self.root_states[:, 2] > 0.27)
-        )
+            rear_too_narrow_threshold = getattr(
+                cfg,
+                "rear_too_narrow_threshold",
+                0.10,
+            )
 
-        late_gate_count = late_gate.float().sum()
+            front_too_narrow_threshold = getattr(
+                cfg,
+                "front_too_narrow_threshold",
+                0.10,
+            )
 
-        late_base_contact_frac = (
-            (base_contact_env & late_gate).float().sum()
-            / late_gate_count.clamp_min(1.0)
-        )
+            # ------------------------------------------------------------
+            # Ensure expected boolean types
+            # ------------------------------------------------------------
+            foot_contact = foot_contact.bool()
+            non_slipping_feet = non_slipping_feet.bool()
+            handoff_ready = handoff_ready.bool()
 
-        # Foot geometry metrics in base/body frame
-        foot_pos_body = quat_rotate_inverse(
-            self.base_quat.unsqueeze(1).repeat(1, 4, 1).reshape(-1, 4),
-            (self.foot_positions - self.base_pos.unsqueeze(1)).reshape(-1, 3),
-        ).reshape(self.num_envs, 4, 3)
+            # ------------------------------------------------------------
+            # Basic recovery state metrics
+            # ------------------------------------------------------------
+            lin_vel_norm = torch.norm(self.base_lin_vel[:, :2], dim=1)
+            ang_vel_norm = torch.norm(self.base_ang_vel, dim=1)
 
-        x = foot_pos_body[:, :, 0]
-        y = foot_pos_body[:, :, 1]
+            base_height = self.root_states[:, 2]
+            target_height = self.cfg.rewards.recovery_height_target
 
-        # Foot order assumed: FL, FR, RL, RR
-        front_sep = y[:, 0] - y[:, 1]   # FL_y - FR_y
-        rear_sep = y[:, 2] - y[:, 3]    # RL_y - RR_y
+            base_height_error = torch.abs(base_height - target_height)
 
-        # Strict crossing: left foot has crossed to the right side.
-        front_crossed_strict = front_sep < 0.0
-        rear_crossed_strict = rear_sep < 0.0
+            valid_height = (
+                torch.isfinite(base_height)
+                & (base_height > -1.0)
+                & (base_height < 2.0)
+            )
 
-        # Practical collapse/interlocking diagnostic.
-        # Go1 nominal left-right foot separation is about 0.31 m.
-        # Below 0.10 m usually means severe collapse/interlocking.
-        front_crossed = front_sep < 0.10
-        rear_crossed = rear_sep < 0.10
+            g_z = self.projected_gravity[:, 2]
 
-        # X-position diagnostics:
-        # - front_x_mean too large  -> front feet too far forward
-        # - rear_x_mean too large   -> rear feet too far forward / under body
-        # - rear_x_mean too negative can also indicate over-stretched rear legs
-        front_x_mean = 0.5 * (x[:, 0] + x[:, 1])
-        rear_x_mean = 0.5 * (x[:, 2] + x[:, 3])
+            foot_fz = self.contact_forces[:, self.feet_indices, 2].clamp_min(0.0)
+            foot_xy_vel = torch.norm(self.foot_velocities[:, :, :2], dim=-1)
 
-        tracking["posture_error_mean"] = posture_error.mean().item()
-        tracking["posture_error_min"] = posture_error.min().item()
-        tracking["posture_error_max"] = posture_error.max().item()
+            loaded_feet = foot_fz > loaded_foot_force_threshold
 
-        tracking["base_height_mean"] = base_height.mean().item()
-        tracking["base_height_error_mean"] = base_height_error.mean().item()
+            # Contacted but not non-slipping.
+            # This is the most useful per-foot slip diagnostic.
+            slipping_feet = foot_contact & (~non_slipping_feet)
 
-        tracking["lin_vel_norm_mean"] = lin_vel_norm.mean().item()
-        tracking["ang_vel_norm_mean"] = ang_vel_norm.mean().item()
+            foot_contact_count = foot_contact.float().sum(dim=1)
+            loaded_foot_count = loaded_feet.float().sum(dim=1)
+            non_slipping_foot_count = non_slipping_feet.float().sum(dim=1)
+            slipping_foot_count = slipping_feet.float().sum(dim=1)
 
-        tracking["foot_contact_count_mean"] = foot_contact_count.mean().item()
-        tracking["non_slipping_foot_count_mean"] = non_slipping_foot_count.mean().item()
+            stable_contacts = (
+                non_slipping_foot_count >= self.cfg.rewards.recovery_min_foot_contacts
+            )
 
-        tracking["base_contact_force_mean"] = base_contact_force.mean().item()
+            # ------------------------------------------------------------
+            # Non-foot contact metrics
+            # ------------------------------------------------------------
+            # self.base_contact_indices should contain all non-foot bodies:
+            # trunk/base, hips, thighs, calves, etc.
+            #
+            # If it contains only base/trunk in your code, rename these metrics
+            # accordingly. The metric names below are kept compatible with your
+            # existing dashboard.
+            # ------------------------------------------------------------
+            if len(self.base_contact_indices) > 0:
+                nonfoot_contact_force = torch.norm(
+                    self.contact_forces[:, self.base_contact_indices, :],
+                    dim=-1,
+                )
 
-        # Keep the original names for dashboard compatibility.
-        tracking["base_contact_env_frac"] = base_contact_env_frac.item()
-        tracking["late_base_contact_frac"] = late_base_contact_frac.item()
-        tracking["late_gate_frac"] = late_gate.float().mean().item()
+                nonfoot_contact_env = (
+                    nonfoot_contact_force.max(dim=1).values
+                    > nonfoot_contact_threshold
+                )
 
-        # Optional clearer aliases. Keep them if your dashboard can show new keys.
-        tracking["nonfoot_contact_env_frac"] = base_contact_env_frac.item()
-        tracking["late_nonfoot_contact_frac"] = late_base_contact_frac.item()
+                nonfoot_contact_force_mean = nonfoot_contact_force.mean()
+            else:
+                nonfoot_contact_force = torch.zeros(
+                    self.num_envs,
+                    1,
+                    device=self.device,
+                )
+                nonfoot_contact_env = torch.zeros(
+                    self.num_envs,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                nonfoot_contact_force_mean = torch.tensor(
+                    0.0,
+                    device=self.device,
+                )
 
-        tracking["handoff_ready_mean"] = handoff_ready.float().mean().item()
+            nonfoot_contact_env_frac = nonfoot_contact_env.float().mean()
 
-        tracking["front_sep_mean"] = front_sep.mean().item()
-        tracking["rear_sep_mean"] = rear_sep.mean().item()
+            # ------------------------------------------------------------
+            # Late-stage gate
+            # ------------------------------------------------------------
+            # Late gate means:
+            #   robot is already reasonably upright and raised.
+            #
+            # This avoids treating expected fallen/rolling contact as a final
+            # recovery failure.
+            # ------------------------------------------------------------
+            late_gate = (
+                (g_z < -0.75)
+                & (base_height > 0.27)
+            )
 
-        tracking["front_sep_min"] = front_sep.min().item()
-        tracking["rear_sep_min"] = rear_sep.min().item()
+            late_gate_float = late_gate.float()
+            late_count = late_gate_float.sum().clamp_min(1.0)
 
-        tracking["front_crossed_frac"] = front_crossed.float().mean().item()
-        tracking["rear_crossed_frac"] = rear_crossed.float().mean().item()
+            def late_scalar_mean(x):
+                """
+                Mean of a scalar per-env tensor over late-gate envs.
+                Returns 0 if no env is in late gate.
+                """
+                return (x.float() * late_gate_float).sum() / late_count
 
-        tracking["front_crossed_strict_frac"] = front_crossed_strict.float().mean().item()
-        tracking["rear_crossed_strict_frac"] = rear_crossed_strict.float().mean().item()
+            def late_vector_mean(x):
+                """
+                Mean of a [num_envs, 4] tensor over late-gate envs.
+                Returns a [4] tensor.
+                """
+                return (
+                    x.float() * late_gate_float.unsqueeze(1)
+                ).sum(dim=0) / late_count
 
-        tracking["front_x_mean"] = front_x_mean.mean().item()
-        tracking["rear_x_mean"] = rear_x_mean.mean().item()
+            late_nonfoot_contact_frac = late_scalar_mean(nonfoot_contact_env)
+
+            late_foot_contact_count_mean = late_scalar_mean(foot_contact_count)
+            late_loaded_foot_count_mean = late_scalar_mean(loaded_foot_count)
+            late_non_slipping_foot_count_mean = late_scalar_mean(non_slipping_foot_count)
+            late_slipping_foot_count_mean = late_scalar_mean(slipping_foot_count)
+            late_stable_contacts_frac = late_scalar_mean(stable_contacts)
+
+            # ------------------------------------------------------------
+            # Foot geometry metrics in base/body frame
+            # ------------------------------------------------------------
+            foot_pos_body = quat_rotate_inverse(
+                self.base_quat.unsqueeze(1).repeat(1, 4, 1).reshape(-1, 4),
+                (self.foot_positions - self.base_pos.unsqueeze(1)).reshape(-1, 3),
+            ).reshape(self.num_envs, 4, 3)
+
+            x = foot_pos_body[:, :, 0]
+            y = foot_pos_body[:, :, 1]
+
+            # Foot order: FL, FR, RL, RR
+            front_sep = y[:, 0] - y[:, 1]
+            rear_sep = y[:, 2] - y[:, 3]
+
+            front_crossed_strict = front_sep < 0.0
+            rear_crossed_strict = rear_sep < 0.0
+
+            # Practical collapse/interlocking diagnostics.
+            # Go1 nominal left-right foot separation is about 0.31 m.
+            front_crossed = front_sep < front_too_narrow_threshold
+            rear_crossed = rear_sep < rear_too_narrow_threshold
+
+            front_x_mean = 0.5 * (x[:, 0] + x[:, 1])
+            rear_x_mean = 0.5 * (x[:, 2] + x[:, 3])
+
+            front_too_wide = front_sep > front_too_wide_threshold
+            front_too_forward = front_x_mean > front_too_forward_threshold
+
+            # ------------------------------------------------------------
+            # Inferred state-distribution diagnostics
+            # ------------------------------------------------------------
+            # These help interpret whether current data mostly comes from fallen,
+            # crouched, near-stand, or terminal-candidate states.
+            # ------------------------------------------------------------
+            fallen_like = (
+                (g_z > -0.30)
+                | (base_height < 0.18)
+            )
+
+            rollup_or_crouch = (
+                (g_z <= -0.30)
+                & (g_z > -0.75)
+                & (base_height >= 0.18)
+            )
+
+            near_stand_unstable = (
+                late_gate
+                & (~stable_contacts)
+                & (~handoff_ready)
+            )
+
+            handoff_candidate = handoff_ready
+
+            # ------------------------------------------------------------
+            # Global tracking metrics
+            # ------------------------------------------------------------
+            if hasattr(self, "recovery_reset_source_buf"):
+                tracking["terminal_reset_frac"] = self.recovery_reset_source_buf.float().mean().item()
+
+            tracking["posture_error_mean"] = posture_error.mean().item()
+            tracking["posture_error_min"] = posture_error.min().item()
+            tracking["posture_error_max"] = posture_error.max().item()
+
+            if valid_height.any():
+                base_height_valid = base_height[valid_height]
+                base_height_error_valid = torch.abs(base_height_valid - target_height)
+
+                tracking["base_height_mean"] = base_height_valid.mean().item()
+                tracking["base_height_median"] = base_height_valid.median().item()
+                tracking["base_height_error_mean"] = base_height_error_valid.mean().item()
+            else:
+                tracking["base_height_mean"] = 0.0
+                tracking["base_height_median"] = 0.0
+                tracking["base_height_error_mean"] = 0.0
+
+            # keep raw diagnostics separately
+            tracking["base_height_raw_min"] = base_height.min().item()
+            tracking["base_height_raw_max"] = base_height.max().item()
+            tracking["bad_height_frac"] = (~valid_height).float().mean().item()
+
+            tracking["lin_vel_norm_mean"] = lin_vel_norm.mean().item()
+            tracking["ang_vel_norm_mean"] = ang_vel_norm.mean().item()
+
+            tracking["foot_contact_count_mean"] = foot_contact_count.mean().item()
+            tracking["loaded_foot_count_mean"] = loaded_foot_count.mean().item()
+            tracking["non_slipping_foot_count_mean"] = non_slipping_foot_count.mean().item()
+            tracking["slipping_foot_count_mean"] = slipping_foot_count.mean().item()
+
+            tracking["stable_contacts_frac"] = stable_contacts.float().mean().item()
+
+            tracking["foot_fz_mean"] = foot_fz.mean().item()
+            tracking["foot_xy_vel_mean"] = foot_xy_vel.mean().item()
+
+            # Keep old dashboard-compatible names.
+            tracking["base_contact_force_mean"] = nonfoot_contact_force_mean.item()
+            tracking["base_contact_env_frac"] = nonfoot_contact_env_frac.item()
+            tracking["late_base_contact_frac"] = late_nonfoot_contact_frac.item()
+
+            # Clearer aliases.
+            tracking["nonfoot_contact_env_frac"] = nonfoot_contact_env_frac.item()
+            tracking["late_nonfoot_contact_frac"] = late_nonfoot_contact_frac.item()
+
+            tracking["late_gate_frac"] = late_gate.float().mean().item()
+
+            tracking["late_foot_contact_count_mean"] = late_foot_contact_count_mean.item()
+            tracking["late_loaded_foot_count_mean"] = late_loaded_foot_count_mean.item()
+            tracking["late_non_slipping_foot_count_mean"] = (
+                late_non_slipping_foot_count_mean.item()
+            )
+            tracking["late_slipping_foot_count_mean"] = late_slipping_foot_count_mean.item()
+            tracking["late_stable_contacts_frac"] = late_stable_contacts_frac.item()
+
+            tracking["handoff_ready_mean"] = handoff_ready.float().mean().item()
+
+            # ------------------------------------------------------------
+            # Geometry tracking metrics
+            # ------------------------------------------------------------
+            tracking["front_sep_mean"] = front_sep.mean().item()
+            tracking["rear_sep_mean"] = rear_sep.mean().item()
+
+            tracking["front_sep_min"] = front_sep.min().item()
+            tracking["rear_sep_min"] = rear_sep.min().item()
+
+            tracking["front_crossed_frac"] = front_crossed.float().mean().item()
+            tracking["rear_crossed_frac"] = rear_crossed.float().mean().item()
+
+            tracking["front_crossed_strict_frac"] = front_crossed_strict.float().mean().item()
+            tracking["rear_crossed_strict_frac"] = rear_crossed_strict.float().mean().item()
+
+            tracking["front_x_mean"] = front_x_mean.mean().item()
+            tracking["rear_x_mean"] = rear_x_mean.mean().item()
+
+            tracking["front_too_wide_frac"] = front_too_wide.float().mean().item()
+            tracking["front_too_forward_frac"] = front_too_forward.float().mean().item()
+
+            tracking["late_front_sep_mean"] = late_scalar_mean(front_sep).item()
+            tracking["late_rear_sep_mean"] = late_scalar_mean(rear_sep).item()
+
+            tracking["late_front_x_mean"] = late_scalar_mean(front_x_mean).item()
+            tracking["late_rear_x_mean"] = late_scalar_mean(rear_x_mean).item()
+
+            tracking["late_front_crossed_frac"] = late_scalar_mean(front_crossed).item()
+            tracking["late_rear_crossed_frac"] = late_scalar_mean(rear_crossed).item()
+
+            tracking["late_front_crossed_strict_frac"] = (
+                late_scalar_mean(front_crossed_strict).item()
+            )
+            tracking["late_rear_crossed_strict_frac"] = (
+                late_scalar_mean(rear_crossed_strict).item()
+            )
+
+            tracking["late_front_too_wide_frac"] = late_scalar_mean(front_too_wide).item()
+            tracking["late_front_too_forward_frac"] = late_scalar_mean(front_too_forward).item()
+
+            tracking["near_crouch_clip_frac"] = getattr(
+                self,
+                "near_crouch_clip_frac",
+                torch.tensor(0.0, device=self.device),
+            ).item()
+
+            tracking["near_stand_clip_frac"] = getattr(
+                self,
+                "near_stand_clip_frac",
+                torch.tensor(0.0, device=self.device),
+            ).item()
+
+            # ------------------------------------------------------------
+            # Per-foot contact/load/non-slip/slip diagnostics
+            # ------------------------------------------------------------
+            # These answer:
+            #   - which foot is touching?
+            #   - which foot is carrying load?
+            #   - which foot is non-slipping?
+            #   - which contacted foot is slipping?
+            # ------------------------------------------------------------
+            foot_names = ["FL", "FR", "RL", "RR"]
+
+            per_foot_contact_frac = foot_contact.float().mean(dim=0)
+            per_foot_loaded_frac = loaded_feet.float().mean(dim=0)
+            per_foot_non_slip_frac = non_slipping_feet.float().mean(dim=0)
+            per_foot_slipping_contact_frac = slipping_feet.float().mean(dim=0)
+
+            per_foot_fz_mean = foot_fz.mean(dim=0)
+            per_foot_xy_vel_mean = foot_xy_vel.mean(dim=0)
+
+            late_per_foot_contact_frac = late_vector_mean(foot_contact)
+            late_per_foot_loaded_frac = late_vector_mean(loaded_feet)
+            late_per_foot_non_slip_frac = late_vector_mean(non_slipping_feet)
+            late_per_foot_slipping_contact_frac = late_vector_mean(slipping_feet)
+
+            late_per_foot_fz_mean = late_vector_mean(foot_fz)
+            late_per_foot_xy_vel_mean = late_vector_mean(foot_xy_vel)
+
+            for i, name in enumerate(foot_names):
+                # Global per-foot metrics.
+                tracking[f"{name}_contact_frac"] = per_foot_contact_frac[i].item()
+                tracking[f"{name}_loaded_frac"] = per_foot_loaded_frac[i].item()
+                tracking[f"{name}_non_slip_frac"] = per_foot_non_slip_frac[i].item()
+                tracking[f"{name}_slipping_contact_frac"] = (
+                    per_foot_slipping_contact_frac[i].item()
+                )
+
+                tracking[f"{name}_foot_fz_mean"] = per_foot_fz_mean[i].item()
+                tracking[f"{name}_foot_xy_vel_mean"] = per_foot_xy_vel_mean[i].item()
+
+                # Late-stage per-foot metrics.
+                tracking[f"late_{name}_contact_frac"] = (
+                    late_per_foot_contact_frac[i].item()
+                )
+                tracking[f"late_{name}_loaded_frac"] = (
+                    late_per_foot_loaded_frac[i].item()
+                )
+                tracking[f"late_{name}_non_slip_frac"] = (
+                    late_per_foot_non_slip_frac[i].item()
+                )
+                tracking[f"late_{name}_slipping_contact_frac"] = (
+                    late_per_foot_slipping_contact_frac[i].item()
+                )
+
+                tracking[f"late_{name}_foot_fz_mean"] = late_per_foot_fz_mean[i].item()
+                tracking[f"late_{name}_foot_xy_vel_mean"] = (
+                    late_per_foot_xy_vel_mean[i].item()
+                )
+
+                # Per-foot body-frame position diagnostics.
+                tracking[f"{name}_x_mean"] = x[:, i].mean().item()
+                tracking[f"{name}_y_mean"] = y[:, i].mean().item()
+
+                tracking[f"late_{name}_x_mean"] = late_scalar_mean(x[:, i]).item()
+                tracking[f"late_{name}_y_mean"] = late_scalar_mean(y[:, i]).item()
+
+            # ------------------------------------------------------------
+            # State-distribution diagnostics
+            # ------------------------------------------------------------
+            tracking["state_fallen_like_frac"] = fallen_like.float().mean().item()
+            tracking["state_rollup_or_crouch_frac"] = rollup_or_crouch.float().mean().item()
+            tracking["state_near_stand_unstable_frac"] = (
+                near_stand_unstable.float().mean().item()
+            )
+            tracking["state_handoff_candidate_frac"] = handoff_candidate.float().mean().item()
+
+            # ------------------------------------------------------------
+            # Reset-source diagnostics, if you have self.reset_source
+            # ------------------------------------------------------------
+            # Suggested convention:
+            #   0 = full fallen reset
+            #   1 = partial recovery / roll-up reset
+            #   2 = near-stand / final-stand reset
+            # reset_fallen_frac
+            #    current fraction of the 4096 envs whose latest reset was fallen
+            # reset_event_fallen_frac
+            #    cumulative fraction of reset events that were fallen
+            # ------------------------------------------------------------
+            if hasattr(self, "reset_source"):
+                reset_source = self.reset_source
+                valid = reset_source >= 0
+                valid_count = valid.float().sum().clamp_min(1.0)
+
+                tracking["reset_fallen_frac"] = (
+                    ((reset_source == 0) & valid).float().sum() / valid_count
+                ).item()
+
+                tracking["reset_near_stand_frac"] = (
+                    ((reset_source == 1) & valid).float().sum() / valid_count
+                ).item()
+
+            if hasattr(self, "reset_source_event_counts"):
+                counts = self.reset_source_event_counts.float()
+                total_events = counts.sum().clamp_min(1.0)
+
+                tracking["reset_event_fallen_frac"] = (counts[0] / total_events).item()
+                tracking["reset_event_near_stand_frac"] = (counts[1] / total_events).item()
+                tracking["reset_event_total"] = total_events.item()
 
     def compute_handoff_ready(self):
         """
-        Computes whether each environment is ready to switch from the recovery
-        policy to the locomotion policy.
+        Diagnostic/runtime gate for switching from recovery policy to locomotion policy.
 
-        This is a diagnostic/runtime gate, not the sparse training success gate.
-        It should be slightly stricter than early training success.
+        This should be stricter than the training recovery-success gate.
+        Do not use this as the sparse reward gate during training.
         """
+
 
         cfg = self.cfg.rewards
 
@@ -531,13 +1112,13 @@ class LeggedRobot(BaseTask):
         )
 
         handoff_ready = (
-            (self.projected_gravity[:, 2] < -0.85)
-            & (self.root_states[:, 2] > 0.26)
-            & (torch.norm(self.base_lin_vel[:, :2], dim=1) < 0.25)
-            & (torch.norm(self.base_ang_vel, dim=1) < 1.0)
-            & (posture_error < 1.8)
-            & (non_slipping_feet.sum(dim=1) >= 3)
-        )
+                (self.projected_gravity[:, 2] < cfg.recovery_upright_threshold)  # usually -0.90
+                & (self.root_states[:, 2] > 0.30)                                # stricter than 0.28 success
+                & (torch.norm(self.base_lin_vel[:, :2], dim=1) < 0.25)
+                & (torch.norm(self.base_ang_vel, dim=1) < 1.00)
+                & (posture_error < 1.80)
+                & (non_slipping_feet.sum(dim=1) >= 3)
+            )
 
         return handoff_ready
 
@@ -625,6 +1206,50 @@ class LeggedRobot(BaseTask):
                 stable_recovery=stable_recovery.detach().cpu().numpy(),
             )
 
+    def _write_reset_source_grid_snapshot(self):
+        """
+        Writes per-env reset-source labels for dashboard visualization.
+
+        Source code:
+            -1 = uninitialized
+             0 = fallen reset
+             1 = terminal / near-stand reset
+        """
+
+        if self.common_step_counter % 50 != 0:
+            return
+
+        if not hasattr(self, "reset_source"):
+            return
+
+        import numpy as np
+        from pathlib import Path
+
+        if hasattr(self, "recovery_grid_path"):
+            grid_path = Path(self.recovery_grid_path).with_name("reset_source_grid.npz")
+        else:
+            grid_path = Path("reset_source_grid.npz")
+
+        reset_source = self.reset_source.detach().cpu().numpy()
+
+        if hasattr(self, "terminal_reset_buf"):
+            terminal_reset = self.terminal_reset_buf.detach().cpu().numpy()
+        else:
+            terminal_reset = np.zeros(self.num_envs, dtype=bool)
+
+        if hasattr(self, "reset_source_event_counts"):
+            event_counts = self.reset_source_event_counts.detach().cpu().numpy()
+        else:
+            event_counts = np.zeros(2, dtype=np.int64)
+
+        np.savez_compressed(
+            grid_path,
+            step=int(self.common_step_counter),
+            reset_source=reset_source,
+            terminal_reset=terminal_reset,
+            event_counts=event_counts,
+        )
+
     def check_recovery_success(self):
         """
         Counts successful fall-recovery events.
@@ -683,6 +1308,32 @@ class LeggedRobot(BaseTask):
 
         # Diagnostic / runtime handoff readiness
         handoff_ready = self.compute_handoff_ready()
+
+        if hasattr(self, "terminal_reset_buf"):
+            terminal_src = self.terminal_reset_buf.bool()
+            fallen_src = ~terminal_src
+
+            dbg = self.extras.setdefault("recovery_debug", {})
+
+            if terminal_src.any():
+                dbg["terminal_src_upright"] = upright[terminal_src].float().mean().item()
+                dbg["terminal_src_height"] = stable_height[terminal_src].float().mean().item()
+                dbg["terminal_src_low_vel"] = low_velocity[terminal_src].float().mean().item()
+                dbg["terminal_src_low_ang_vel"] = low_ang_vel[terminal_src].float().mean().item()
+                dbg["terminal_src_posture"] = good_posture[terminal_src].float().mean().item()
+                dbg["terminal_src_stable_contacts"] = stable_contacts[terminal_src].float().mean().item()
+                dbg["terminal_src_recovered"] = recovered[terminal_src].float().mean().item()
+                dbg["terminal_src_handoff"] = handoff_ready[terminal_src].float().mean().item()
+
+            if fallen_src.any():
+                dbg["fallen_src_upright"] = upright[fallen_src].float().mean().item()
+                dbg["fallen_src_height"] = stable_height[fallen_src].float().mean().item()
+                dbg["fallen_src_low_vel"] = low_velocity[fallen_src].float().mean().item()
+                dbg["fallen_src_low_ang_vel"] = low_ang_vel[fallen_src].float().mean().item()
+                dbg["fallen_src_posture"] = good_posture[fallen_src].float().mean().item()
+                dbg["fallen_src_stable_contacts"] = stable_contacts[fallen_src].float().mean().item()
+                dbg["fallen_src_recovered"] = recovered[fallen_src].float().mean().item()
+                dbg["fallen_src_handoff"] = handoff_ready[fallen_src].float().mean().item()
 
         self.log_recovery_tracking_metrics(
             posture_error=posture_error,
@@ -744,6 +1395,7 @@ class LeggedRobot(BaseTask):
             stable_recovery=stable_recovery,
         )
 
+        self._write_reset_source_grid_snapshot()
 
 
     def reset_idx(self, env_ids):
@@ -795,6 +1447,7 @@ class LeggedRobot(BaseTask):
         self.feet_air_time[env_ids] = 0.
         self.episode_length_buf[env_ids] = 0
         self.reset_buf[env_ids] = 1
+
         # fill extras
         train_env_ids = env_ids[env_ids < self.num_train_envs]
         if len(train_env_ids) > 0:
@@ -872,6 +1525,8 @@ class LeggedRobot(BaseTask):
         for i in range(len(self.lag_buffer)):
             self.lag_buffer[i][env_ids, :] = 0
 
+        self._debug_log_terminal_reset_state(env_ids)
+
     def set_idx_pose(self, env_ids, dof_pos, base_state):
         if len(env_ids) == 0:
             return
@@ -893,6 +1548,75 @@ class LeggedRobot(BaseTask):
         self.gym.set_actor_root_state_tensor_indexed(self.sim,
                                                      gymtorch.unwrap_tensor(self.root_states),
                                                      gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+
+    def _debug_log_terminal_reset_state(self, env_ids):
+        if not getattr(self.cfg.env, "debug_log_terminal_reset", False):
+            return
+
+        if not hasattr(self, "terminal_reset_buf"):
+            print("[TERMINAL RESET DEBUG] terminal_reset_buf does not exist")
+            return
+
+        env_ids = env_ids.to(device=self.device, dtype=torch.long).flatten()
+
+        # Safety: keep only valid env ids
+        valid_env_mask = (env_ids >= 0) & (env_ids < self.num_envs)
+        env_ids = env_ids[valid_env_mask]
+
+        if env_ids.numel() == 0:
+            return
+
+        terminal_mask = self.terminal_reset_buf[env_ids].bool().flatten()
+        terminal_env_ids = env_ids[terminal_mask]
+
+        if terminal_env_ids.numel() == 0:
+            print("[TERMINAL RESET] no terminal envs in this reset batch")
+            return
+
+        # Extra safety against bad env ids
+        valid_terminal = (
+            (terminal_env_ids >= 0)
+            & (terminal_env_ids < self.root_states.shape[0])
+            & (terminal_env_ids < self.dof_pos.shape[0])
+            & (terminal_env_ids < self.dof_vel.shape[0])
+        )
+        terminal_env_ids = terminal_env_ids[valid_terminal]
+
+        if terminal_env_ids.numel() == 0:
+            print("[TERMINAL RESET DEBUG] terminal_env_ids invalid after filtering")
+            return
+
+        q = self.dof_pos[terminal_env_ids, :self.num_actuated_dof]
+
+        # Correct handling of default_dof_pos shape
+        if hasattr(self, "_get_default_dof_pos_for_env_ids"):
+            q_default = self._get_default_dof_pos_for_env_ids(
+                terminal_env_ids
+            )[:, :self.num_actuated_dof]
+        else:
+            default = self.default_dof_pos
+
+            if default.dim() == 1:
+                q_default = default[:self.num_actuated_dof].unsqueeze(0).expand_as(q)
+            elif default.shape[0] == 1:
+                q_default = default[:, :self.num_actuated_dof].expand_as(q)
+            else:
+                q_default = default[terminal_env_ids, :self.num_actuated_dof]
+
+        terminal_posture_error = torch.norm(q - q_default, dim=1)
+
+        print(
+            "[TERMINAL RESET]",
+            "n", int(terminal_env_ids.numel()),
+            "z mean", self.root_states[terminal_env_ids, 2].mean().item(),
+            "z min", self.root_states[terminal_env_ids, 2].min().item(),
+            "z max", self.root_states[terminal_env_ids, 2].max().item(),
+            "posture err mean", terminal_posture_error.mean().item(),
+            "posture err max", terminal_posture_error.max().item(),
+            "dof vel max", self.dof_vel[terminal_env_ids, :self.num_actuated_dof].abs().max().item(),
+            "lin vel max", self.root_states[terminal_env_ids, 7:10].norm(dim=1).max().item(),
+            "ang vel max", self.root_states[terminal_env_ids, 10:13].norm(dim=1).max().item(),
+        )
 
     def compute_reward(self):
         """ Compute rewards
@@ -1948,7 +2672,151 @@ class LeggedRobot(BaseTask):
             len(env_ids_int32)
         )
 
-    def _reset_root_states_fall_recovery(self, env_ids, cfg):
+    # def _reset_root_states_fall_recovery(self, env_ids, cfg):
+    #     num_resets = len(env_ids)
+
+    #     # 1. XY position from terrain origins
+    #     self.root_states[env_ids, 0:2] = self.env_origins[env_ids, 0:2]
+
+    #     # 2. Orientation curriculum
+    #     progress = torch.clamp(
+    #         torch.tensor(self.common_step_counter, device=self.device) / 5e6,
+    #         0.0, 1.0
+    #     )
+
+    #     min_roll  = 0.6 + 0.4 * progress
+    #     min_pitch = 0.4 + 0.4 * progress
+    #     max_roll  = 0.8 + 1.2 * progress
+    #     max_pitch = 0.5 + 0.8 * progress
+
+    #     mag_roll  = min_roll  + (max_roll  - min_roll)  * torch.rand(num_resets, device=self.device) ** 0.5
+    #     mag_pitch = min_pitch + (max_pitch - min_pitch) * torch.rand(num_resets, device=self.device) ** 0.5
+
+    #     sign_roll  = torch.where(torch.rand(num_resets, device=self.device) > 0.5,  1.0, -1.0)
+    #     sign_pitch = torch.where(torch.rand(num_resets, device=self.device) > 0.5,  1.0, -1.0)
+
+    #     roll  = sign_roll  * mag_roll
+    #     pitch = sign_pitch * mag_pitch
+    #     yaw   = torch.rand(num_resets, device=self.device) * 2 * torch.pi - torch.pi
+
+    #     quat    = quat_from_euler_xyz(roll, pitch, yaw)
+    #     gravity = self.gravity_vec[env_ids]
+    #     g       = quat_rotate_inverse(quat, gravity)
+
+    #     # Reject near-upright (gz < -0.1) AND fully supine (gz > 0.8)
+    #     # Keep sideways + partial falls: gz in [-0.1, 0.8]
+    #     # mask = (g[:, 2] < -0.1) | (g[:, 2] > 0.8)
+    #     # Use rollout_recovered as curriculum signal (already tracked in your debug)
+    #     # recovery_rate = self.rollout_recovered.float().mean().item()
+    #     recovery_rate = self.recovery_rate_ema
+
+    #     if recovery_rate < 0.25:
+    #         # Phase 1: supine only - easiest, symmetric
+    #         mask = g[:, 2] < 0.1 #0.3
+    #     elif recovery_rate < 0.55:
+    #         # Phase 2: all fallen states including sideways
+    #         mask = g[:, 2] < -0.1
+    #     else:
+    #         # Phase 3: exclude easy supine, force harder sideways
+    #         mask = (g[:, 2] < -0.1) | (g[:, 2] > 0.8)
+
+    #     max_iters = 20
+    #     for _ in range(max_iters):
+    #         if not mask.any():
+    #             break
+    #         idx = mask.nonzero(as_tuple=False).flatten()
+    #         roll[idx]  = (torch.rand(len(idx), device=self.device) * 2 - 1) * torch.pi
+    #         pitch[idx] = (torch.rand(len(idx), device=self.device) * 2 - 1) * torch.pi
+    #         quat[idx]  = quat_from_euler_xyz(roll[idx], pitch[idx], yaw[idx])
+    #         g[idx]     = quat_rotate_inverse(quat[idx], gravity[idx])
+    #         # mask       = (g[:, 2] < -0.1) | (g[:, 2] > 0.8)
+    #         if recovery_rate < 0.25:
+    #             # Phase 1: supine only — easiest, symmetric
+    #             mask = g[:, 2] < 0.3
+    #         elif recovery_rate < 0.55:
+    #             # Phase 2: all fallen states including sideways
+    #             mask = g[:, 2] < -0.1
+    #         else:
+    #             # Phase 3: exclude easy supine, force harder sideways
+    #             mask = (g[:, 2] < -0.1) | (g[:, 2] > 0.8)
+
+    #     # 3. Height: low enough to land quickly, varied
+    #     # Robot-aware spawn height
+    #     if self.cfg.env.robot == "go1":
+    #         self.root_states[env_ids, 2] = 0.15 + 0.06 * torch.rand(num_resets, device=self.device)
+    #     else:  # aliengo
+    #         self.root_states[env_ids, 2] = 0.18 + 0.08 * torch.rand(num_resets, device=self.device)
+
+    #     # 4. Orientation
+    #     self.root_states[env_ids, 3:7] = quat
+
+    #     # 5. Velocities — small linear only, NO angular at reset
+    #     vel = torch.zeros(num_resets, 6, device=self.device)
+    #     vel[:, 0:3] = 0.05 * torch.randn(num_resets, 3, device=self.device)
+    #     vel[:, 2]   = torch.clamp(vel[:, 2], -0.1, 0.0)
+    #     # vel[:, 3:6] = 0  ← keep zero, don't add angular vel at reset
+    #     self.root_states[env_ids, 7:13] = vel
+
+    #     # 6. Push to sim
+    #     env_ids_int32 = env_ids.to(dtype=torch.int32)
+
+    #     self.gym.set_dof_state_tensor_indexed(
+    #         self.sim,
+    #         gymtorch.unwrap_tensor(self.dof_state),
+    #         gymtorch.unwrap_tensor(env_ids_int32),
+    #         len(env_ids_int32)
+    #     )
+
+    #     self.gym.set_actor_root_state_tensor_indexed(
+    #         self.sim,
+    #         gymtorch.unwrap_tensor(self.root_states),
+    #         gymtorch.unwrap_tensor(env_ids_int32),
+    #         len(env_ids_int32)
+    #     )
+
+    #     # 7. Settle — enough steps for body to land and stop bouncing
+    #     #    dt=0.005s × 25 steps = 125ms — sufficient for ~0.2m drop
+    #     zero_torques = torch.zeros_like(self.torques)
+    #     settle_steps = 20 if self.cfg.env.robot == "go1" else 25
+    #     for _ in range(settle_steps):
+    #         self.gym.set_dof_actuation_force_tensor(
+    #             self.sim, gymtorch.unwrap_tensor(zero_torques)
+    #         )
+    #         self.gym.simulate(self.sim)
+    #         self.gym.fetch_results(self.sim, True)
+
+    #     self.gym.refresh_actor_root_state_tensor(self.sim)
+    #     self.gym.refresh_net_contact_force_tensor(self.sim)
+    #     self.gym.refresh_dof_state_tensor(self.sim)
+    #     self.gym.refresh_rigid_body_state_tensor(self.sim)
+
+    #     # 8. Debug — recompute gz from fresh quat
+    #     fresh_quat = self.root_states[env_ids, 3:7]
+    #     g_post     = quat_rotate_inverse(fresh_quat, self.gravity_vec[env_ids])
+    #     gz         = g_post[:, 2]
+
+    #     sideways = ((gz > -0.7) & (gz < 0.3)).float().mean()
+    #     fallen   = (gz >= 0.3).float().mean()
+    #     upright  = (gz < -0.7).float().mean()
+    #     print(f"[POST-SETTLE] upright={upright:.2f} sideways={sideways:.2f} fallen={fallen:.2f} | "
+    #           f"gz min={gz.min():.3f} mean={gz.mean():.3f} max={gz.max():.3f}")
+
+    #     if cfg.env.record_video and 0 in env_ids:
+    #         if self.complete_video_frames is None:
+    #             self.complete_video_frames = []
+    #         else:
+    #             self.complete_video_frames = self.video_frames[:]
+    #         self.video_frames = []
+
+    #     if cfg.env.record_video and self.eval_cfg is not None and self.num_train_envs in env_ids:
+    #         if self.complete_video_frames_eval is None:
+    #             self.complete_video_frames_eval = []
+    #         else:
+    #             self.complete_video_frames_eval = self.video_frames_eval[:]
+    #         self.video_frames_eval = []
+
+
+    def _reset_root_states_fall_recovery_fallen(self, env_ids, cfg):
         num_resets = len(env_ids)
 
         # 1. XY position from terrain origins
@@ -2077,6 +2945,20 @@ class LeggedRobot(BaseTask):
         print(f"[POST-SETTLE] upright={upright:.2f} sideways={sideways:.2f} fallen={fallen:.2f} | "
               f"gz min={gz.min():.3f} mean={gz.mean():.3f} max={gz.max():.3f}")
 
+        self._sync_recovery_control_history_after_reset(env_ids)
+        # Mark these envs as NOT terminal-stance resets.
+        # This distinguishes fallen resets from terminal resets in the dashboard.
+        if not hasattr(self, "terminal_reset_buf"):
+            self.terminal_reset_buf = torch.zeros(
+                self.num_envs,
+                device=self.device,
+                dtype=torch.bool,
+            )
+
+        self.terminal_reset_buf[env_ids] = False
+
+        self._mark_recovery_reset_source(env_ids, source_value=0.0)  # 0 = fallen reset
+
         if cfg.env.record_video and 0 in env_ids:
             if self.complete_video_frames is None:
                 self.complete_video_frames = []
@@ -2091,36 +2973,508 @@ class LeggedRobot(BaseTask):
                 self.complete_video_frames_eval = self.video_frames_eval[:]
             self.video_frames_eval = []
 
-    def _reset_root_states_disturbance(self, env_ids, cfg):
+
+    # def _reset_root_states_fall_recovery(self, env_ids, cfg):
+    #     """
+    #     Recovery reset dispatcher.
+
+    #     Keeps the external reset call unchanged:
+
+    #         self._call_train_eval(self._reset_root_states_fall_recovery, env_ids)
+
+    #     Internally, it chooses between:
+    #         0 = normal fallen-state reset
+    #         1 = near-terminal standing reset
+
+    #     For the next short stabilization run, use:
+    #         cfg.env.terminal_stance_reset_prob = 1.0
+
+    #     Later:
+    #         0.7 terminal / 0.3 fallen
+    #         0.4 terminal / 0.6 fallen
+    #         0.0 terminal / 1.0 fallen
+    #     """
+
+    #     if len(env_ids) == 0:
+    #         return
+
+    #     terminal_prob = getattr(cfg.env, "terminal_stance_reset_prob", 0.0)
+    #     terminal_prob = float(terminal_prob)
+
+    #     if terminal_prob <= 0.0:
+    #         self._reset_root_states_fall_recovery_fallen(env_ids, cfg)
+    #         return
+
+    #     if terminal_prob >= 1.0:
+    #         self._reset_root_states_recovery_terminal_stance(env_ids, cfg)
+    #         return
+
+    #     use_terminal = (
+    #         torch.rand(len(env_ids), device=self.device) < terminal_prob
+    #     )
+
+    #     terminal_env_ids = env_ids[use_terminal]
+    #     fallen_env_ids = env_ids[~use_terminal]
+
+    #     if len(terminal_env_ids) > 0:
+    #         self._reset_root_states_recovery_terminal_stance(terminal_env_ids, cfg)
+
+    #     if len(fallen_env_ids) > 0:
+    #         self._reset_root_states_fall_recovery_fallen(fallen_env_ids, cfg)
+    #
+
+    def _reset_root_states_fall_recovery(self, env_ids, cfg):
+        """
+        Fall-recovery reset dispatcher.
+
+        During terminal-stance debugging, force all envs into a clean terminal
+        standing reset. During normal training, mix terminal and fallen resets.
+        """
+
+        if len(env_ids) == 0:
+            return
+
+        # ------------------------------------------------------------
+        # DEBUG MODE:
+        # Force clean terminal stance only.
+        # This checks whether the terminal pose itself is physically valid.
+        # ------------------------------------------------------------
+        if getattr(cfg.env, "debug_clean_terminal_reset", False):
+            self._reset_root_states_recovery_terminal_stance(env_ids, cfg)
+            return
+
+        # ------------------------------------------------------------
+        # TRAINING MODE:
+        # Mix terminal-stance resets and normal fallen resets.
+        # Important: mask must have shape [len(env_ids)], not [num_envs].
+        # ------------------------------------------------------------
+        terminal_prob = getattr(cfg.env, "terminal_stance_reset_prob", 0.0)
+
+        reset_sample = torch.rand(len(env_ids), device=self.device)
+        terminal_mask = reset_sample < terminal_prob
+
+        terminal_env_ids = env_ids[terminal_mask]
+        fallen_env_ids = env_ids[~terminal_mask]
+
+        if len(terminal_env_ids) > 0:
+            self._reset_root_states_recovery_terminal_stance(terminal_env_ids, cfg)
+
+        if len(fallen_env_ids) > 0:
+            self._reset_root_states_fall_recovery_fallen(fallen_env_ids, cfg)
+
+
+    def _get_default_dof_pos_for_env_ids(self, env_ids):
+        """
+        Returns default DOF positions with shape [len(env_ids), num_dof].
+
+        Handles both cases:
+            self.default_dof_pos shape [1, num_dof]
+            self.default_dof_pos shape [num_envs, num_dof]
+        """
+
         num_resets = len(env_ids)
 
-        # start upright
-        self.root_states[env_ids, 0:2] = self.env_origins[env_ids, 0:2]
-        self.root_states[env_ids, 2] = 0.30  # nominal height
+        if self.default_dof_pos.ndim == 1:
+            return self.default_dof_pos.unsqueeze(0).expand(num_resets, -1)
 
-        # upright orientation
-        quat = torch.tensor([0, 0, 0, 1], device=self.device).repeat(num_resets, 1)
-        self.root_states[env_ids, 3:7] = quat
+        if self.default_dof_pos.ndim == 2:
+            if self.default_dof_pos.shape[0] == 1:
+                return self.default_dof_pos.expand(num_resets, -1)
 
-        # Adding disturbances
-        # linear velocity
-        self.root_states[env_ids, 7:10] = 0.5 * torch.randn(num_resets, 3, device=self.device)
+            if self.default_dof_pos.shape[0] == self.num_envs:
+                return self.default_dof_pos[env_ids]
 
-        # angular velocity
-        # self.root_states[env_ids, 10:13] = torch.clamp(
-        #     1.0 * torch.randn(num_resets, 3, device=self.device),
-        #     -2.0, 2.0
-        # )
+        raise RuntimeError(
+            f"Unexpected default_dof_pos shape: {self.default_dof_pos.shape}"
+        )
 
-        # push to sim
+
+    # def _reset_root_states_recovery_terminal_stance(self, env_ids, cfg):
+    #     """
+    #     Near-terminal recovery reset.
+
+    #     Purpose:
+    #         Train the missing final skill:
+    #             near-standing -> reduce foot slip -> stabilize contacts -> handoff-ready
+
+    #     Important:
+    #         Do NOT zero-torque settle here.
+    #         Zero-torque settling is useful for fallen resets, but for near-standing
+    #         resets it can immediately collapse the robot before the policy acts.
+    #     """
+
+    #     if len(env_ids) == 0:
+    #         return
+
+    #     num_resets = len(env_ids)
+    #     env_ids_int32 = env_ids.to(dtype=torch.int32)
+
+    #     # ------------------------------------------------------------
+    #     # 1. Base position
+    #     # ------------------------------------------------------------
+    #     self.root_states[env_ids, 0:2] = self.env_origins[env_ids, 0:2]
+
+    #     if self.cfg.env.robot == "go1":
+    #         # Near standing but not always exactly perfect.
+    #         self.root_states[env_ids, 2] = torch_rand_float(
+    #             0.305, 0.335, (num_resets, 1), device=self.device
+    #         ).squeeze(1)
+    #     else:
+    #         self.root_states[env_ids, 2] = torch_rand_float(
+    #             0.40, 0.46, (num_resets, 1), device=self.device
+    #         ).squeeze(1)
+
+    #     # ------------------------------------------------------------
+    #     # 2. Base orientation
+    #     # ------------------------------------------------------------
+    #     roll = torch_rand_float(
+    #         -0.08, 0.08, (num_resets, 1), device=self.device
+    #     ).squeeze(1)
+
+    #     pitch = torch_rand_float(
+    #         -0.08, 0.08, (num_resets, 1), device=self.device
+    #     ).squeeze(1)
+
+    #     yaw = torch_rand_float(
+    #         -torch.pi, torch.pi, (num_resets, 1), device=self.device
+    #     ).squeeze(1)
+
+    #     quat = quat_from_euler_xyz(roll, pitch, yaw)
+    #     self.root_states[env_ids, 3:7] = quat
+
+    #     # ------------------------------------------------------------
+    #     # 3. Base velocity
+    #     # ------------------------------------------------------------
+    #     self.root_states[env_ids, 7:13] = 0.0
+
+    #     # Small horizontal perturbation only.
+    #     self.root_states[env_ids, 7:9] = torch_rand_float(
+    #         -0.03, 0.03, (num_resets, 2), device=self.device
+    #     )
+
+    #     # Very small angular perturbation.
+    #     self.root_states[env_ids, 10:13] = torch_rand_float(
+    #         -0.08, 0.08, (num_resets, 3), device=self.device
+    #     )
+
+    #     # ------------------------------------------------------------
+    #     # 4. Joint state
+    #     # ------------------------------------------------------------
+    #     q_nominal = self._get_default_dof_pos_for_env_ids(env_ids)
+
+    #     # Easier terminal reset for first stability/debug run.
+    #     q_noise = 0.01 * torch.randn(
+    #         num_resets, self.num_dof, device=self.device
+    #     )
+
+    #     q_min = self.dof_pos_limits[:, 0].unsqueeze(0)
+    #     q_max = self.dof_pos_limits[:, 1].unsqueeze(0)
+
+    #     q_reset = torch.minimum(
+    #         torch.maximum(q_nominal + q_noise, q_min),
+    #         q_max,
+    #     )
+
+    #     self.dof_pos[env_ids] = q_reset
+    #     self.dof_vel[env_ids] = 0.0
+
+    #     # Store the exact reset pose so we can test whether this pose is physically stable
+    #     # when the PD controller holds it.
+    #     if not hasattr(self, "debug_hold_dof_pos"):
+    #         self.debug_hold_dof_pos = torch.zeros_like(self.dof_pos)
+
+    #     self.debug_hold_dof_pos[env_ids] = q_reset
+
+    #     # ------------------------------------------------------------
+    #     # 5. Push state to simulator
+    #     # ------------------------------------------------------------
+    #     self.gym.set_dof_state_tensor_indexed(
+    #         self.sim,
+    #         gymtorch.unwrap_tensor(self.dof_state),
+    #         gymtorch.unwrap_tensor(env_ids_int32),
+    #         len(env_ids_int32),
+    #     )
+
+    #     self.gym.set_actor_root_state_tensor_indexed(
+    #         self.sim,
+    #         gymtorch.unwrap_tensor(self.root_states),
+    #         gymtorch.unwrap_tensor(env_ids_int32),
+    #         len(env_ids_int32),
+    #     )
+
+    #     self.gym.refresh_actor_root_state_tensor(self.sim)
+    #     self.gym.refresh_net_contact_force_tensor(self.sim)
+    #     self.gym.refresh_dof_state_tensor(self.sim)
+    #     self.gym.refresh_rigid_body_state_tensor(self.sim)
+
+    #     # ------------------------------------------------------------
+    #     # 6. Critical: remove stale action/target history
+    #     # ------------------------------------------------------------
+    #     self._sync_recovery_control_history_after_reset(env_ids)
+
+    #     # 1 = terminal reset. Useful for dashboard/debugging.
+    #     self._mark_recovery_reset_source(env_ids, source_value=1.0)
+
+    #     # ------------------------------------------------------------
+    #     # 7. Video buffer handling
+    #     # ------------------------------------------------------------
+    #     if cfg.env.record_video and 0 in env_ids:
+    #         if self.complete_video_frames is None:
+    #             self.complete_video_frames = []
+    #         else:
+    #             self.complete_video_frames = self.video_frames[:]
+    #         self.video_frames = []
+
+    #     if cfg.env.record_video and self.eval_cfg is not None and self.num_train_envs in env_ids:
+    #         if self.complete_video_frames_eval is None:
+    #             self.complete_video_frames_eval = []
+    #         else:
+    #             self.complete_video_frames_eval = self.video_frames_eval[:]
+    #         self.video_frames_eval = []
+    #
+
+    def _reset_root_states_recovery_terminal_stance(self, env_ids, cfg):
+        """
+        Clean terminal-stance reset.
+
+        Purpose:
+            Create a physically valid near-handoff standing state.
+
+        This is NOT a fallen reset. It should initialize the robot in an upright,
+        feet-on-ground, no-body-contact standing pose.
+
+        Use this first with:
+            debug_hold_reset_pose = True
+            debug_clean_terminal_reset = True
+            terminal_stance_reset_prob = 1.0
+
+        Expected result:
+            stable_height high
+            nonfoot_contact_env_frac near 0
+            foot_contact_count_mean around 3-4
+            base_height_mean around 0.30-0.34
+        """
+
+        if len(env_ids) == 0:
+            return
+
+        num_resets = len(env_ids)
         env_ids_int32 = env_ids.to(dtype=torch.int32)
 
+        # ------------------------------------------------------------
+        # 1. Root position: clean standing height.
+        # ------------------------------------------------------------
+        self.root_states[env_ids, 0:2] = self.env_origins[env_ids, 0:2]
+
+        # Use a conservative standing height.
+        # Your previous debug showed base_height_mean ~0.19, which is too low.
+        self.root_states[env_ids, 2] = self.env_origins[env_ids, 2] + 0.34
+
+        # ------------------------------------------------------------
+        # 2. Root orientation: exactly upright.
+        # Quaternion format: x, y, z, w
+        # ------------------------------------------------------------
+        upright_quat = torch.tensor(
+            [0.0, 0.0, 0.0, 1.0],
+            device=self.device,
+            dtype=self.root_states.dtype,
+        ).repeat(num_resets, 1)
+
+        self.root_states[env_ids, 3:7] = upright_quat
+
+        # ------------------------------------------------------------
+        # 3. Root velocities: zero.
+        # ------------------------------------------------------------
+        self.root_states[env_ids, 7:13] = 0.0
+
+        # ------------------------------------------------------------
+        # 4. Joint pose: use default standing pose.
+        # Do NOT use a crouched/low pose here.
+        # ------------------------------------------------------------
+        q_reset = self._get_default_dof_pos_for_env_ids(env_ids).clone()
+
+        self.dof_pos[env_ids, :self.num_dof] = q_reset[:, :self.num_dof]
+        self.dof_vel[env_ids, :self.num_dof] = 0.0
+
+        # ------------------------------------------------------------
+        # 5. Store exact reset pose for debug_hold_reset_pose.
+        # step() will command this pose through the PD controller.
+        # ------------------------------------------------------------
+        if hasattr(self, "debug_hold_dof_pos"):
+            self.debug_hold_dof_pos[env_ids] = q_reset
+
+        # ------------------------------------------------------------
+        # 6. Reset action and target histories.
+        # This prevents artificial action-smoothness / PD transient spikes.
+        # ------------------------------------------------------------
+        n = min(self.num_actions, self.num_dof)
+
+        if hasattr(self, "joint_pos_target"):
+            self.joint_pos_target[env_ids, :n] = q_reset[:, :n]
+
+        if hasattr(self, "last_joint_pos_target"):
+            self.last_joint_pos_target[env_ids, :n] = q_reset[:, :n]
+
+        if hasattr(self, "last_last_joint_pos_target"):
+            self.last_last_joint_pos_target[env_ids, :n] = q_reset[:, :n]
+
+        if hasattr(self, "actions"):
+            self.actions[env_ids] = 0.0
+
+        if hasattr(self, "last_actions"):
+            self.last_actions[env_ids] = 0.0
+
+        if hasattr(self, "last_last_actions"):
+            self.last_last_actions[env_ids] = 0.0
+
+        if hasattr(self, "last_dof_vel"):
+            self.last_dof_vel[env_ids] = 0.0
+
+        if hasattr(self, "torques"):
+            self.torques[env_ids] = 0.0
+
+        if hasattr(self, "last_torques"):
+            self.last_torques[env_ids] = 0.0
+
+        # ------------------------------------------------------------
+        # 7. Mark reset source for dashboard.
+        # ------------------------------------------------------------
+        if not hasattr(self, "terminal_reset_buf"):
+            self.terminal_reset_buf = torch.zeros(
+                self.num_envs,
+                device=self.device,
+                dtype=torch.bool,
+            )
+
+        self.terminal_reset_buf[env_ids] = True
+
+        self._mark_recovery_reset_source(env_ids, source_value=1.0)  # 1 = terminal reset
+
+        # ------------------------------------------------------------
+        # 8. Push state to simulator.
+        # Keep this if your reset functions directly update Isaac Gym tensors.
+        # If your reset_idx already does this globally later, duplicate setting is
+        # harmless but slightly redundant.
+        # ------------------------------------------------------------
         self.gym.set_actor_root_state_tensor_indexed(
             self.sim,
             gymtorch.unwrap_tensor(self.root_states),
             gymtorch.unwrap_tensor(env_ids_int32),
-            len(env_ids_int32)
+            len(env_ids_int32),
         )
+
+        self.gym.set_dof_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.dof_state),
+            gymtorch.unwrap_tensor(env_ids_int32),
+            len(env_ids_int32),
+        )
+
+
+    def _sync_recovery_control_history_after_reset(self, env_ids):
+        """
+        Clears stale policy/action/PD history after recovery reset.
+
+        This is especially important for terminal-stance resets. Otherwise, the first
+        action after reset may compare against old targets from the previous episode,
+        creating an artificial jerk and immediate foot slip.
+        """
+
+        if len(env_ids) == 0:
+            return
+
+        q_reset = self.dof_pos[env_ids, :self.num_dof].clone()
+
+        if hasattr(self, "actions"):
+            self.actions[env_ids] = 0.0
+
+        if hasattr(self, "last_actions"):
+            self.last_actions[env_ids] = 0.0
+
+        if hasattr(self, "last_last_actions"):
+            self.last_last_actions[env_ids] = 0.0
+
+        if hasattr(self, "joint_pos_target"):
+            self.joint_pos_target[env_ids, :self.num_dof] = q_reset
+
+        if hasattr(self, "last_joint_pos_target"):
+            self.last_joint_pos_target[env_ids, :self.num_dof] = q_reset
+
+        if hasattr(self, "last_last_joint_pos_target"):
+            self.last_last_joint_pos_target[env_ids, :self.num_dof] = q_reset
+
+        if hasattr(self, "last_dof_vel"):
+            self.last_dof_vel[env_ids] = 0.0
+
+        if hasattr(self, "last_contacts"):
+            self.last_contacts[env_ids] = False
+
+        if hasattr(self, "torques"):
+            self.torques[env_ids] = 0.0
+
+        if hasattr(self, "last_torques"):
+            self.last_torques[env_ids] = 0.0
+
+        if hasattr(self, "last_last_torques"):
+            self.last_last_torques[env_ids] = 0.0
+
+        # For actuator-network history, if used.
+        if hasattr(self, "joint_pos_err_last"):
+            self.joint_pos_err_last[env_ids] = 0.0
+
+        if hasattr(self, "joint_pos_err_last_last"):
+            self.joint_pos_err_last_last[env_ids] = 0.0
+
+        if hasattr(self, "joint_vel_last"):
+            self.joint_vel_last[env_ids] = 0.0
+
+        if hasattr(self, "joint_vel_last_last"):
+            self.joint_vel_last_last[env_ids] = 0.0
+
+
+    def _mark_recovery_reset_source(self, env_ids, source_value):
+        """
+        Tracks reset source for debugging.
+
+        source_value:
+            0 = fallen recovery reset
+            1 = terminal / near-stand reset
+        """
+
+        if len(env_ids) == 0:
+            return
+
+        source_int = int(source_value)
+
+        if not hasattr(self, "recovery_reset_source_buf"):
+            self.recovery_reset_source_buf = torch.zeros(
+                self.num_envs,
+                device=self.device,
+                dtype=torch.float,
+            )
+
+        if not hasattr(self, "reset_source"):
+            self.reset_source = torch.full(
+                (self.num_envs,),
+                -1,
+                device=self.device,
+                dtype=torch.long,
+            )
+
+        if not hasattr(self, "reset_source_event_counts"):
+            self.reset_source_event_counts = torch.zeros(
+                2,
+                device=self.device,
+                dtype=torch.long,
+            )
+
+        self.recovery_reset_source_buf[env_ids] = float(source_int)
+        self.reset_source[env_ids] = source_int
+
+        if source_int in (0, 1):
+            self.reset_source_event_counts[source_int] += len(env_ids)
+
+
 
     def _reset_root_states(self, env_ids, cfg):
             """ Resets ROOT states position and velocities of selected environmments
@@ -2323,6 +3677,9 @@ class LeggedRobot(BaseTask):
         self.net_contact_forces = gymtorch.wrap_tensor(net_contact_forces)[:self.num_envs * self.num_bodies, :]
         self.dof_pos = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 0]
         self.base_pos = self.root_states[:self.num_envs, 0:3]
+
+        self.debug_hold_dof_pos = torch.zeros_like(self.dof_pos)
+
         self.dof_vel = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 1]
         self.dof_acc = torch.zeros((self.num_envs, self.num_dof), device=self.device)
         self.base_quat = self.root_states[:self.num_envs, 3:7]
@@ -2358,6 +3715,34 @@ class LeggedRobot(BaseTask):
             self.rollout_max_counter = torch.zeros(self.num_envs, device=self.device)
 
             self.recovery_bonus_buf = torch.zeros(self.num_envs, device=self.device)
+
+            self.reset_source = torch.full(
+                (self.num_envs,),
+                -1,
+                device=self.device,
+                dtype=torch.long,
+            )
+
+            # cumulative reset-event counts:
+            # index 0 = fallen reset
+            # index 1 = terminal / near-stand reset
+            self.reset_source_event_counts = torch.zeros(
+                2,
+                device=self.device,
+                dtype=torch.long,
+            )
+
+            self.near_crouch_clip_frac = torch.tensor(
+                0.0,
+                device=self.device,
+                dtype=torch.float,
+            )
+
+            self.near_stand_clip_frac = torch.tensor(
+                0.0,
+                device=self.device,
+                dtype=torch.float,
+            )
 
         # initialize some data used later on
         self.common_step_counter = 0
@@ -2883,7 +4268,7 @@ class LeggedRobot(BaseTask):
             self.camera_props = gymapi.CameraProperties()
             self.camera_props.width = 360
             self.camera_props.height = 240
-            self.camera_props.enable_tensors = True # True (on gcp headless) #False (local)
+            self.camera_props.enable_tensors = False # True (on gcp headless) #False (local)
             self.rendering_camera = self.gym.create_camera_sensor(self.envs[0], self.camera_props)
 
             if self.rendering_camera == -1:
