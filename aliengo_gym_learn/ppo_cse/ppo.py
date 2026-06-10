@@ -14,32 +14,48 @@ class PPO_Args(PrefixProto):
     # algorithm
     value_loss_coef = 1.0
     use_clipped_value_loss = True
-    clip_param = 0.2
-    # entropy_coef = 0.005 #0.01
-    num_learning_epochs = 5
+    # clip_param = 0.2
+    # # entropy_coef = 0.005 #0.01
+    # num_learning_epochs = 5
     num_mini_batches = 4  # mini batch size = num_envs*nsteps / nminibatches
     # learning_rate = 1e-3
     # adaptation_module_learning_rate = 1e-3
 
     # FINETUNE
-    entropy_coef = 0.002
-    learning_rate = 3e-4
-    adaptation_module_learning_rate = 3e-4
+    entropy_coef = 0.0002 #0.0005
+    learning_rate = 2e-4 #5e-4 #3e-4
+    adaptation_module_learning_rate = 1e-4 #3e-6 #3e-4
 
     num_adaptation_module_substeps = 1
     schedule = 'adaptive'  # could be adaptive, fixed
     gamma = 0.99
     lam = 0.95
-    desired_kl = 0.01
-    max_grad_norm = 1.
+    # desired_kl = 0.01
+    # max_grad_norm = 1.
 
-    use_mass_regression_loss = True
+    clip_param = 0.10
+    num_learning_epochs = 2
+    # desired_kl = 0.005       # if your PPO uses adaptive LR / KL stop
+    max_grad_norm = 0.5
+
+    # use_mass_regression_loss = True
 
     # If adaptation overfits masses and ignores other privileged info, set 0.5
     # In case of poor mass prediction, set it to 2.0
-    mass_regression_coef = 1.0
+    # mass_regression_coef = 1.0
 
-    selective_adaptation_module_loss = False
+    selective_adaptation_module_loss = True
+    # freeze_adaptation_module = False
+
+    # conservative settings
+    entropy_coef = 0.0
+    learning_rate = 1e-5
+    adaptation_module_learning_rate = 0.0
+
+    freeze_adaptation_module = True
+    use_mass_regression_loss = False
+    mass_regression_coef = 0.0
+    desired_kl = 0.002
 
 
 class PPO:
@@ -52,6 +68,16 @@ class PPO:
         # PPO components
         self.actor_critic = actor_critic
         self.actor_critic.to(device)
+
+        # ------------------------------------------------------------
+        # Freeze adaptation module for recovery fine-tuning
+        # ------------------------------------------------------------
+        if getattr(PPO_Args, "freeze_adaptation_module", False):
+            for p in self.actor_critic.adaptation_module.parameters():
+                p.requires_grad_(False)
+
+            print("[PPO] Adaptation module frozen.")
+
         self.storage = None  # initialized later
 
         print(
@@ -60,16 +86,25 @@ class PPO:
             f"entropy_coef={PPO_Args.entropy_coef}"
         )
 
-        self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=PPO_Args.learning_rate)
+        self.optimizer = optim.Adam(
+            filter(lambda p: p.requires_grad, self.actor_critic.parameters()),
+            lr=PPO_Args.learning_rate,
+        )
         # self.adaptation_module_optimizer = optim.Adam(self.actor_critic.parameters(),
         #                                               lr=PPO_Args.adaptation_module_learning_rate)
 
-        self.adaptation_module_optimizer = optim.Adam(self.actor_critic.adaptation_module.parameters(),
-                                                    lr=PPO_Args.adaptation_module_learning_rate)
+        # Only create adaptation optimizer if adaptation is not frozen
+        if getattr(PPO_Args, "freeze_adaptation_module", False):
+            self.adaptation_module_optimizer = None
+        else:
+            self.adaptation_module_optimizer = optim.Adam(
+                self.actor_critic.adaptation_module.parameters(),
+                lr=PPO_Args.adaptation_module_learning_rate
+            )
 
         if self.actor_critic.decoder:
             self.decoder_optimizer = optim.Adam(self.actor_critic.decoder.parameters(),
-                                                r=PPO_Args.adaptation_module_learning_rate)
+                                                lr=PPO_Args.adaptation_module_learning_rate)
         self.transition = RolloutStorage.Transition()
 
         self.learning_rate = PPO_Args.learning_rate
@@ -122,203 +157,265 @@ class PPO:
         self.storage.compute_returns(last_values, PPO_Args.gamma, PPO_Args.lam)
 
     def update(self):
-        mean_value_loss = 0
-        mean_surrogate_loss = 0
-        mean_adaptation_module_loss = 0
-        mean_decoder_loss = 0
-        mean_decoder_loss_student = 0
-        mean_adaptation_module_test_loss = 0
-        mean_decoder_test_loss = 0
-        mean_decoder_test_loss_student = 0
-        mean_mass_regression_loss = 0
-        mean_mass_regression_test_loss = 0
-        generator = self.storage.mini_batch_generator(PPO_Args.num_mini_batches, PPO_Args.num_learning_epochs)
-        for obs_batch, critic_obs_batch, privileged_obs_batch, obs_history_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
-            old_mu_batch, old_sigma_batch, masks_batch, in generator: #env_bins_batch in generator:
+        mean_value_loss = 0.0
+        mean_surrogate_loss = 0.0
+        mean_adaptation_module_loss = 0.0
+        mean_decoder_loss = 0.0
+        mean_decoder_loss_student = 0.0
+        mean_adaptation_module_test_loss = 0.0
+        mean_decoder_test_loss = 0.0
+        mean_decoder_test_loss_student = 0.0
+        mean_mass_regression_loss = 0.0
+        mean_mass_regression_test_loss = 0.0
 
-            # self.actor_critic.act(obs_history_batch, masks=masks_batch)
-            # both current obs and obs_history
+        train_adaptation = (
+            not getattr(PPO_Args, "freeze_adaptation_module", False)
+            and PPO_Args.num_adaptation_module_substeps > 0
+            and self.adaptation_module_optimizer is not None
+        )
+
+        generator = self.storage.mini_batch_generator(
+            PPO_Args.num_mini_batches,
+            PPO_Args.num_learning_epochs,
+        )
+
+        for (
+            obs_batch,
+            critic_obs_batch,
+            privileged_obs_batch,
+            obs_history_batch,
+            actions_batch,
+            target_values_batch,
+            advantages_batch,
+            returns_batch,
+            old_actions_log_prob_batch,
+            old_mu_batch,
+            old_sigma_batch,
+            masks_batch,
+        ) in generator:
+
+            # ------------------------------------------------------------
+            # PPO actor-critic update
+            # ------------------------------------------------------------
             self.actor_critic.act(
                 obs_batch,
                 obs_history_batch,
-                masks=masks_batch
+                masks=masks_batch,
             )
-            actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
-            # value_batch = self.actor_critic.evaluate(obs_history_batch, privileged_obs_batch, masks=masks_batch)
-            value_batch = self.actor_critic.evaluate(obs_batch, privileged_obs_batch, masks=masks_batch)
+
+            actions_log_prob_batch = self.actor_critic.get_actions_log_prob(
+                actions_batch
+            )
+
+            value_batch = self.actor_critic.evaluate(
+                obs_batch,
+                privileged_obs_batch,
+                masks=masks_batch,
+            )
+
             mu_batch = self.actor_critic.action_mean
             sigma_batch = self.actor_critic.action_std
             entropy_batch = self.actor_critic.entropy
 
-            # print("returns mean:", returns_batch.mean().item(),
-            #       "returns max:", returns_batch.max().item())
-            #
-            # print("values mean:", value_batch.mean().item(),
-            #       "values max:", value_batch.max().item())
-
-            # KL
-            if PPO_Args.desired_kl != None and PPO_Args.schedule == 'adaptive':
+            # ------------------------------------------------------------
+            # Adaptive learning-rate schedule using KL
+            # ------------------------------------------------------------
+            if PPO_Args.desired_kl is not None and PPO_Args.schedule == "adaptive":
                 with torch.inference_mode():
-                    # Closed form KL divergence for univariate normal distributions p and q
-                    # D_KL(p|q) = log(sigma_1/sigma_0) + ((sigma_0**2 + (mu_0 - mu_1)**2)) / 2*sigma_2**2 - 1/2
                     kl = torch.sum(
-                        torch.log(sigma_batch / old_sigma_batch + 1.e-5) + (
-                                torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch)) / (
-                                2.0 * torch.square(sigma_batch)) - 0.5, axis=-1)
+                        torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
+                        + (
+                            torch.square(old_sigma_batch)
+                            + torch.square(old_mu_batch - mu_batch)
+                        )
+                        / (2.0 * torch.square(sigma_batch))
+                        - 0.5,
+                        axis=-1,
+                    )
+
                     kl_mean = torch.mean(kl)
 
                     if kl_mean > PPO_Args.desired_kl * 2.0:
-                        self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                        self.learning_rate = max(
+                            1.0e-5,
+                            self.learning_rate / 1.5,
+                        )
                     elif kl_mean < PPO_Args.desired_kl / 2.0 and kl_mean > 0.0:
-                        self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                        self.learning_rate = min(
+                            1.0e-2,
+                            self.learning_rate * 1.5,
+                        )
 
                     for param_group in self.optimizer.param_groups:
-                        param_group['lr'] = self.learning_rate
+                        param_group["lr"] = self.learning_rate
 
-            # Surrogate loss
-            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+            # ------------------------------------------------------------
+            # PPO losses
+            # ------------------------------------------------------------
+            ratio = torch.exp(
+                actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)
+            )
+
             surrogate = -torch.squeeze(advantages_batch) * ratio
-            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(ratio, 1.0 - PPO_Args.clip_param,
-                                                                               1.0 + PPO_Args.clip_param)
+            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
+                ratio,
+                1.0 - PPO_Args.clip_param,
+                1.0 + PPO_Args.clip_param,
+            )
+
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-            # Value function loss
             if PPO_Args.use_clipped_value_loss:
-                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(-PPO_Args.clip_param,
-                                                                                                 PPO_Args.clip_param)
+                value_clipped = target_values_batch + (
+                    value_batch - target_values_batch
+                ).clamp(
+                    -PPO_Args.clip_param,
+                    PPO_Args.clip_param,
+                )
+
                 value_losses = (value_batch - returns_batch).pow(2)
                 value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                value_loss = torch.max(value_losses, value_losses_clipped).mean()
+                value_loss = torch.max(
+                    value_losses,
+                    value_losses_clipped,
+                ).mean()
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + PPO_Args.value_loss_coef * value_loss - PPO_Args.entropy_coef * entropy_batch.mean()
+            loss = (
+                surrogate_loss
+                + PPO_Args.value_loss_coef * value_loss
+                - PPO_Args.entropy_coef * entropy_batch.mean()
+            )
 
-            # Gradient step
             self.optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), PPO_Args.max_grad_norm)
+
+            nn.utils.clip_grad_norm_(
+                filter(lambda p: p.requires_grad, self.actor_critic.parameters()),
+                PPO_Args.max_grad_norm,
+            )
+
             self.optimizer.step()
 
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
 
-            # data_size = privileged_obs_batch.shape[0]
-            # num_train = int(data_size // 5 * 4)
-
-            # # Adaptation module gradient step
-
-            # for epoch in range(PPO_Args.num_adaptation_module_substeps):
-
-            #     adaptation_pred = self.actor_critic.adaptation_module(obs_history_batch)
-            #     with torch.no_grad():
-            #         adaptation_target = privileged_obs_batch
-            #         # residual = (adaptation_target - adaptation_pred).norm(dim=1)
-            #         # caches.slot_cache.log(env_bins_batch[:, 0].cpu().numpy().astype(np.uint8),
-            #         #                       sysid_residual=residual.cpu().numpy())
-
-            #     selection_indices = torch.linspace(0, adaptation_pred.shape[1]-1, steps=adaptation_pred.shape[1], dtype=torch.long)
-            #     if PPO_Args.selective_adaptation_module_loss:
-            #         # mask out indices corresponding to swing feet
-            #         selection_indices = 0
-
-            #     adaptation_loss = F.mse_loss(adaptation_pred[:num_train, selection_indices], adaptation_target[:num_train, selection_indices])
-            #     adaptation_test_loss = F.mse_loss(adaptation_pred[num_train:, selection_indices], adaptation_target[num_train:, selection_indices])
-
-            #     if PPO_Args.use_mass_regression_loss and self.actor_critic.estimator_mass_dim > 0:
-            #         mass_dim = self.actor_critic.estimator_mass_dim
-            #         mass_pred = adaptation_pred[:, :mass_dim]
-            #         mass_target = adaptation_target[:, :mass_dim]
-            #         mass_reg_loss = F.mse_loss(mass_pred[:num_train], mass_target[:num_train])
-            #         mass_reg_test_loss = F.mse_loss(mass_pred[num_train:], mass_target[num_train:])
-            #         adaptation_loss = adaptation_loss + PPO_Args.mass_regression_coef * mass_reg_loss
-            #         adaptation_test_loss = adaptation_test_loss + PPO_Args.mass_regression_coef * mass_reg_test_loss
-
-
-            #     self.adaptation_module_optimizer.zero_grad()
-            #     adaptation_loss.backward()
-            #     self.adaptation_module_optimizer.step()
-
-            #     mean_adaptation_module_loss += adaptation_loss.item()
-            #     mean_adaptation_module_test_loss += adaptation_test_loss.item()
+            # ------------------------------------------------------------
+            # Optional adaptation-module update
             #
+            # For recovery fine-tuning with freeze_adaptation_module=True,
+            # this whole block is skipped. This is required because
+            # self.adaptation_module_optimizer is None when frozen.
+            # ------------------------------------------------------------
+            if train_adaptation:
+                data_size = privileged_obs_batch.shape[0]
+                num_train = int(data_size // 5 * 4)
 
-        data_size = privileged_obs_batch.shape[0]
-        num_train = int(data_size // 5 * 4)
+                for _ in range(PPO_Args.num_adaptation_module_substeps):
+                    adaptation_pred = self.actor_critic.adaptation_module(
+                        obs_history_batch
+                    )
 
-        # Adaptation module gradient step
-        for epoch in range(PPO_Args.num_adaptation_module_substeps):
+                    with torch.no_grad():
+                        adaptation_target = privileged_obs_batch
 
-            adaptation_pred = self.actor_critic.adaptation_module(obs_history_batch)
+                    mass_dim = self.actor_critic.estimator_mass_dim
 
-            with torch.no_grad():
-                adaptation_target = privileged_obs_batch
+                    if mass_dim > 0:
+                        mass_pred = adaptation_pred[:, :mass_dim]
+                        latent_pred = adaptation_pred[:, mass_dim:]
 
-            mass_dim = self.actor_critic.estimator_mass_dim
+                        mass_target = adaptation_target[:, :mass_dim]
+                        latent_target = adaptation_target[:, mass_dim:]
+                    else:
+                        mass_pred = None
+                        latent_pred = adaptation_pred
 
-            # Split prediction/targets into:
-            #   [mass prediction | latent prediction]
-            if mass_dim > 0:
-                mass_pred = adaptation_pred[:, :mass_dim]
-                latent_pred = adaptation_pred[:, mass_dim:]
+                        mass_target = None
+                        latent_target = adaptation_target
 
-                mass_target = adaptation_target[:, :mass_dim]
-                latent_target = adaptation_target[:, mass_dim:]
-            else:
-                mass_pred = None
-                latent_pred = adaptation_pred
+                    if latent_pred.shape[1] > 0:
+                        latent_loss = F.mse_loss(
+                            latent_pred[:num_train],
+                            latent_target[:num_train],
+                        )
+                        latent_test_loss = F.mse_loss(
+                            latent_pred[num_train:],
+                            latent_target[num_train:],
+                        )
+                    else:
+                        latent_loss = torch.zeros((), device=self.device)
+                        latent_test_loss = torch.zeros((), device=self.device)
 
-                mass_target = None
-                latent_target = adaptation_target
+                    if PPO_Args.use_mass_regression_loss and mass_dim > 0:
+                        mass_reg_loss = F.mse_loss(
+                            mass_pred[:num_train],
+                            mass_target[:num_train],
+                        )
+                        mass_reg_test_loss = F.mse_loss(
+                            mass_pred[num_train:],
+                            mass_target[num_train:],
+                        )
+                    else:
+                        mass_reg_loss = torch.zeros((), device=self.device)
+                        mass_reg_test_loss = torch.zeros((), device=self.device)
 
-            # Latent supervision loss
-            if latent_pred.shape[1] > 0:
-                latent_loss = F.mse_loss(latent_pred[:num_train], latent_target[:num_train])
-                latent_test_loss = F.mse_loss(latent_pred[num_train:], latent_target[num_train:])
-            else:
-                latent_loss = 0.0
-                latent_test_loss = 0.0
+                    adaptation_loss = (
+                        latent_loss
+                        + PPO_Args.mass_regression_coef * mass_reg_loss
+                    )
 
-            # Mass regression loss
-            if PPO_Args.use_mass_regression_loss and mass_dim > 0:
-                # print("Using mass regression loss!")
-                mass_reg_loss = F.mse_loss(mass_pred[:num_train], mass_target[:num_train])
-                mass_reg_test_loss = F.mse_loss(mass_pred[num_train:], mass_target[num_train:])
-            else:
-                mass_reg_loss = 0.0
-                mass_reg_test_loss = 0.0
+                    adaptation_test_loss = (
+                        latent_test_loss
+                        + PPO_Args.mass_regression_coef * mass_reg_test_loss
+                    )
 
-            # Total adaptation loss
-            adaptation_loss = (
-                latent_loss + PPO_Args.mass_regression_coef * mass_reg_loss
-            )
+                    self.adaptation_module_optimizer.zero_grad()
+                    adaptation_loss.backward()
+                    self.adaptation_module_optimizer.step()
 
-            adaptation_test_loss = (
-                latent_test_loss + PPO_Args.mass_regression_coef * mass_reg_test_loss
-            )
+                    mean_adaptation_module_loss += adaptation_loss.item()
+                    mean_adaptation_module_test_loss += adaptation_test_loss.item()
 
-            self.adaptation_module_optimizer.zero_grad()
-            adaptation_loss.backward()
-            self.adaptation_module_optimizer.step()
+                    if PPO_Args.use_mass_regression_loss and mass_dim > 0:
+                        mean_mass_regression_loss += mass_reg_loss.item()
+                        mean_mass_regression_test_loss += mass_reg_test_loss.item()
 
-            mean_adaptation_module_loss += adaptation_loss.item()
-            mean_adaptation_module_test_loss += adaptation_test_loss.item()
-
-            if PPO_Args.use_mass_regression_loss and mass_dim > 0:
-
-                mean_mass_regression_loss += mass_reg_loss.item()
-                mean_mass_regression_test_loss += mass_reg_test_loss.item()
-
+        # ------------------------------------------------------------
+        # Normalize logging values
+        # ------------------------------------------------------------
         num_updates = PPO_Args.num_learning_epochs * PPO_Args.num_mini_batches
+
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
-        mean_adaptation_module_loss /= (num_updates * PPO_Args.num_adaptation_module_substeps)
-        mean_mass_regression_loss /= (num_updates * PPO_Args.num_adaptation_module_substeps)
-        mean_decoder_loss /= (num_updates * PPO_Args.num_adaptation_module_substeps)
-        mean_decoder_loss_student /= (num_updates * PPO_Args.num_adaptation_module_substeps)
-        mean_adaptation_module_test_loss /= (num_updates * PPO_Args.num_adaptation_module_substeps)
-        mean_decoder_test_loss /= (num_updates * PPO_Args.num_adaptation_module_substeps)
-        mean_decoder_test_loss_student /= (num_updates * PPO_Args.num_adaptation_module_substeps)
+
+        if train_adaptation:
+            adapt_updates = num_updates * PPO_Args.num_adaptation_module_substeps
+            mean_adaptation_module_loss /= adapt_updates
+            mean_mass_regression_loss /= adapt_updates
+            mean_adaptation_module_test_loss /= adapt_updates
+        else:
+            mean_adaptation_module_loss = 0.0
+            mean_mass_regression_loss = 0.0
+            mean_adaptation_module_test_loss = 0.0
+
+        # Decoder is not updated in this PPO file's active code path.
+        mean_decoder_loss = 0.0
+        mean_decoder_loss_student = 0.0
+        mean_decoder_test_loss = 0.0
+        mean_decoder_test_loss_student = 0.0
+
         self.storage.clear()
 
-        return mean_value_loss, mean_surrogate_loss, mean_adaptation_module_loss, mean_mass_regression_loss, mean_decoder_loss, mean_decoder_loss_student, mean_adaptation_module_test_loss, mean_decoder_test_loss, mean_decoder_test_loss_student
+        return (
+            mean_value_loss,
+            mean_surrogate_loss,
+            mean_adaptation_module_loss,
+            mean_mass_regression_loss,
+            mean_decoder_loss,
+            mean_decoder_loss_student,
+            mean_adaptation_module_test_loss,
+            mean_decoder_test_loss,
+            mean_decoder_test_loss_student,
+        )
