@@ -55,6 +55,78 @@ class CoRLRewards:
         h_success = self.env.cfg.rewards.recovery_height_success
         return body_height > h_success
 
+    def _smooth_support_count(self):
+        """
+        Smooth estimate of useful support feet.
+
+        Gives credit only when a foot is:
+        - carrying some vertical load
+        - not sliding too fast in XY
+
+        Returns approximately [0, 4].
+        """
+        env = self.env
+
+        foot_fz = env.contact_forces[:, env.feet_indices, 2].clamp_min(0.0)
+
+        # Softer than the previous (fz - 3) / 20.
+        # This gives learning signal once the foot starts loading.
+        load_score = torch.clamp((foot_fz - 1.0) / 12.0, 0.0, 1.0)
+
+        foot_xy_vel = torch.norm(env.foot_velocities[:, :, :2], dim=-1)
+        no_slip_score = torch.exp(-8.0 * foot_xy_vel)
+
+        return (load_score * no_slip_score).sum(dim=1)
+
+    def _loaded_support_gate(self):
+        env = self.env
+        cfg = env.cfg.rewards
+
+        foot_fz = env.contact_forces[:, env.feet_indices, 2].clamp_min(0.0)
+
+        loaded_feet = foot_fz > getattr(
+            cfg,
+            "loaded_foot_force_threshold",
+            3.0,
+        )
+
+        loaded_count = loaded_feet.float().sum(dim=1)
+
+        # 0 when no feet loaded, 1 when >= 3 feet loaded
+        return torch.clamp(loaded_count / 3.0, 0.0, 1.0)
+
+
+    def _stable_support_gate(self):
+        env = self.env
+        cfg = env.cfg.rewards
+
+        foot_fz = env.contact_forces[:, env.feet_indices, 2].clamp_min(0.0)
+
+        foot_contact = foot_fz > cfg.recovery_contact_force_threshold
+
+        foot_xy_vel = torch.norm(
+            env.foot_velocities[:, :, :2],
+            dim=-1,
+        )
+
+        non_slipping_feet = foot_contact & (
+            foot_xy_vel < cfg.recovery_foot_slip_vel_threshold
+        )
+
+        stable_count = non_slipping_feet.float().sum(dim=1)
+
+        # Strict terminal support gate:
+        # 0 below 2 stable feet, 1 at 3 or more stable feet.
+        return torch.clamp((stable_count - 2.0) / 1.0, 0.0, 1.0)
+
+
+    def _smooth_support_gate(self):
+        """
+        0 when support is poor, 1 when about 3 useful support feet exist.
+        """
+        smooth_support_count = self._smooth_support_count()
+        return torch.clamp((smooth_support_count - 1.0) / 2.0, 0.0, 1.0)
+
     ######## dense success reward ########
     # def _reward_recovery_progress(self):
     #     gz = self.env.projected_gravity[:, 2]
@@ -150,12 +222,32 @@ class CoRLRewards:
         return upright * height_progress * support_progress
 
     ######## sparse success reward ########
+    # def _reward_recovery_bonus(self):
+    #     """
+    #     Sparse one-shot success bonus.
+    #     Fires only when legged_robot.py detects stable recovery and sets recovery_bonus_buf.
+    #     """
+    #     return self.env.recovery_bonus_buf
+
     def _reward_recovery_bonus(self):
         """
-        Sparse one-shot success bonus.
-        Fires only when legged_robot.py detects stable recovery and sets recovery_bonus_buf.
+        Sparse recovery bonus.
+
+        During terminal-stabilization training, this is usually disabled by setting
+        recovery_bonus = 0.0 in reward_scales.
+
+        When re-enabled later, the delay prevents the policy from receiving a success
+        bonus immediately after being reset near standing. The robot must first survive
+        for a short time after reset.
         """
-        return self.env.recovery_bonus_buf
+        env = self.env
+
+        delay_s = getattr(env.cfg.rewards, "recovery_bonus_delay_s", 0.0)
+        delay_steps = int(delay_s / env.dt)
+
+        old_enough = env.episode_length_buf >= delay_steps
+
+        return env.recovery_bonus_buf * old_enough.float()
 
 
     ###############################################
@@ -177,24 +269,45 @@ class CoRLRewards:
     #     )
     #
 
+    # def _reward_upright_orientation(self):
+    #     """
+    #     Rewards upright orientation using a stricter upright sigma.
+    #     The reward is scaled by height progress and foot-contact support to reduce flying/flipping exploits.
+    #     """
+    #     upright_reward = self._upright_progress(self.env.cfg.rewards.upright_sigma_strict)
+    #     # height_progress = self._height_progress()
+    #     height_progress = self._terminal_height_progress()
+    #     foot_contacts = (self.env.contact_forces[:, self.env.feet_indices, 2] > 1.0).sum(dim=1).float()
+    #     contact_progress = torch.clamp(foot_contacts / 4.0, 0.0, 1.0)
+    #     # 20% reward for becoming upright at all
+    #     # +35% if the body is raised
+    #     # +45% if feet are supporting the robot
+    #     stability_factor = (
+    #         0.20
+    #         + 0.35 * height_progress
+    #         + 0.45 * contact_progress
+    #     )
+    #     return upright_reward * stability_factor
+
     def _reward_upright_orientation(self):
-        """
-        Rewards upright orientation using a stricter upright sigma.
-        The reward is scaled by height progress and foot-contact support to reduce flying/flipping exploits.
-        """
-        upright_reward = self._upright_progress(self.env.cfg.rewards.upright_sigma_strict)
-        # height_progress = self._height_progress()
-        height_progress = self._terminal_height_progress()
-        foot_contacts = (self.env.contact_forces[:, self.env.feet_indices, 2] > 1.0).sum(dim=1).float()
-        contact_progress = torch.clamp(foot_contacts / 4.0, 0.0, 1.0)
-        # 20% reward for becoming upright at all
-        # +35% if the body is raised
-        # +45% if feet are supporting the robot
-        stability_factor = (
-            0.20
-            + 0.35 * height_progress
-            + 0.45 * contact_progress
+        upright_reward = self._upright_progress(
+            self.env.cfg.rewards.upright_sigma_strict
         )
+
+        height_progress = self._height_progress()
+
+        foot_contacts = (
+            self.env.contact_forces[:, self.env.feet_indices, 2] > 1.0
+        ).sum(dim=1).float()
+
+        contact_progress = torch.clamp(foot_contacts / 4.0, 0.0, 1.0)
+
+        stability_factor = (
+            0.30
+            + 0.35 * height_progress
+            + 0.35 * contact_progress
+        )
+
         return upright_reward * stability_factor
 
     # def _reward_height_alignment(self):
@@ -220,13 +333,28 @@ class CoRLRewards:
     #     height_progress = self._height_progress()
     #     return upright_factor * height_progress
 
+    # def _reward_height_alignment(self):
+    #     env = self.env
+
+    #     g_z = env.projected_gravity[:, 2]
+    #     upright_factor = torch.clamp(-g_z, 0.0, 1.0)
+    #     height_progress = self._height_progress()
+
+    #     # Do not gate height by support yet.
+    #     return upright_factor * height_progress
+    #
+
     def _reward_height_alignment(self):
-        g_z = self.env.projected_gravity[:, 2]
+        env = self.env
+
+        g_z = env.projected_gravity[:, 2]
         upright_factor = torch.clamp(-g_z, 0.0, 1.0)
 
-        height_progress = self._terminal_height_progress()
+        height_progress = self._height_progress()
 
-        return upright_factor * height_progress
+        support_gate = self._loaded_support_gate()
+
+        return upright_factor * support_gate * height_progress
 
 
     ###############################################
@@ -462,23 +590,55 @@ class CoRLRewards:
         """
         return torch.std(self.env.dof_pos[:, :self.env.num_actuated_dof], dim=1)
 
+    # def _reward_feet_on_ground(self):
+    #     """
+    #     Rewards stable 3-4 foot support, gradually activated as the robot becomes upright.
+    #     Prevents rewarding meaningless foot contact while fully fallen.
+    #     """
+    #     contact_forces = self.env.contact_forces[:, self.env.feet_indices, :]
+    #     contact_norm = torch.norm(contact_forces, dim=-1)
+    #     contacts = (contact_norm > 1.0).float()
+    #     num_contacts = torch.sum(contacts, dim=1)
+    #     g_z = self.env.projected_gravity[:, 2]
+    #     # 0 when not upright enough, gradually increases as robot becomes upright
+    #     # g_z = -0.3 -> upright_factor = 0.0
+    #     # g_z = -0.6 -> upright_factor = 0.5
+    #     # g_z = -0.9 -> upright_factor = 1.0
+    #     upright_factor = torch.clamp((-g_z - 0.3) / 0.6, 0.0, 1.0)
+    #     contact_reward = torch.clamp(num_contacts - 2, min=0.0) / 2.0
+    #     return contact_reward * upright_factor
+
     def _reward_feet_on_ground(self):
-        """
-        Rewards stable 3-4 foot support, gradually activated as the robot becomes upright.
-        Prevents rewarding meaningless foot contact while fully fallen.
-        """
-        contact_forces = self.env.contact_forces[:, self.env.feet_indices, :]
-        contact_norm = torch.norm(contact_forces, dim=-1)
-        contacts = (contact_norm > 1.0).float()
-        num_contacts = torch.sum(contacts, dim=1)
-        g_z = self.env.projected_gravity[:, 2]
-        # 0 when not upright enough, gradually increases as robot becomes upright
-        # g_z = -0.3 -> upright_factor = 0.0
-        # g_z = -0.6 -> upright_factor = 0.5
-        # g_z = -0.9 -> upright_factor = 1.0
-        upright_factor = torch.clamp((-g_z - 0.3) / 0.6, 0.0, 1.0)
-        contact_reward = torch.clamp(num_contacts - 2, min=0.0) / 2.0
-        return contact_reward * upright_factor
+        env = self.env
+
+        # Activate only when the robot is already near upright.
+        upright_gate = torch.clamp(
+            (-env.projected_gravity[:, 2] - 0.65) / 0.30,
+            0.0,
+            1.0
+        )
+
+        # Activate mostly once the body is raised.
+        height_gate = torch.clamp(
+            (env.root_states[:, 2] - 0.26) / 0.07,
+            0.0,
+            1.0
+        )
+
+        foot_fz = env.contact_forces[:, env.feet_indices, 2].clamp_min(0.0)
+
+        # Soft contact score, not strict no-slip.
+        contact_score = torch.clamp((foot_fz - 1.0) / 10.0, 0.0, 1.0)
+        contact_count_soft = contact_score.sum(dim=1)
+
+        # 1 foot -> little reward, 3 feet -> high reward.
+        support_contact_progress = torch.clamp(
+            (contact_count_soft - 1.0) / 2.0,
+            0.0,
+            1.0
+        )
+
+        return upright_gate * height_gate * support_contact_progress
 
     # def _reward_posture(self):
     #     """
@@ -496,31 +656,81 @@ class CoRLRewards:
     #     upright_factor = torch.clamp((-g_z - 0.4) / 0.5, 0.0, 1.0)
     #     return r_posture * upright_factor
 
+    # def _reward_posture(self):
+    #     # FINETUNE
+    #     q = self.env.dof_pos[:, :self.env.num_actuated_dof]
+    #     q_stand = self.env.default_dof_pos[:, :self.env.num_actuated_dof]
+
+    #     posture_error = torch.norm(q - q_stand, dim=1)
+
+    #     r_posture = torch.exp(-1.5 * posture_error)
+
+    #     g_z = self.env.projected_gravity[:, 2]
+    #     upright_factor = torch.clamp((-g_z - 0.4) / 0.5, 0.0, 1.0)
+
+    #     # height_gate = torch.clamp(
+    #     #     (self.env.root_states[:, 2] - 0.18) / 0.12,
+    #     #     0.0,
+    #     #     1.0
+    #     # )
+
+    #     height_gate = torch.clamp(
+    #         (self.env.root_states[:, 2] - 0.26) / 0.07,
+    #         0.0,
+    #         1.0
+    #     )
+
+    #     return r_posture * upright_factor * height_gate
+
+
+    # def _reward_posture(self):
+    #     env = self.env
+
+    #     q = env.dof_pos[:, :env.num_actuated_dof]
+    #     q_stand = env.default_dof_pos[:, :env.num_actuated_dof]
+
+    #     posture_error = torch.norm(q - q_stand, dim=1)
+    #     r_posture = torch.exp(-0.6 * posture_error)
+
+    #     upright_gate = torch.clamp(
+    #         (-env.projected_gravity[:, 2] - 0.70) / 0.25,
+    #         0.0,
+    #         1.0
+    #     )
+
+    #     height_gate = torch.clamp(
+    #         (env.root_states[:, 2] - 0.28) / 0.05,
+    #         0.0,
+    #         1.0
+    #     )
+
+    #     return upright_gate * height_gate * r_posture
+    #
+
     def _reward_posture(self):
-        # FINETUNE
-        q = self.env.dof_pos[:, :self.env.num_actuated_dof]
-        q_stand = self.env.default_dof_pos[:, :self.env.num_actuated_dof]
+        env = self.env
+
+        q = env.dof_pos[:, :env.num_actuated_dof]
+        q_stand = env.default_dof_pos[:, :env.num_actuated_dof]
 
         posture_error = torch.norm(q - q_stand, dim=1)
+        r_posture = torch.exp(-0.6 * posture_error)
 
-        r_posture = torch.exp(-1.5 * posture_error)
-
-        g_z = self.env.projected_gravity[:, 2]
-        upright_factor = torch.clamp((-g_z - 0.4) / 0.5, 0.0, 1.0)
-
-        # height_gate = torch.clamp(
-        #     (self.env.root_states[:, 2] - 0.18) / 0.12,
-        #     0.0,
-        #     1.0
-        # )
-
-        height_gate = torch.clamp(
-            (self.env.root_states[:, 2] - 0.26) / 0.07,
+        upright_gate = torch.clamp(
+            (-env.projected_gravity[:, 2] - 0.70) / 0.25,
             0.0,
-            1.0
+            1.0,
         )
 
-        return r_posture * upright_factor * height_gate
+        height_gate = torch.clamp(
+            (env.root_states[:, 2] - 0.28) / 0.05,
+            0.0,
+            1.0,
+        )
+
+        support_gate = self._stable_support_gate()
+
+        return upright_gate * height_gate * support_gate * r_posture
 
 
 
@@ -682,82 +892,199 @@ class CoRLRewards:
 
     def _reward_stance_region(self):
         """
-        Rewards a valid final foot-support geometry in the robot base frame.
+        Rewards valid final foot-support geometry in the robot base frame.
 
-        This reward is active mainly in the late recovery phase. It checks that
-        each foot lies in a measured-default-centered stance region and adds a
-        small anti-collapse term for left/right foot separation, with stronger
-        emphasis on the rear feet because the observed failure mode is rear-leg
-        interlocking.
+        This version is stricter on fore-aft foot placement, especially rear feet.
+        It is intended for terminal recovery refinement after the robot can already
+        reach upright/high states.
 
-        Foot order is assumed to be:
+        Foot order:
             0 = FL, 1 = FR, 2 = RL, 3 = RR
         """
 
         env = self.env
 
-        # Activate only after the robot is reasonably upright.
+        # Active only after the robot is reasonably upright.
         upright_gate = torch.clamp(
             (-env.projected_gravity[:, 2] - 0.70) / 0.25,
             0.0,
             1.0
         )
 
-        # Activate only once the body has started rising.
-        # height_gate = torch.clamp(
-        #     (env.root_states[:, 2] - 0.23) / 0.10,
-        #     0.0,
-        #     1.0
-        # )
-
+        # Active only near terminal recovery height.
         height_gate = torch.clamp(
             (env.root_states[:, 2] - 0.26) / 0.07,
             0.0,
             1.0
         )
 
-        # Convert foot positions from world frame to body/base frame.
         foot_pos_body = quat_rotate_inverse(
             env.base_quat.unsqueeze(1).repeat(1, 4, 1).reshape(-1, 4),
             (env.foot_positions - env.base_pos.unsqueeze(1)).reshape(-1, 3)
         ).reshape(env.num_envs, 4, 3)
 
-        xy = foot_pos_body[:, :, :2]
-        x = xy[:, :, 0]
-        y = xy[:, :, 1]
+        x = foot_pos_body[:, :, 0]
+        y = foot_pos_body[:, :, 1]
 
-        # ------------------------------------------------------------------
-        # Measured static default stance from recovery env:
+        # -------------------------------------------------
+        # Wider terminal stance boxes.
         #
+        # Nominal Go1-like measured stance:
         # FL: [ 0.1725,  0.1574]
         # FR: [ 0.1725, -0.1574]
         # RL: [-0.2652,  0.1565]
         # RR: [-0.2652, -0.1565]
         #
-        # These bounds are centered around that pose but still allow tolerance.
-        # ------------------------------------------------------------------
+        # These bounds are slightly wider than nominal to avoid over-constraining
+        # recovery, but still penalize rear feet drifting too far forward.
+        # -------------------------------------------------
 
-        # Foot order: FL, FR, RL, RR
-        x_min = torch.tensor([ 0.12,  0.12, -0.33, -0.33], device=env.device)
-        x_max = torch.tensor([ 0.23,  0.23, -0.21, -0.21], device=env.device)
+        if not hasattr(self, "_stance_x_min") or self._stance_x_min.device != env.device:
+            self._stance_x_min = torch.tensor(
+                [0.08, 0.08, -0.36, -0.36],
+                device=env.device
+            )
+            self._stance_x_max = torch.tensor(
+                [0.28, 0.28, -0.16, -0.16],
+                device=env.device
+            )
 
-        y_min = torch.tensor([ 0.13, -0.19,  0.13, -0.19], device=env.device)
-        y_max = torch.tensor([ 0.19, -0.13,  0.19, -0.13], device=env.device)
+            self._stance_y_min = torch.tensor(
+                [0.10, -0.22, 0.10, -0.22],
+                device=env.device
+            )
+            self._stance_y_max = torch.tensor(
+                [0.22, -0.10, 0.22, -0.10],
+                device=env.device
+            )
+
+            # Rear feet get higher weight because rear-foot placement has been
+            # the main terminal-support failure.
+            self._stance_x_weight = torch.tensor(
+                [1.5, 1.5, 2.5, 2.5],
+                device=env.device
+            )
+            self._stance_y_weight = torch.tensor(
+                [1.0, 1.0, 1.5, 1.5],
+                device=env.device
+            )
 
         x_violation = (
-            torch.clamp(x_min.unsqueeze(0) - x, min=0.0)
-            + torch.clamp(x - x_max.unsqueeze(0), min=0.0)
+            torch.clamp(self._stance_x_min.unsqueeze(0) - x, min=0.0)
+            + torch.clamp(x - self._stance_x_max.unsqueeze(0), min=0.0)
         )
 
         y_violation = (
-            torch.clamp(y_min.unsqueeze(0) - y, min=0.0)
-            + torch.clamp(y - y_max.unsqueeze(0), min=0.0)
+            torch.clamp(self._stance_y_min.unsqueeze(0) - y, min=0.0)
+            + torch.clamp(y - self._stance_y_max.unsqueeze(0), min=0.0)
         )
 
-        # Per-foot box violation. Zero if the foot is inside its valid region.
-        box_err = (x_violation + y_violation).mean(dim=1)
+        weighted_box_err = (
+            (self._stance_x_weight.unsqueeze(0) * x_violation).sum(dim=1)
+            + (self._stance_y_weight.unsqueeze(0) * y_violation).sum(dim=1)
+        ) / (
+            self._stance_x_weight.sum() + self._stance_y_weight.sum()
+        )
 
-        return upright_gate * height_gate * torch.exp(-5.0 * box_err)
+        # Explicitly penalize rear feet being too far forward.
+        # This targets the observed rear_x_mean ≈ -0.09 to -0.12 failure.
+        rear_forward_violation = 0.5 * (
+            torch.clamp(x[:, 2] - (-0.16), min=0.0)
+            + torch.clamp(x[:, 3] - (-0.16), min=0.0)
+        )
+
+        # Also mildly penalize front feet being too far forward.
+        front_forward_violation = 0.5 * (
+            torch.clamp(x[:, 0] - 0.28, min=0.0)
+            + torch.clamp(x[:, 1] - 0.28, min=0.0)
+        )
+
+        stance_err = (
+            weighted_box_err
+            + 2.0 * rear_forward_violation
+            + 0.75 * front_forward_violation
+        )
+
+        return upright_gate * height_gate * torch.exp(-6.0 * stance_err)
+
+    # def _reward_stance_region(self):
+    #     """
+    #     Rewards a valid final foot-support geometry in the robot base frame.
+
+    #     This reward is active mainly in the late recovery phase. It checks that
+    #     each foot lies in a measured-default-centered stance region and adds a
+    #     small anti-collapse term for left/right foot separation, with stronger
+    #     emphasis on the rear feet because the observed failure mode is rear-leg
+    #     interlocking.
+
+    #     Foot order is assumed to be:
+    #         0 = FL, 1 = FR, 2 = RL, 3 = RR
+    #     """
+
+    #     env = self.env
+
+    #     # Activate only after the robot is reasonably upright.
+    #     upright_gate = torch.clamp(
+    #         (-env.projected_gravity[:, 2] - 0.70) / 0.25,
+    #         0.0,
+    #         1.0
+    #     )
+
+    #     # Activate only once the body has started rising.
+    #     # height_gate = torch.clamp(
+    #     #     (env.root_states[:, 2] - 0.23) / 0.10,
+    #     #     0.0,
+    #     #     1.0
+    #     # )
+
+    #     height_gate = torch.clamp(
+    #         (env.root_states[:, 2] - 0.26) / 0.07,
+    #         0.0,
+    #         1.0
+    #     )
+
+    #     # Convert foot positions from world frame to body/base frame.
+    #     foot_pos_body = quat_rotate_inverse(
+    #         env.base_quat.unsqueeze(1).repeat(1, 4, 1).reshape(-1, 4),
+    #         (env.foot_positions - env.base_pos.unsqueeze(1)).reshape(-1, 3)
+    #     ).reshape(env.num_envs, 4, 3)
+
+    #     xy = foot_pos_body[:, :, :2]
+    #     x = xy[:, :, 0]
+    #     y = xy[:, :, 1]
+
+    #     # ------------------------------------------------------------------
+    #     # Measured static default stance from recovery env:
+    #     #
+    #     # FL: [ 0.1725,  0.1574]
+    #     # FR: [ 0.1725, -0.1574]
+    #     # RL: [-0.2652,  0.1565]
+    #     # RR: [-0.2652, -0.1565]
+    #     #
+    #     # These bounds are centered around that pose but still allow tolerance.
+    #     # ------------------------------------------------------------------
+
+    #     # Foot order: FL, FR, RL, RR
+    #     x_min = torch.tensor([ 0.12,  0.12, -0.33, -0.33], device=env.device)
+    #     x_max = torch.tensor([ 0.23,  0.23, -0.21, -0.21], device=env.device)
+
+    #     y_min = torch.tensor([ 0.13, -0.19,  0.13, -0.19], device=env.device)
+    #     y_max = torch.tensor([ 0.19, -0.13,  0.19, -0.13], device=env.device)
+
+    #     x_violation = (
+    #         torch.clamp(x_min.unsqueeze(0) - x, min=0.0)
+    #         + torch.clamp(x - x_max.unsqueeze(0), min=0.0)
+    #     )
+
+    #     y_violation = (
+    #         torch.clamp(y_min.unsqueeze(0) - y, min=0.0)
+    #         + torch.clamp(y - y_max.unsqueeze(0), min=0.0)
+    #     )
+
+    #     # Per-foot box violation. Zero if the foot is inside its valid region.
+    #     box_err = (x_violation + y_violation).mean(dim=1)
+
+    #     return upright_gate * height_gate * torch.exp(-5.0 * box_err)
 
     def _reward_stand_still_action(self):
         env = self.env
@@ -768,16 +1095,304 @@ class CoRLRewards:
             1.0
         )
 
-        # Activate only near real standing height, not at 0.25 m crouch
         height_gate = torch.clamp(
             (env.root_states[:, 2] - 0.30) / 0.04,
             0.0,
             1.0
         )
 
-        near_stand_gate = upright_gate * height_gate
+        foot_fz = env.contact_forces[:, env.feet_indices, 2].clamp_min(0.0)
+        load_score = torch.clamp((foot_fz - 3.0) / 20.0, 0.0, 1.0)
+
+        foot_xy_vel = torch.norm(env.foot_velocities[:, :, :2], dim=-1)
+        no_slip_score = torch.exp(-8.0 * foot_xy_vel)
+
+        smooth_support_count = (load_score * no_slip_score).sum(dim=1)
+
+        # Activate action damping only when there are already around 2+ useful
+        # support feet. This avoids suppressing corrective leg motions too early.
+        support_gate = torch.clamp(
+            (smooth_support_count - 1.5) / 1.0,
+            0.0,
+            1.0
+        )
+
+        near_stand_gate = upright_gate * height_gate * support_gate
 
         return near_stand_gate * torch.sum(
             torch.square(env.actions[:, :env.num_actuated_dof]),
             dim=1
         )
+
+    def _reward_loaded_foot_support(self):
+        """
+        Rewards loaded foot support during late recovery.
+
+        This is different from non-slip support:
+            loaded support = foot carries vertical force
+            non-slip support = loaded/contacted foot is also stationary
+
+        Purpose:
+            First teach the policy to use feet as support points.
+            Do not rely only on feet_slip, because slip penalty can be avoided
+            by reducing foot contact.
+        """
+        env = self.env
+
+        upright_gate = torch.clamp(
+            (-env.projected_gravity[:, 2] - 0.65) / 0.30,
+            0.0,
+            1.0
+        )
+
+        height_gate = torch.clamp(
+            (env.root_states[:, 2] - 0.25) / 0.08,
+            0.0,
+            1.0
+        )
+
+        foot_fz = env.contact_forces[:, env.feet_indices, 2].clamp_min(0.0)
+
+        loaded_threshold = getattr(
+            env.cfg.rewards,
+            "loaded_foot_force_threshold",
+            3.0
+        )
+
+        # Smooth load score.
+        # Weak/tiny contacts get little reward; real support contacts get more.
+        load_score = torch.clamp(
+            (foot_fz - loaded_threshold) / 17.0,
+            0.0,
+            1.0
+        )
+
+        loaded_count = load_score.sum(dim=1)
+
+        # Reward progress from roughly 1 loaded foot to 3 loaded feet.
+        support_progress = torch.clamp(
+            (loaded_count - 1.0) / 2.0,
+            0.0,
+            1.0
+        )
+
+        return upright_gate * height_gate * support_progress
+
+    def _reward_late_nonfoot_contact(self):
+        """
+        Penalizes non-foot contact only in the late recovery phase.
+
+        This prevents the robot from using trunk/thigh/calf contact as a fake
+        terminal support mode after it is already upright and raised.
+        """
+        env = self.env
+
+        upright_gate = torch.clamp(
+            (-env.projected_gravity[:, 2] - 0.70) / 0.25,
+            0.0,
+            1.0
+        )
+
+        height_gate = torch.clamp(
+            (env.root_states[:, 2] - 0.25) / 0.08,
+            0.0,
+            1.0
+        )
+
+        nonfoot_threshold = getattr(
+            env.cfg.rewards,
+            "nonfoot_contact_threshold",
+            0.2
+        )
+
+        forces = env.contact_forces[:, env.base_contact_indices, :]
+        contact_force = torch.norm(forces, dim=-1)
+
+        nonfoot_contact = (
+            contact_force.max(dim=1).values > nonfoot_threshold
+        ).float()
+
+        return upright_gate * height_gate * nonfoot_contact
+
+    def _reward_loaded_foot_slip(self):
+        """
+        Penalizes horizontal sliding of feet that are actually carrying load.
+
+        This targets the current failure mode:
+            feet are visually on the ground,
+            feet are loaded,
+            but the contact points are sliding.
+        """
+        env = self.env
+
+        upright_gate = torch.clamp(
+            (-env.projected_gravity[:, 2] - 0.70) / 0.25,
+            0.0,
+            1.0,
+        )
+
+        height_gate = torch.clamp(
+            (env.root_states[:, 2] - 0.27) / 0.06,
+            0.0,
+            1.0,
+        )
+
+        gate = upright_gate * height_gate
+
+        foot_fz = env.contact_forces[:, env.feet_indices, 2].clamp_min(0.0)
+        foot_xy_vel = torch.norm(env.foot_velocities[:, :, :2], dim=-1)
+
+        loaded_threshold = getattr(
+            env.cfg.rewards,
+            "loaded_foot_force_threshold",
+            3.0,
+        )
+
+        slip_threshold = getattr(
+            env.cfg.rewards,
+            "recovery_foot_slip_vel_threshold",
+            0.08,
+        )
+
+        load_weight = torch.clamp(
+            (foot_fz - loaded_threshold) / 20.0,
+            0.0,
+            1.0,
+        )
+
+        slip_speed = torch.clamp(
+            foot_xy_vel - slip_threshold,
+            min=0.0,
+        )
+
+        return gate * torch.sum(load_weight * torch.square(slip_speed), dim=1)
+
+    def _reward_support_deficit(self):
+        """
+        Penalizes having fewer than 3 smooth loaded/non-slipping support feet
+        during the late recovery phase.
+        """
+        env = self.env
+
+        upright_gate = torch.clamp(
+            (-env.projected_gravity[:, 2] - 0.70) / 0.25,
+            0.0,
+            1.0,
+        )
+
+        height_gate = torch.clamp(
+            (env.root_states[:, 2] - 0.27) / 0.06,
+            0.0,
+            1.0,
+        )
+
+        gate = upright_gate * height_gate
+
+        foot_fz = env.contact_forces[:, env.feet_indices, 2].clamp_min(0.0)
+        foot_xy_vel = torch.norm(env.foot_velocities[:, :, :2], dim=-1)
+
+        load_score = torch.clamp(
+            (foot_fz - 3.0) / 20.0,
+            0.0,
+            1.0,
+        )
+
+        # Softer than exp(-8v), so it still gives gradient when feet are sliding.
+        no_slip_score = 1.0 / (
+            1.0 + torch.square(foot_xy_vel / 0.35)
+        )
+
+        stable_count = torch.sum(load_score * no_slip_score, dim=1)
+
+        # Zero penalty once the robot has about 3 stable support feet.
+        deficit = torch.clamp(3.0 - stable_count, min=0.0) / 3.0
+
+        return gate * torch.square(deficit)
+
+    def _reward_front_leg_error(self):
+        """
+        Penalizes front feet being too wide and too far forward during terminal
+        recovery.
+
+        Current observed failure:
+            front feet act like wide forward braces instead of moving under the body.
+        """
+        env = self.env
+
+        upright_gate = torch.clamp(
+            (-env.projected_gravity[:, 2] - 0.75) / 0.20,
+            0.0,
+            1.0,
+        )
+
+        height_gate = torch.clamp(
+            (env.root_states[:, 2] - 0.28) / 0.05,
+            0.0,
+            1.0,
+        )
+
+        gate = upright_gate * height_gate
+
+        foot_pos_body = quat_rotate_inverse(
+            env.base_quat.unsqueeze(1).repeat(1, 4, 1).reshape(-1, 4),
+            (env.foot_positions - env.base_pos.unsqueeze(1)).reshape(-1, 3),
+        ).reshape(env.num_envs, 4, 3)
+
+        x = foot_pos_body[:, :, 0]
+        y = foot_pos_body[:, :, 1]
+
+        # Foot order: FL, FR, RL, RR
+        front_sep = y[:, 0] - y[:, 1]
+        front_x_mean = 0.5 * (x[:, 0] + x[:, 1])
+        front_y_center = 0.5 * (y[:, 0] + y[:, 1])
+
+        # Penalize only outside a reasonable terminal stance.
+        width_err = torch.clamp(front_sep - 0.42, min=0.0) / 0.20
+        forward_err = torch.clamp(front_x_mean - 0.28, min=0.0) / 0.20
+        center_err = torch.abs(front_y_center) / 0.15
+
+        err = (
+            1.5 * torch.square(width_err)
+            + 1.0 * torch.square(forward_err)
+            + 0.3 * torch.square(center_err)
+        )
+
+        return gate * torch.clamp(err, 0.0, 4.0)
+
+    def _reward_terminal_action_prior(self):
+        """
+        Encourages small actions once the robot is upright and high enough
+        to be near terminal recovery.
+
+        This version intentionally does not require good posture/contact,
+        because those are the quantities we are trying to recover.
+        """
+
+        cfg = self.env.cfg.rewards
+
+        # Upright gate: active before perfect upright.
+        upright_score = torch.clamp(
+            (-self.env.projected_gravity[:, 2] - 0.45) / 0.45,
+            0.0,
+            1.0,
+        )
+
+        # Height gate: active once the robot is raised enough.
+        height_score = torch.clamp(
+            (self.env.root_states[:, 2] - 0.22) / 0.10,
+            0.0,
+            1.0,
+        )
+
+        terminal_gate = upright_score * height_score
+
+        # Start loose. Tighten later after stable behavior emerges.
+        sigma = getattr(cfg, "terminal_action_prior_sigma", 3.0)
+
+        action_cost = torch.mean((self.env.actions / sigma) ** 2, dim=1)
+
+        # Non-saturating reward. Unlike exp(-cost), this still gives signal
+        # when actions are large.
+        reward = terminal_gate / (1.0 + action_cost)
+
+        return reward
