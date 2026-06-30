@@ -88,7 +88,7 @@ class FallRecoveryConfig(BaseCfg):
         robot = "go1"
         num_observations = 42  # ang_vel(3) in base + observe_only_ang_vel adds 3 more + gravity(3) + dof_pos(12) + dof_vel(12) + actions(12)
         num_scalar_observations = 42
-        num_privileged_obs = 26
+        num_privileged_obs = 26 + 176
         episode_length_s = 9  # longer episodes to allow full recovery sequences (9/4*0.005 = 450)
         observe_only_ang_vel = True  # prepend ang_vel again for emphasis in recovery task (gives 45 obs total)
 
@@ -102,7 +102,7 @@ class FallRecoveryConfig(BaseCfg):
         priv_observe_Kpd_factor = True
         priv_observe_contact_forces = True
         priv_observe_contact_states = True
-        priv_observe_heightmap = False
+        priv_observe_heightmap = True
 
     class terrain(BaseCfg.terrain):
         mesh_type = "trimesh" # none, plane, heightfield or trimesh
@@ -113,11 +113,9 @@ class FallRecoveryConfig(BaseCfg):
 
         measure_heights = True
 
-        # debug_height_grid = True
-        # debug_height_grid_env_id = 0
-        # debug_height_grid_point_radius = 0.018
-
-        debug_height_grid = True
+        # Visualize terrain height-sampling points in the Isaac Gym viewer
+        # Disable(False) during normal training to avoid rendering overhead
+        debug_height_grid = False
         debug_height_grid_env_id = -1
         debug_height_grid_point_radius = 0.025
 
@@ -209,6 +207,7 @@ class FallRecoveryConfig(BaseCfg):
             [1.2, 2.0],   # thigh
             [0.18, 0.40],  # calf
         ]
+        relative_height_range = [-0.2, 0.8]
 
     class rewards(BaseCfg.rewards):
         base_height_target = 0.34
