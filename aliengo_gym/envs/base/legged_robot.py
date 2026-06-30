@@ -2008,24 +2008,39 @@ class LeggedRobot(BaseTask):
                                                  self.desired_contact_states), dim=-1)
 
         if self.cfg.env.priv_observe_heightmap:
-            heights = self.env.measured_heights              # (N, K)
-            body_height = self.env.root_states[:, 2:3]       # (N, 1)
+            heights = self.measured_heights
+            body_height = self.root_states[:, 2:3]
 
-            # Relative terrain height
-            heights_relative = body_height - heights
+            # Unclamped base-to-terrain vertical clearance.
+            heights_relative_raw = body_height - heights
 
-            # Normalize
-            height_scale, height_shift = get_scale_shift(
-                self.cfg.normalization.relative_height_range
+            height_min, height_max = self.cfg.normalization.relative_height_range
+
+            # Log before clamping so range violations remain visible.
+            if self.common_step_counter % 50 == 0:
+                tracking = self.extras.setdefault("recovery_tracking", {})
+
+                outside_range = (
+                    (heights_relative_raw < height_min)
+                    | (heights_relative_raw > height_max)
+                )
+
+                tracking["heightmap_relative_min"] = heights_relative_raw.min().item()
+                tracking["heightmap_relative_mean"] = heights_relative_raw.mean().item()
+                tracking["heightmap_relative_max"] = heights_relative_raw.max().item()
+                tracking["heightmap_outside_range_frac"] = outside_range.float().mean().item()
+
+            heights_relative = torch.clamp(
+                heights_relative_raw,
+                height_min,
+                height_max,
             )
+
+            height_scale, height_shift = get_scale_shift(self.cfg.normalization.relative_height_range)
             heights_normalized = (heights_relative - height_shift) * height_scale
 
-            self.privileged_obs_buf = torch.cat(
-                (self.privileged_obs_buf, heights_normalized),
-                dim=1
-            )
-
-        # print(f"masses: {self.privileged_obs_buf[:, :4]}")
+            self.privileged_obs_buf = torch.cat((self.privileged_obs_buf, heights_normalized), dim=1)
+            self.next_privileged_obs_buf = torch.cat((self.next_privileged_obs_buf, heights_normalized), dim=1)
 
         # print(f"priv obs shape: {self.privileged_obs_buf.shape}")
         assert self.privileged_obs_buf.shape[
