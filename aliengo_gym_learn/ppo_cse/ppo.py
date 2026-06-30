@@ -10,52 +10,80 @@ from aliengo_gym_learn.ppo_cse import RolloutStorage
 from aliengo_gym_learn.ppo_cse import caches
 
 
+# class PPO_Args(PrefixProto):
+#     # algorithm
+#     value_loss_coef = 1.0
+#     use_clipped_value_loss = True
+#     # clip_param = 0.2
+#     # # entropy_coef = 0.005 #0.01
+#     # num_learning_epochs = 5
+#     num_mini_batches = 4  # mini batch size = num_envs*nsteps / nminibatches
+#     # learning_rate = 1e-3
+#     # adaptation_module_learning_rate = 1e-3
+
+#     # FINETUNE
+#     entropy_coef = 0.0002 #0.0005
+#     learning_rate = 2e-4 #5e-4 #3e-4
+#     adaptation_module_learning_rate = 1e-4 #3e-6 #3e-4
+
+#     num_adaptation_module_substeps = 1
+#     schedule = 'adaptive'  # could be adaptive, fixed
+#     gamma = 0.99
+#     lam = 0.95
+#     # desired_kl = 0.01
+#     # max_grad_norm = 1.
+
+#     clip_param = 0.10
+#     num_learning_epochs = 2
+#     # desired_kl = 0.005       # if your PPO uses adaptive LR / KL stop
+#     max_grad_norm = 0.5
+
+#     # use_mass_regression_loss = True
+
+#     # If adaptation overfits masses and ignores other privileged info, set 0.5
+#     # In case of poor mass prediction, set it to 2.0
+#     # mass_regression_coef = 1.0
+
+#     selective_adaptation_module_loss = True
+#     # freeze_adaptation_module = False
+
+#     # conservative settings
+#     entropy_coef = 0.0
+#     learning_rate = 1e-5
+#     adaptation_module_learning_rate = 0.0
+
+#     freeze_adaptation_module = True
+#     use_mass_regression_loss = False
+#     mass_regression_coef = 0.0
+#     desired_kl = 0.002
+#
+
 class PPO_Args(PrefixProto):
-    # algorithm
     value_loss_coef = 1.0
     use_clipped_value_loss = True
-    # clip_param = 0.2
-    # # entropy_coef = 0.005 #0.01
-    # num_learning_epochs = 5
-    num_mini_batches = 4  # mini batch size = num_envs*nsteps / nminibatches
-    # learning_rate = 1e-3
-    # adaptation_module_learning_rate = 1e-3
 
-    # FINETUNE
-    entropy_coef = 0.0002 #0.0005
-    learning_rate = 2e-4 #5e-4 #3e-4
-    adaptation_module_learning_rate = 1e-4 #3e-6 #3e-4
+    clip_param = 0.2
+    entropy_coef = 0.005
 
+    num_learning_epochs = 5
+    num_mini_batches = 4
+
+    learning_rate = 5e-4
+    adaptation_module_learning_rate = 5e-4
     num_adaptation_module_substeps = 1
-    schedule = 'adaptive'  # could be adaptive, fixed
+
+    schedule = "adaptive"
     gamma = 0.99
     lam = 0.95
-    # desired_kl = 0.01
-    # max_grad_norm = 1.
+    desired_kl = 0.01
+    max_grad_norm = 1.0
 
-    clip_param = 0.10
-    num_learning_epochs = 2
-    # desired_kl = 0.005       # if your PPO uses adaptive LR / KL stop
-    max_grad_norm = 0.5
+    freeze_adaptation_module = False
 
-    # use_mass_regression_loss = True
+    use_mass_regression_loss = True
+    mass_regression_coef = 1.0
 
-    # If adaptation overfits masses and ignores other privileged info, set 0.5
-    # In case of poor mass prediction, set it to 2.0
-    # mass_regression_coef = 1.0
-
-    selective_adaptation_module_loss = True
-    # freeze_adaptation_module = False
-
-    # conservative settings
-    entropy_coef = 0.0
-    learning_rate = 1e-5
-    adaptation_module_learning_rate = 0.0
-
-    freeze_adaptation_module = True
-    use_mass_regression_loss = False
-    mass_regression_coef = 0.0
-    desired_kl = 0.002
+    selective_adaptation_module_loss = False
 
 
 class PPO:
