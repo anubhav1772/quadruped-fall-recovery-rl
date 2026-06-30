@@ -15,7 +15,8 @@ from aliengo_gym.utils.math_utils import quat_apply_yaw, wrap_to_pi, get_scale_s
 from aliengo_gym.utils.terrain import Terrain
 # from .legged_robot_config import BaseCfg as Cfg
 # from .fall_recovery_config import FallRecoveryConfig as Cfg
-from .fall_recovery_config_go1 import FallRecoveryConfig as Cfg
+# from .fall_recovery_config_go1 import FallRecoveryConfig as Cfg
+from .fall_recovery_config_tr import FallRecoveryConfig as Cfg
 
 
 class LeggedRobot(BaseTask):
@@ -37,7 +38,8 @@ class LeggedRobot(BaseTask):
         self.eval_cfg = eval_cfg
         self.sim_params = sim_params
         self.height_samples = None
-        self.debug_viz = False
+        # self.debug_viz = True
+        self.debug_viz = getattr(self.cfg.terrain, "debug_height_grid", False)
         self.init_done = False
         self.initial_dynamics_dict = initial_dynamics_dict
         if eval_cfg is not None: self._parse_cfg(eval_cfg)
@@ -693,7 +695,13 @@ class LeggedRobot(BaseTask):
             lin_vel_norm = torch.norm(self.base_lin_vel[:, :2], dim=1)
             ang_vel_norm = torch.norm(self.base_ang_vel, dim=1)
 
-            base_height = self.root_states[:, 2]
+            # base_height = self.root_states[:, 2]
+            local_terrain_height = self._get_local_terrain_height()
+
+            base_height = (
+                self.root_states[:, 2]
+                - local_terrain_height
+            )
             target_height = self.cfg.rewards.recovery_height_target
 
             base_height_error = torch.abs(base_height - target_height)
@@ -1111,9 +1119,14 @@ class LeggedRobot(BaseTask):
             dim=1
         )
 
+        relative_base_height = (
+            self.root_states[:, 2]
+            - self._get_local_terrain_height()
+        )
+
         handoff_ready = (
                 (self.projected_gravity[:, 2] < cfg.recovery_upright_threshold)  # usually -0.90
-                & (self.root_states[:, 2] > 0.30)                                # stricter than 0.28 success
+                & (relative_base_height > 0.30)                                  # stricter than 0.28 success
                 & (torch.norm(self.base_lin_vel[:, :2], dim=1) < 0.25)
                 & (torch.norm(self.base_ang_vel, dim=1) < 1.00)
                 & (posture_error < 1.80)
@@ -1264,7 +1277,14 @@ class LeggedRobot(BaseTask):
         g_z = self.projected_gravity[:, 2]
 
         upright = g_z < cfg.recovery_upright_threshold
-        stable_height = (self.root_states[:, 2] > cfg.recovery_height_success)
+        # stable_height = (self.root_states[:, 2] > cfg.recovery_height_success)
+        local_terrain_height = self._get_local_terrain_height()
+
+        relative_base_height = (
+            self.root_states[:, 2]
+            - local_terrain_height
+        )
+        stable_height = (relative_base_height > cfg.recovery_height_success)
         low_velocity = (torch.norm(self.base_lin_vel[:, :2], dim=1) < cfg.recovery_lin_vel_threshold)
         low_ang_vel = (torch.norm(self.base_ang_vel, dim=1) < cfg.recovery_ang_vel_threshold)
         posture_error = torch.norm(self.dof_pos - self.default_dof_pos, dim=1)
@@ -1285,7 +1305,17 @@ class LeggedRobot(BaseTask):
             foot_xy_vel < cfg.recovery_foot_slip_vel_threshold
         )
 
-        stable_contacts = non_slipping_feet.sum(dim=1) >= cfg.recovery_min_foot_contacts
+        # stable_contacts = non_slipping_feet.sum(dim=1) >= cfg.recovery_min_foot_contacts
+        if getattr(cfg, "require_non_slipping_contacts", False):
+            stable_contacts = (
+                non_slipping_feet.sum(dim=1)
+                >= cfg.recovery_min_foot_contacts
+            )
+        else:
+            stable_contacts = (
+                foot_contact.sum(dim=1)
+                >= cfg.recovery_min_foot_contacts
+            )
 
         recovered = (
             upright
@@ -4515,27 +4545,103 @@ class LeggedRobot(BaseTask):
         cfg.domain_rand.gravity_rand_duration = np.ceil(
             cfg.domain_rand.gravity_rand_interval * cfg.domain_rand.gravity_impulse_duration)
 
+    # def _draw_debug_vis(self):
+    #     """ Draws visualizations for dubugging (slows down simulation a lot).
+    #         Default behaviour: draws height measurement points
+    #     """
+    #     # draw height lines
+    #     if not self.terrain.cfg.measure_heights:
+    #         return
+    #     self.gym.clear_lines(self.viewer)
+    #     self.gym.refresh_rigid_body_state_tensor(self.sim)
+    #     sphere_geom = gymutil.WireframeSphereGeometry(0.02, 4, 4, None, color=(1, 1, 0))
+    #     for i in range(self.num_envs):
+    #         base_pos = (self.root_states[i, :3]).cpu().numpy()
+    #         heights = self.measured_heights[i].cpu().numpy()
+    #         height_points = quat_apply_yaw(self.base_quat[i].repeat(heights.shape[0]),
+    #                                        self.height_points[i]).cpu().numpy()
+    #         for j in range(heights.shape[0]):
+    #             x = height_points[j, 0] + base_pos[0]
+    #             y = height_points[j, 1] + base_pos[1]
+    #             z = heights[j]
+    #             sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z), r=None)
+    #             gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose)
+
     def _draw_debug_vis(self):
-        """ Draws visualizations for dubugging (slows down simulation a lot).
-            Default behaviour: draws height measurement points
         """
-        # draw height lines
+        Draw height-sampling points using the original working visualization path.
+
+        Colors:
+            red     = outer grid boundary
+            cyan    = center x/y axes
+            magenta = exact center
+            yellow  = remaining interior points
+        """
+
         if not self.terrain.cfg.measure_heights:
             return
+
+        if self.viewer is None:
+            return
+
         self.gym.clear_lines(self.viewer)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
-        sphere_geom = gymutil.WireframeSphereGeometry(0.02, 4, 4, None, color=(1, 1, 0))
-        for i in range(self.num_envs):
-            base_pos = (self.root_states[i, :3]).cpu().numpy()
-            heights = self.measured_heights[i].cpu().numpy()
-            height_points = quat_apply_yaw(self.base_quat[i].repeat(heights.shape[0]),
-                                           self.height_points[i]).cpu().numpy()
-            for j in range(heights.shape[0]):
-                x = height_points[j, 0] + base_pos[0]
-                y = height_points[j, 1] + base_pos[1]
-                z = heights[j]
-                sphere_pose = gymapi.Transform(gymapi.Vec3(x, y, z), r=None)
-                gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose)
+
+        radius = float(getattr(self.cfg.terrain, "debug_height_grid_point_radius", 0.025))
+
+        nx = len(self.cfg.terrain.measured_points_x)
+        ny = len(self.cfg.terrain.measured_points_y)
+
+        boundary_geom = gymutil.WireframeSphereGeometry(radius, 4, 4, None, color=(1.0, 0.0, 0.0))
+        axis_geom = gymutil.WireframeSphereGeometry(radius, 4, 4, None, color=(0.0, 1.0, 1.0))
+        center_geom = gymutil.WireframeSphereGeometry(radius * 1.5, 6, 6, None, color=(1.0, 0.0, 1.0))
+        interior_geom = gymutil.WireframeSphereGeometry(radius, 4, 4, None, color=(1.0, 1.0, 0.0))
+
+        # -1 draws the grid for every environment.
+        selected_env = int(getattr(self.cfg.terrain, "debug_height_grid_env_id", -1))
+
+        if selected_env < 0:
+            env_ids = range(self.num_envs)
+        else:
+            selected_env = max(0, min(selected_env, self.num_envs - 1))
+            env_ids = [selected_env]
+
+        center_i = nx // 2
+        center_j = ny // 2
+
+        z_visual_offset = 0.025
+
+        for env_id in env_ids:
+            base_pos = self.root_states[env_id, :3].detach().cpu().numpy()
+            heights = self.measured_heights[env_id].detach().cpu().numpy()
+
+            repeated_quat = self.base_quat[env_id].unsqueeze(0).repeat(heights.shape[0], 1)
+            height_points = quat_apply_yaw(repeated_quat, self.height_points[env_id]).detach().cpu().numpy()
+
+            for ix in range(nx):
+                for iy in range(ny):
+                    flat_idx = ix * ny + iy
+
+                    is_boundary = ix == 0 or ix == nx - 1 or iy == 0 or iy == ny - 1
+                    is_center = ix == center_i and iy == center_j
+                    is_center_axis = ix == center_i or iy == center_j
+
+                    if is_center:
+                        sphere_geom = center_geom
+                    elif is_boundary:
+                        sphere_geom = boundary_geom
+                    elif is_center_axis:
+                        sphere_geom = axis_geom
+                    else:
+                        sphere_geom = interior_geom
+
+                    x = height_points[flat_idx, 0] + base_pos[0]
+                    y = height_points[flat_idx, 1] + base_pos[1]
+                    z = heights[flat_idx] + z_visual_offset
+
+                    sphere_pose = gymapi.Transform(gymapi.Vec3(float(x), float(y), float(z)), r=None)
+                    gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[env_id], sphere_pose)
+
 
     def _init_height_points(self, env_ids, cfg):
         """ Returns points at which the height measurments are sampled (in base frame)
@@ -4588,3 +4694,22 @@ class LeggedRobot(BaseTask):
         heights = torch.min(heights, heights3)
 
         return heights.view(len(env_ids), -1) * self.terrain.cfg.vertical_scale
+
+    def _get_local_terrain_height(self):
+        """
+        Effective terrain height over the robot support footprint.
+        Assumes self.measured_heights has shape [num_envs, num_points].
+        """
+        heights = self.measured_heights
+
+        sorted_heights = torch.sort(
+            heights,
+            dim=1,
+        ).values
+
+        # Remove the lowest and highest 10%.
+        trim = max(1, heights.shape[1] // 10)
+
+        trimmed_heights = sorted_heights[:, trim:-trim]
+
+        return trimmed_heights.mean(dim=1)
