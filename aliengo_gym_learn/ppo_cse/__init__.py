@@ -97,11 +97,21 @@ class Runner:
         self.device = device
         self.env = env
 
-        actor_critic = ActorCritic(self.env.num_obs,
-                                      self.env.num_privileged_obs,
-                                      self.env.num_obs_history,
-                                      self.env.num_actions,
-                                      ).to(self.device)
+        if self.env.cfg.env.priv_observe_heightmap:
+            num_height_obs = (
+                len(self.env.cfg.terrain.measured_points_x)
+                * len(self.env.cfg.terrain.measured_points_y)
+            )
+        else:
+            num_height_obs = 0
+
+        actor_critic = ActorCritic(
+            self.env.num_obs,
+            self.env.num_privileged_obs,
+            self.env.num_obs_history,
+            self.env.num_actions,
+            num_height_obs=num_height_obs,
+        ).to(self.device)
 
         # Recovery policy resume
         if RunnerArgs.resume:
