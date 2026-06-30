@@ -345,8 +345,24 @@ class PPO:
                         obs_history_batch
                     )
 
+                    # with torch.no_grad():
+                        # adaptation_target = privileged_obs_batch
+
+                    # Only the first 26 privileged values are adaptation targets.
+                    # The remaining values are the raw height map for the critic encoder.
                     with torch.no_grad():
-                        adaptation_target = privileged_obs_batch
+                        adaptation_target = privileged_obs_batch[
+                            :, :self.actor_critic.num_adaptation_obs
+                        ]
+
+                    if adaptation_pred.shape != adaptation_target.shape:
+                        raise RuntimeError(
+                            "Adaptation prediction/target shape mismatch: "
+                            f"prediction={tuple(adaptation_pred.shape)}, "
+                            f"target={tuple(adaptation_target.shape)}, "
+                            f"num_adaptation_obs={self.actor_critic.num_adaptation_obs}, "
+                            f"full_privileged_dim={privileged_obs_batch.shape[-1]}"
+                        )
 
                     mass_dim = self.actor_critic.estimator_mass_dim
 
