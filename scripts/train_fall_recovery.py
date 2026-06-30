@@ -4,7 +4,8 @@ def train_aliengo(headless=True):
     assert isaacgym
     import torch
 
-    from aliengo_gym.envs.base.fall_recovery_config_go1 import FallRecoveryConfig as Cfg
+    # from aliengo_gym.envs.base.fall_recovery_config_go1 import FallRecoveryConfig as Cfg
+    from aliengo_gym.envs.base.fall_recovery_config_tr import FallRecoveryConfig as Cfg
     # from aliengo_gym.envs.base.fall_recovery_config import FallRecoveryConfig as Cfg
     # from aliengo_gym.envs.aliengo.aliengo_config import config_aliengo
     from aliengo_gym.envs.aliengo.velocity_tracking import VelocityTrackingEasyEnv
