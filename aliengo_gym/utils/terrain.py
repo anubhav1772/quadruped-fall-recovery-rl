@@ -90,7 +90,11 @@ class Terrain:
     def curriculum(self, cfg):
         for j in range(cfg.num_cols):
             for i in range(cfg.num_rows):
-                difficulty = i / cfg.num_rows * cfg.difficulty_scale
+                # difficulty = i / cfg.num_rows * cfg.difficulty_scale
+                # With ten rows, the highest difficulty is only 0.9, not 1.0
+                # row 0 -> difficulty 0.0
+                # row 9 -> difficulty 1.0
+                difficulty = i / max(cfg.num_rows - 1, 1) * cfg.difficulty_scale
                 choice = j / cfg.num_cols + 0.001
 
                 terrain = self.make_terrain(cfg, choice, difficulty, cfg.proportions)
@@ -120,8 +124,21 @@ class Terrain:
         slope = difficulty * 0.4
         step_height = 0.05 + 0.18 * difficulty
         discrete_obstacles_height = 0.05 + difficulty * (cfg.max_platform_height - 0.05)
-        stepping_stones_size = 1.5 * (1.05 - difficulty)
-        stone_distance = 0.05 if difficulty == 0 else 0.1
+        # stepping_stones_size = 1.5 * (1.05 - difficulty)
+        # stone_distance = 0.05 if difficulty == 0 else 0.1
+        # Keep difficulty inside the intended curriculum range.
+        difficulty = float(np.clip(difficulty, 0.0, 1.0))
+
+        # Increasing difficulty:
+        #   smaller stones and larger gaps.
+        stepping_stones_size = 0.40 - 0.20 * difficulty
+        stone_distance = 0.10 + 0.20 * difficulty
+
+        # Isaac Gym converts metric dimensions to integer height-field cells.
+        # Prevent stone size or gap from becoming zero after discretization.
+        stepping_stones_size = max(stepping_stones_size, 2.0 * cfg.horizontal_scale)
+
+        stone_distance = max(stone_distance, cfg.horizontal_scale)
         if choice < proportions[0]:
             if choice < proportions[0] / 2:
                 slope *= -1
