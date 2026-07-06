@@ -57,8 +57,8 @@ class Terrain:
         cfg.num_sub_terrains = cfg.num_rows * cfg.num_cols
         cfg.env_origins = np.zeros((cfg.num_rows, cfg.num_cols, 3))
 
-        cfg.width_per_env_pixels = int(cfg.terrain_length / cfg.horizontal_scale)
-        cfg.length_per_env_pixels = int(cfg.terrain_width / cfg.horizontal_scale)
+        cfg.length_per_env_pixels = int(cfg.terrain_length / cfg.horizontal_scale)
+        cfg.width_per_env_pixels = int(cfg.terrain_width / cfg.horizontal_scale)
 
         cfg.border = int(cfg.border_size / cfg.horizontal_scale)
         cfg.tot_cols = int(cfg.num_cols * cfg.width_per_env_pixels) + 2 * cfg.border
@@ -106,71 +106,309 @@ class Terrain:
             # Env coordinates in the world
             (i, j) = np.unravel_index(k, (cfg.num_rows, cfg.num_cols))
 
-            terrain = terrain_utils.SubTerrain("terrain",
-                                               width=cfg.width_per_env_pixels,
-                                               length=cfg.width_per_env_pixels,
-                                               vertical_scale=cfg.vertical_scale,
-                                               horizontal_scale=cfg.horizontal_scale)
+            terrain = terrain_utils.SubTerrain(
+                "terrain",
+                width=cfg.width_per_env_pixels,
+                length=cfg.length_per_env_pixels,
+                vertical_scale=cfg.vertical_scale,
+                horizontal_scale=cfg.horizontal_scale,
+            )
 
             eval(terrain_type)(terrain, **cfg.terrain_kwargs.terrain_kwargs)
             self.add_terrain_to_map(cfg, terrain, i, j)
 
+    def gap_terrain(terrain, gap_width, gap_depth=0.5, platform_size=1.2):
+        """
+        Creates a square gap surrounding a central safe platform.
+
+        Args:
+            terrain:
+                Isaac Gym SubTerrain.
+            gap_width:
+                Width of the gap surrounding the platform [m].
+            gap_depth:
+                Depth of the gap [m].
+            platform_size:
+                Width of the central platform [m].
+        """
+
+        horizontal_scale = terrain.horizontal_scale
+        vertical_scale = terrain.vertical_scale
+
+        gap_px = max(1, int(round(gap_width / horizontal_scale)))
+
+        platform_px = max(2, int(round(platform_size / horizontal_scale)))
+
+        depth_raw = int(round(-abs(gap_depth) / vertical_scale))
+
+        center_x = terrain.length // 2
+        center_y = terrain.width // 2
+
+        platform_half = platform_px // 2
+        outer_half = platform_half + gap_px
+
+        outer_x1 = max(0, center_x - outer_half)
+        outer_x2 = min(terrain.length, center_x + outer_half)
+
+        outer_y1 = max(0, center_y - outer_half)
+        outer_y2 = min(terrain.width, center_y + outer_half)
+
+        platform_x1 = max(0, center_x - platform_half)
+        platform_x2 = min(terrain.length, center_x + platform_half)
+
+        platform_y1 = max(0, center_y - platform_half)
+        platform_y2 = min(terrain.width, center_y + platform_half)
+
+        # Dig the outer square.
+        terrain.height_field_raw[outer_x1:outer_x2, outer_y1:outer_y2] = depth_raw
+
+        # Restore the central spawn platform.
+        terrain.height_field_raw[platform_x1:platform_x2, platform_y1:platform_y2] = 0
+
+        return terrain
+
+    def pillar_terrain(terrain, pillar_size, pillar_spacing, pillar_height, center_platform_size=1.2):
+        """
+        Creates a grid of raised square pillars with a raised central
+        platform on which the robot is initialized.
+
+        Args:
+            terrain:
+                Isaac Gym SubTerrain.
+            pillar_size:
+                Width of each pillar [m].
+            pillar_spacing:
+                Horizontal gap between pillars [m].
+            pillar_height:
+                Pillar height [m].
+            center_platform_size:
+                Width of the central spawn platform [m].
+        """
+
+        horizontal_scale = terrain.horizontal_scale
+        vertical_scale = terrain.vertical_scale
+
+        pillar_px = max(1, int(round(pillar_size / horizontal_scale)))
+
+        spacing_px = max(1, int(round(pillar_spacing / horizontal_scale)))
+
+        center_platform_px = max(pillar_px, int(round(center_platform_size / horizontal_scale)))
+
+        pillar_height_raw = max(1, int(round(pillar_height / vertical_scale)))
+
+        stride = pillar_px + spacing_px
+
+        center_x = terrain.length // 2
+        center_y = terrain.width // 2
+        center_half = center_platform_px // 2
+
+        center_x1 = max(0, center_x - center_half)
+        center_x2 = min(terrain.length, center_x + center_half)
+
+        center_y1 = max(0, center_y - center_half)
+        center_y2 = min(terrain.width, center_y + center_half)
+
+        # Create a regular field of pillars.
+        for x1 in range(0, terrain.length - pillar_px + 1, stride):
+            x2 = x1 + pillar_px
+
+            for y1 in range(0, terrain.width - pillar_px + 1, stride):
+                y2 = y1 + pillar_px
+
+                # Do not overwrite the central spawn region.
+                overlaps_center = not (
+                    x2 <= center_x1
+                    or x1 >= center_x2
+                    or y2 <= center_y1
+                    or y1 >= center_y2
+                )
+
+                if overlaps_center:
+                    continue
+
+                terrain.height_field_raw[x1:x2, y1:y2] = pillar_height_raw
+
+        # Raised central platform guarantees a valid spawn surface.
+        terrain.height_field_raw[center_x1:center_x2, center_y1:center_y2] = pillar_height_raw
+
+        return terrain
+
     def make_terrain(self, cfg, choice, difficulty, proportions):
-        terrain = terrain_utils.SubTerrain("terrain",
-                                           width=cfg.width_per_env_pixels,
-                                           length=cfg.width_per_env_pixels,
-                                           vertical_scale=cfg.vertical_scale,
-                                           horizontal_scale=cfg.horizontal_scale)
-        slope = difficulty * 0.4
-        step_height = 0.05 + 0.18 * difficulty
-        discrete_obstacles_height = 0.05 + difficulty * (cfg.max_platform_height - 0.05)
-        # stepping_stones_size = 1.5 * (1.05 - difficulty)
-        # stone_distance = 0.05 if difficulty == 0 else 0.1
-        # Keep difficulty inside the intended curriculum range.
+        terrain = terrain_utils.SubTerrain(
+            "terrain",
+            width=cfg.width_per_env_pixels,
+            length=cfg.length_per_env_pixels,
+            vertical_scale=cfg.vertical_scale,
+            horizontal_scale=cfg.horizontal_scale,
+        )
+
+        # Normalized curriculum difficulty.
         difficulty = float(np.clip(difficulty, 0.0, 1.0))
 
-        # Increasing difficulty:
-        #   smaller stones and larger gaps.
-        stepping_stones_size = 0.40 - 0.20 * difficulty
-        stone_distance = 0.10 + 0.20 * difficulty
+        def lerp(easy, hard):
+            """Linear interpolation from easy at d=0 to hard at d=1."""
+            return easy + difficulty * (hard - easy)
 
-        # Isaac Gym converts metric dimensions to integer height-field cells.
-        # Prevent stone size or gap from becoming zero after discretization.
+        # ------------------------------------------------------------
+        # Difficulty-dependent terrain parameters
+        # ------------------------------------------------------------
+
+        # Smooth and rough slopes: 0% -> 40% gradient.
+        slope = lerp(0.0, 0.40)
+
+        # Rough component added to the rough slope.
+        rough_slope_height = lerp(cfg.vertical_scale, 0.05)
+
+        # Stairs: 5 cm -> 23 cm.
+        step_height = lerp(0.05, 0.23)
+
+        # Discrete obstacles:
+        # progressively increase both height and obstacle density.
+        obstacle_height = lerp(0.03, cfg.max_platform_height)
+        num_rectangles = int(round(lerp(8, 20)))
+
+        # Stepping stones:
+        # progressively smaller stones, larger gaps and uneven heights.
+        stepping_stones_size = lerp(0.45, 0.20)
+        stone_distance = lerp(0.05, 0.30)
+        stepping_stones_height = lerp(0.0, 0.04)
+
         stepping_stones_size = max(stepping_stones_size, 2.0 * cfg.horizontal_scale)
-
         stone_distance = max(stone_distance, cfg.horizontal_scale)
+
+        # Fully random terrain.
+        random_noise_height = lerp(cfg.vertical_scale, cfg.terrain_noise_magnitude)
+
+        # Rough half of the half-flat/half-rough terrain.
+        half_rough_height = lerp(cfg.vertical_scale, 0.05)
+
+        height_step = max(cfg.vertical_scale, getattr(cfg, "terrain_smoothness", cfg.vertical_scale))
+
+        # ------------------------------------------------------------
+        # Gap curriculum
+        # ------------------------------------------------------------
+
+        # Wider and deeper gaps at higher terrain levels.
+        gap_width = lerp(0.05, 0.35)
+        gap_depth = lerp(0.15, 0.60)
+
+        # Reduce the central support area as difficulty increases.
+        gap_platform_size = lerp(1.40, 0.90)
+
+
+        # ------------------------------------------------------------
+        # Pillar curriculum
+        # ------------------------------------------------------------
+
+        # Pillars become smaller, farther apart and taller.
+        pillar_size = lerp(0.45, 0.20)
+        pillar_spacing = lerp(0.05, 0.25)
+        pillar_height = lerp(0.03, 0.25)
+
+        # Reduce the central support platform gradually.
+        pillar_center_platform = lerp(1.40, 0.90)
+
+        # ------------------------------------------------------------
+        # Terrain selection
+        # ------------------------------------------------------------
+
         if choice < proportions[0]:
+            # Smooth ascending/descending slope.
             if choice < proportions[0] / 2:
-                slope *= -1
-            terrain_utils.pyramid_sloped_terrain(terrain, slope=slope, platform_size=3.)
+                slope *= -1.0
+
+            terrain_utils.pyramid_sloped_terrain(
+                terrain,
+                slope=slope,
+                platform_size=0.5,
+            )
+
         elif choice < proportions[1]:
-            terrain_utils.pyramid_sloped_terrain(terrain, slope=slope, platform_size=3.)
-            terrain_utils.random_uniform_terrain(terrain, min_height=-0.05, max_height=0.05,
-                                                 step=self.cfg.terrain_smoothness, downsampled_scale=0.2)
+            # Rough slope: both slope and roughness increase.
+            terrain_utils.pyramid_sloped_terrain(
+                terrain,
+                slope=slope,
+                platform_size=0.5,
+            )
+
+            terrain_utils.random_uniform_terrain(
+                terrain,
+                min_height=-rough_slope_height,
+                max_height=rough_slope_height,
+                step=height_step,
+                downsampled_scale=0.2,
+            )
+
         elif choice < proportions[3]:
+            # Ascending/descending stairs.
             if choice < proportions[2]:
-                step_height *= -1
-            terrain_utils.pyramid_stairs_terrain(terrain, step_width=0.31, step_height=step_height, platform_size=3.)
+                step_height *= -1.0
+
+            terrain_utils.pyramid_stairs_terrain(
+                terrain,
+                step_width=0.31,
+                step_height=step_height,
+                platform_size=0.8,
+            )
+
         elif choice < proportions[4]:
-            num_rectangles = 20
-            rectangle_min_size = 1.
-            rectangle_max_size = 2.
-            terrain_utils.discrete_obstacles_terrain(terrain, discrete_obstacles_height, rectangle_min_size,
-                                                     rectangle_max_size, num_rectangles, platform_size=3.)
+            # Discrete obstacles.
+            terrain_utils.discrete_obstacles_terrain(
+                terrain,
+                max_height=obstacle_height,
+                min_size=1.0,
+                max_size=2.0,
+                num_rects=num_rectangles,
+                platform_size=0.8,
+            )
+
         elif choice < proportions[5]:
-            terrain_utils.stepping_stones_terrain(terrain, stone_size=stepping_stones_size,
-                                                  stone_distance=stone_distance, max_height=0., platform_size=4.)
+            # Stepping stones.
+            terrain_utils.stepping_stones_terrain(
+                terrain,
+                stone_size=stepping_stones_size,
+                stone_distance=stone_distance,
+                max_height=stepping_stones_height,
+                platform_size=0.8,
+            )
+
         elif choice < proportions[6]:
-            pass
+            gap_terrain(
+                terrain,
+                gap_width=gap_width,
+                gap_depth=gap_depth,
+                platform_size=gap_platform_size,
+            )
+
         elif choice < proportions[7]:
-            pass
+            pillar_terrain(
+                terrain,
+                pillar_size=pillar_size,
+                pillar_spacing=pillar_spacing,
+                pillar_height=pillar_height,
+                center_platform_size=pillar_center_platform,
+            )
+
         elif choice < proportions[8]:
-            terrain_utils.random_uniform_terrain(terrain, min_height=-cfg.terrain_noise_magnitude,
-                                                 max_height=cfg.terrain_noise_magnitude, step=0.005,
-                                                 downsampled_scale=0.2)
+            # Random rough terrain.
+            terrain_utils.random_uniform_terrain(
+                terrain,
+                min_height=-random_noise_height,
+                max_height=random_noise_height,
+                step=height_step,
+                downsampled_scale=0.2,
+            )
+
         elif choice < proportions[9]:
-            terrain_utils.random_uniform_terrain(terrain, min_height=-0.05, max_height=0.05,
-                                                 step=self.cfg.terrain_smoothness, downsampled_scale=0.2)
+            # Half-flat, half-rough terrain.
+            terrain_utils.random_uniform_terrain(
+                terrain,
+                min_height=-half_rough_height,
+                max_height=half_rough_height,
+                step=height_step,
+                downsampled_scale=0.2,
+            )
+
             terrain.height_field_raw[0:terrain.length // 2, :] = 0
 
         return terrain
