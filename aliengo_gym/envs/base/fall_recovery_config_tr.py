@@ -108,6 +108,12 @@ class FallRecoveryConfig(BaseCfg):
         mesh_type = "trimesh" # none, plane, heightfield or trimesh
         curriculum = True
 
+        num_rows = 10
+        num_cols = 20
+
+        # ------------------------------------------------------------
+        # Independent terrain curriculum
+        # ------------------------------------------------------------
         # Recovery-driven terrain progression.
         recovery_curriculum = True
 
@@ -119,7 +125,31 @@ class FallRecoveryConfig(BaseCfg):
         curriculum_demote_step = 1
 
         curriculum_min_level = 0
-        curriculum_max_level = 9
+        curriculum_max_level = 9 # (num_row - 1)
+
+
+        # ------------------------------------------------------------
+        # Independent global orientation curriculum
+        # ------------------------------------------------------------
+
+        orientation_curriculum = True
+
+        # Number of completed training episodes used for one
+        # orientation-performance update.
+        orientation_update_window = 256
+
+        # Episodic recovery EMA used only for fallen-orientation difficulty.
+        orientation_ema_alpha = 0.10
+
+        # Hysteresis thresholds prevent rapid phase oscillation.
+        orientation_phase_1_enter = 0.60
+        orientation_phase_1_exit = 0.40
+
+        orientation_phase_2_enter = 0.80
+        orientation_phase_2_exit = 0.60
+
+        # Avoid mixing terrain-window statistics across orientation phases.
+        reset_terrain_windows_on_orientation_change = True
 
         # Easy initial terrain rows
         min_init_terrain_level = 0
@@ -153,9 +183,6 @@ class FallRecoveryConfig(BaseCfg):
         # Do not let center sampling override min/max terrain levels
         center_robots = False
 
-        num_rows = 10
-        num_cols = 20
-
         terrain_proportions = [
             0.15,  # smooth slope
             0.30,  # rough slope
@@ -169,15 +196,18 @@ class FallRecoveryConfig(BaseCfg):
             0.20,  # half-flat half-rough
         ]
 
-        # Episodic recovery EMA used only for fallen-orientation difficulty.
-        orientation_ema_alpha = 0.10
-
-        # Hysteresis thresholds prevent rapid phase oscillation.
-        orientation_phase_1_enter = 0.30
-        orientation_phase_1_exit = 0.20
-
-        orientation_phase_2_enter = 0.60
-        orientation_phase_2_exit = 0.45
+        # terrain_proportions = [
+        #     0.15,  # smooth slope: 3 columns
+        #     0.25,  # rough slope: 5 columns
+        #     0.05,  # stairs up: 1 column
+        #     0.05,  # stairs down: 1 column
+        #     0.10,  # discrete obstacles: 2 columns
+        #     0.05,  # stepping stones: 1 column
+        #     0.05,  # gap: 1 column
+        #     0.05,  # pillars: 1 column
+        #     0.10,  # random noise: 2 columns
+        #     0.15,  # half-flat half-rough: 3 columns
+        # ]
 
     class domain_rand(BaseCfg.domain_rand):
         # trunk_mass_range = [4.0, 28.0]
