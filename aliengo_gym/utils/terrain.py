@@ -117,7 +117,7 @@ class Terrain:
             eval(terrain_type)(terrain, **cfg.terrain_kwargs.terrain_kwargs)
             self.add_terrain_to_map(cfg, terrain, i, j)
 
-    def gap_terrain(terrain, gap_width, gap_depth=0.5, platform_size=1.2):
+    def gap_terrain(self, terrain, gap_width, gap_depth=0.5, platform_size=1.2):
         """
         Creates a square gap surrounding a central safe platform.
 
@@ -167,7 +167,7 @@ class Terrain:
 
         return terrain
 
-    def pillar_terrain(terrain, pillar_size, pillar_spacing, pillar_height, center_platform_size=1.2):
+    def pillar_terrain(self, terrain, pillar_size, pillar_spacing, pillar_height, center_platform_size=1.2):
         """
         Creates a grid of raised square pillars with a raised central
         platform on which the robot is initialized.
@@ -320,7 +320,7 @@ class Terrain:
             terrain_utils.pyramid_sloped_terrain(
                 terrain,
                 slope=slope,
-                platform_size=0.5,
+                platform_size=0.3,
             )
 
         elif choice < proportions[1]:
@@ -328,7 +328,7 @@ class Terrain:
             terrain_utils.pyramid_sloped_terrain(
                 terrain,
                 slope=slope,
-                platform_size=0.5,
+                platform_size=0.3,
             )
 
             terrain_utils.random_uniform_terrain(
@@ -348,7 +348,7 @@ class Terrain:
                 terrain,
                 step_width=0.31,
                 step_height=step_height,
-                platform_size=0.8,
+                platform_size=0.4,
             )
 
         elif choice < proportions[4]:
@@ -359,7 +359,7 @@ class Terrain:
                 min_size=1.0,
                 max_size=2.0,
                 num_rects=num_rectangles,
-                platform_size=0.8,
+                platform_size=0.4,
             )
 
         elif choice < proportions[5]:
@@ -369,11 +369,11 @@ class Terrain:
                 stone_size=stepping_stones_size,
                 stone_distance=stone_distance,
                 max_height=stepping_stones_height,
-                platform_size=0.8,
+                platform_size=0.4,
             )
 
         elif choice < proportions[6]:
-            gap_terrain(
+            self.gap_terrain(
                 terrain,
                 gap_width=gap_width,
                 gap_depth=gap_depth,
@@ -381,7 +381,7 @@ class Terrain:
             )
 
         elif choice < proportions[7]:
-            pillar_terrain(
+            self.pillar_terrain(
                 terrain,
                 pillar_size=pillar_size,
                 pillar_spacing=pillar_spacing,
