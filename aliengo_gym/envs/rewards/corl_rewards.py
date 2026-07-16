@@ -11,6 +11,11 @@ class CoRLRewards:
     def load_env(self, env):
         self.env = env
 
+    def get_body_height(self):
+        local_terrain_height = self.env._get_local_terrain_height()
+        relative_base_height = self.env.root_states[:, 2] - local_terrain_height
+        return relative_base_height
+
     # Helper functions:
     # - _upright_progress: soft orientation progress
     # - _height_progress: soft height progress
@@ -33,7 +38,7 @@ class CoRLRewards:
         Stricter height progress for final recovery / handoff refinement.
         Gives little reward to low crouched states.
         """
-        h = self.env.root_states[:, 2]
+        h = self.get_body_height()
         return torch.clamp((h - 0.26) / 0.07, 0.0, 1.0)
 
     def _height_progress(self):
@@ -41,7 +46,7 @@ class CoRLRewards:
         Soft normalized body-height progress from recovery_height_min to recovery_height_target.
         Returns 0 when body is too low and 1 near target standing height.
         """
-        body_height = self.env.root_states[:, 2]
+        body_height = self.get_body_height()
         h_min = self.env.cfg.rewards.recovery_height_min
         h_target = self.env.cfg.rewards.recovery_height_target
         return torch.clamp((body_height - h_min) / (h_target - h_min), 0.0, 1.0)
@@ -51,7 +56,7 @@ class CoRLRewards:
         Hard height check for true recovery success.
         Should match the stable_height condition used in legged_robot.py.
         """
-        body_height = self.env.root_states[:, 2]
+        body_height = self.get_body_height()
         h_success = self.env.cfg.rewards.recovery_height_success
         return body_height > h_success
 
@@ -505,8 +510,9 @@ class CoRLRewards:
             1.0
         )
 
+        base_height = self.get_body_height()
         height_gate = torch.clamp(
-            (env.root_states[:, 2] - 0.25) / 0.08,
+            (base_height - 0.25) / 0.08,
             0.0,
             1.0
         )
@@ -559,8 +565,9 @@ class CoRLRewards:
             1.0
         )
 
+        base_height = self.get_body_height()
         height_gate = torch.clamp(
-            (env.root_states[:, 2] - 0.26) / 0.07,
+            (base_height - 0.26) / 0.07,
             0.0,
             1.0
         )
@@ -618,9 +625,10 @@ class CoRLRewards:
             1.0
         )
 
+        base_height = self.get_body_height()
         # Activate mostly once the body is raised.
         height_gate = torch.clamp(
-            (env.root_states[:, 2] - 0.26) / 0.07,
+            (base_height - 0.26) / 0.07,
             0.0,
             1.0
         )
@@ -722,8 +730,9 @@ class CoRLRewards:
             1.0,
         )
 
+        body_height = self.get_body_height()
         height_gate = torch.clamp(
-            (env.root_states[:, 2] - 0.28) / 0.05,
+            (body_height - 0.28) / 0.05,
             0.0,
             1.0,
         )
@@ -739,7 +748,7 @@ class CoRLRewards:
         Raw target-height reward without upright/contact gating.
         For fall recovery, usually keep this disabled and use height_alignment instead.
         """
-        body_height = self.env.root_states[:, 2]
+        body_height = self.get_body_height()
         target_height = self.env.cfg.rewards.base_height_target
         return torch.exp(-torch.square(target_height - body_height))
 
@@ -770,9 +779,9 @@ class CoRLRewards:
             0.0,
             1.0
         )
-
+        base_height = self.get_body_height()
         height_gate = torch.clamp(
-            (env.root_states[:, 2] - 0.24) / 0.08,
+            (base_height - 0.24) / 0.08,
             0.0,
             1.0
         )
@@ -805,8 +814,9 @@ class CoRLRewards:
             #     1.0
             # )
 
+            base_height = self.get_body_height()
             height_gate = torch.clamp(
-                (env.root_states[:, 2] - 0.26) / 0.07,
+                (base_height - 0.26) / 0.07,
                 0.0,
                 1.0
             )
@@ -858,8 +868,9 @@ class CoRLRewards:
             1.0
         )
 
+        base_height = self.get_body_height()
         height_gate = torch.clamp(
-            (self.env.root_states[:, 2] - 0.18) / 0.12,
+            (base_height - 0.18) / 0.12,
             0.0,
             1.0
         )
@@ -911,9 +922,10 @@ class CoRLRewards:
             1.0
         )
 
+        base_height = self.get_body_height()
         # Active only near terminal recovery height.
         height_gate = torch.clamp(
-            (env.root_states[:, 2] - 0.26) / 0.07,
+            (base_height - 0.26) / 0.07,
             0.0,
             1.0
         )
@@ -1095,8 +1107,9 @@ class CoRLRewards:
             1.0
         )
 
+        base_height = self.get_body_height()
         height_gate = torch.clamp(
-            (env.root_states[:, 2] - 0.30) / 0.04,
+            (base_height - 0.30) / 0.04,
             0.0,
             1.0
         )
@@ -1145,8 +1158,9 @@ class CoRLRewards:
             1.0
         )
 
+        base_height = self.get_body_height()
         height_gate = torch.clamp(
-            (env.root_states[:, 2] - 0.25) / 0.08,
+            (base_height - 0.25) / 0.08,
             0.0,
             1.0
         )
@@ -1192,9 +1206,9 @@ class CoRLRewards:
             0.0,
             1.0
         )
-
+        base_height = self.get_body_height()
         height_gate = torch.clamp(
-            (env.root_states[:, 2] - 0.25) / 0.08,
+            (base_height - 0.25) / 0.08,
             0.0,
             1.0
         )
@@ -1230,9 +1244,9 @@ class CoRLRewards:
             0.0,
             1.0,
         )
-
+        base_height = self.get_body_height()
         height_gate = torch.clamp(
-            (env.root_states[:, 2] - 0.27) / 0.06,
+            (base_height - 0.27) / 0.06,
             0.0,
             1.0,
         )
@@ -1279,9 +1293,9 @@ class CoRLRewards:
             0.0,
             1.0,
         )
-
+        base_height = self.get_body_height()
         height_gate = torch.clamp(
-            (env.root_states[:, 2] - 0.27) / 0.06,
+            (base_height - 0.27) / 0.06,
             0.0,
             1.0,
         )
@@ -1324,9 +1338,9 @@ class CoRLRewards:
             0.0,
             1.0,
         )
-
+        base_height = self.get_body_height()
         height_gate = torch.clamp(
-            (env.root_states[:, 2] - 0.28) / 0.05,
+            (base_height - 0.28) / 0.05,
             0.0,
             1.0,
         )
@@ -1376,10 +1390,10 @@ class CoRLRewards:
             0.0,
             1.0,
         )
-
+        base_height = self.get_body_height()
         # Height gate: active once the robot is raised enough.
         height_score = torch.clamp(
-            (self.env.root_states[:, 2] - 0.22) / 0.10,
+            (base_height - 0.22) / 0.10,
             0.0,
             1.0,
         )
