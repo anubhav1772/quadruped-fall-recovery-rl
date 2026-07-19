@@ -12,6 +12,9 @@ class CoRLRewards:
         self.env = env
 
     def get_body_height(self):
+        """
+        Returns terrain-relative base height.
+        """
         local_terrain_height = self.env._get_local_terrain_height()
         relative_base_height = self.env.root_states[:, 2] - local_terrain_height
         return relative_base_height
@@ -133,98 +136,36 @@ class CoRLRewards:
         return torch.clamp((smooth_support_count - 1.0) / 2.0, 0.0, 1.0)
 
     ######## dense success reward ########
-    # def _reward_recovery_progress(self):
-    #     gz = self.env.projected_gravity[:, 2]
-    #     upright = gz < -0.9
-    #     if self.env.cfg.env.robot == "go1":
-    #         height = self.env.root_states[:, 2] > 0.28
-    #     else:
-    #         height = self.env.root_states[:, 2] > 0.42
-    #     low_vel     = torch.norm(self.env.base_lin_vel[:, :2], dim=1) < 0.3
-    #     low_ang_vel = torch.norm(self.env.base_ang_vel, dim=1) < 1.2
-    #     posture_error = torch.norm(self.env.dof_pos - self.env.default_dof_pos, dim=1)
-    #     good_posture  = posture_error < 2.0
-    #     foot_contacts = (self.env.contact_forces[:, self.env.feet_indices, 2] > 1.0).sum(dim=1)
-    #     stable_contacts = foot_contacts >= 3
-    #     success = upright & height & low_vel & low_ang_vel & good_posture & stable_contacts
-    #     return success.float()
-
-    # def _reward_recovery_progress(self):
-    #     """
-    #     Soft combined recovery-progress reward.
-    #     Rewards the robot only when it is upright, sufficiently raised, and supported by 3-4 feet.
-    #     This is dense shaping, not the final success condition.
-    #     """
-    #     upright = self._upright_progress(self.env.cfg.rewards.upright_sigma_soft)
-    #     height_progress = self._height_progress()
-    #     # foot_contacts = (self.env.contact_forces[:, self.env.feet_indices, 2] > 1.0).sum(dim=1).float()
-    #     # support_progress = torch.clamp(foot_contacts / 4.0, 0.0, 1.0)
-    #     # 0, 1, 2 foot contacts -> 0 reward
-    #     # 3 foot contacts       -> 0.5 reward
-    #     # 4 foot contacts       -> 1.0 reward
-    #     # support_progress = torch.clamp((foot_contacts - 2.0) / 2.0, 0.0, 1.0)
-
-    #     # FINETUNE
-    #     foot_contact = (
-    #         self.env.contact_forces[:, self.env.feet_indices, 2] > self.env.cfg.rewards.recovery_contact_force_threshold
-    #     )
-
-    #     foot_xy_vel = torch.norm(self.env.foot_velocities[:, :, :2], dim=-1)
-
-    #     non_slipping_feet = foot_contact & (
-    #         foot_xy_vel < self.env.cfg.rewards.recovery_foot_slip_vel_threshold
-    #     )
-
-    #     support_progress = torch.clamp(
-    #         (non_slipping_feet.sum(dim=1).float() - 2.0) / 2.0,
-    #         0.0,
-    #         1.0
-    #     )
-    #     return upright * height_progress * support_progress
-    #
-
     def _reward_recovery_progress(self):
         """
         Dense recovery progress reward.
-
-        Rewards upright + height + smooth loaded non-slipping support.
-        Unlike the hard success condition, this gives gradient even when feet are
-        partially loaded or still slipping.
         """
-
         env = self.env
 
-        upright = self._upright_progress(env.cfg.rewards.upright_sigma_soft)
-        # height_progress = self._height_progress()
-        height_progress = self._terminal_height_progress()
+        gz = env.projected_gravity[:, 2]
 
-        # Vertical foot load
-        foot_fz = env.contact_forces[:, env.feet_indices, 2].clamp_min(0.0)
-
-        # Smooth load score.
-        # Tiny contacts get little reward; feet carrying real load get more.
-        load_score = torch.clamp((foot_fz - 3.0) / 20.0, 0.0, 1.0)
-
-        # Horizontal foot speed
-        foot_xy_vel = torch.norm(env.foot_velocities[:, :, :2], dim=-1)
-
-        # Smooth no-slip score.
-        # v = 0.00 -> 1.00
-        # v = 0.10 -> about 0.45
-        # v = 0.20 -> about 0.20
-        no_slip_score = torch.exp(-8.0 * foot_xy_vel)
-
-        # Smooth support score in [0, 4]
-        smooth_support_count = (load_score * no_slip_score).sum(dim=1)
-
-        # Progress toward roughly 3 stable support feet.
-        support_progress = torch.clamp(
-            smooth_support_count / 3.0,
+        # Inverted/back = 0, sideways = 0.5, upright = 1
+        orientation_progress = torch.clamp(
+            (1.0 - gz) * 0.5,
             0.0,
-            1.0
+            1.0,
         )
 
-        return upright * height_progress * support_progress
+        # Soft terrain-relative height progress
+        height_progress = self._height_progress()
+
+        # Smooth loaded and non-slipping foot support
+        support_progress = torch.clamp(
+            self._smooth_support_count() / 3.0,
+            0.0,
+            1.0,
+        )
+
+        return (
+            0.45 * orientation_progress
+            + 0.30 * orientation_progress * height_progress
+            + 0.25 * orientation_progress * height_progress * support_progress
+        )
 
     ######## sparse success reward ########
     # def _reward_recovery_bonus(self):
@@ -765,25 +706,58 @@ class CoRLRewards:
     #     force_norm = torch.norm(forces, dim=-1)
     #     return (force_norm > 0.2).any(dim=1).float()
 
+    # def _reward_base_contact(self):
+    #     # fallen/rolling phase: non-foot contact is expected
+    #     # near-standing phase: non-foot contact is bad
+    #     env = self.env
+
+    #     forces = env.contact_forces[:, env.base_contact_indices, :]
+    #     force_norm = torch.norm(forces, dim=-1)
+    #     nonfoot_contact = (force_norm > 0.2).any(dim=1).float()
+
+    #     upright_gate = torch.clamp(
+    #         (-env.projected_gravity[:, 2] - 0.55) / 0.35,
+    #         0.0,
+    #         1.0
+    #     )
+    #     base_height = self.get_body_height()
+    #     height_gate = torch.clamp(
+    #         (base_height - 0.24) / 0.08,
+    #         0.0,
+    #         1.0
+    #     )
+
+    #     return upright_gate * height_gate * nonfoot_contact
+
     def _reward_base_contact(self):
-        # fallen/rolling phase: non-foot contact is expected
-        # near-standing phase: non-foot contact is bad
         env = self.env
+        cfg = env.cfg.rewards
 
         forces = env.contact_forces[:, env.base_contact_indices, :]
         force_norm = torch.norm(forces, dim=-1)
-        nonfoot_contact = (force_norm > 0.2).any(dim=1).float()
+
+        contact_threshold = getattr(
+            cfg,
+            "recovery_nonfoot_contact_threshold",
+            5.0,
+        )
+
+        nonfoot_contact = (
+            force_norm.max(dim=1).values > contact_threshold
+        ).float()
 
         upright_gate = torch.clamp(
             (-env.projected_gravity[:, 2] - 0.55) / 0.35,
             0.0,
-            1.0
+            1.0,
         )
+
         base_height = self.get_body_height()
+
         height_gate = torch.clamp(
             (base_height - 0.24) / 0.08,
             0.0,
-            1.0
+            1.0,
         )
 
         return upright_gate * height_gate * nonfoot_contact
