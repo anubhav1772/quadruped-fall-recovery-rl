@@ -69,7 +69,7 @@ class BaseCfg(PrefixProto, cli=False):
 
     class env(PrefixProto, cli=False):
         train_recovery = False
-        num_envs = 10
+        num_envs = 4096
         num_observations = 42
         num_scalar_observations = 42
         # if not None a privilige_obs_buf will be returned by step() (critic obs for assymetric training). None is returned otherwise
@@ -400,8 +400,8 @@ class BaseCfg(PrefixProto, cli=False):
         ground_friction_range = [1, 1.0]
         restitution_range = [0, 1.0]
         added_mass_range = [-1., 3.]
-        com_displacement_range = [-0.05, 0.05]
-        com_position_range = [-0.05, 0.05] # [-0.2, 0.2]
+        com_displacement_range = [-0.1, 0.1]
+        com_position_range = [-0.3, 0.3] # [-0.2, 0.2]
         motor_strength_range = [0.9, 1.1]
         motor_offset_range = [-0.05, 0.05]
         Kp_factor_range = [0.8, 1.3]
@@ -481,6 +481,7 @@ class BaseCfg(PrefixProto, cli=False):
             rest_offset = 0.0  # [m]
             bounce_threshold_velocity = 0.5  # 0.5 [m/s]
             max_depenetration_velocity = 1.0
-            max_gpu_contact_pairs = 2 ** 23  # 2**24 -> needed for 8000 envs and more
+            # max_gpu_contact_pairs = 2 ** 23  # 2**24 (needed for 8000 envs and more)
+            max_gpu_contact_pairs = 2 ** 24  # 16,777,216; PhysX requested 12,053,300
             default_buffer_size_multiplier = 5
             contact_collection = 2  # 0: never, 1: last sub-step, 2: all sub-steps (default=2)
