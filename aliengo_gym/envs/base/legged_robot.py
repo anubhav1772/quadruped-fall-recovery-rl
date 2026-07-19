@@ -17,6 +17,7 @@ from aliengo_gym.utils.terrain import Terrain
 # from .fall_recovery_config import FallRecoveryConfig as Cfg
 # from .fall_recovery_config_go1 import FallRecoveryConfig as Cfg
 from .fall_recovery_config_tr import FallRecoveryConfig as Cfg
+from pathlib import Path
 
 
 class LeggedRobot(BaseTask):
@@ -1416,9 +1417,23 @@ class LeggedRobot(BaseTask):
         self.extras["recovery_debug"]["recovery_counter_mean"] = self.recovery_counter.float().mean().item()
         self.extras["recovery_debug"]["recovery_counter_max"] = self.recovery_counter.max().float().item()
 
-        self.extras["recovery_debug"]["curriculum_phase"] = (
-            self.orientation_curriculum_phase + 1
-        )
+        # Orientation is now an evaluation/training bin, not a global
+        # promote/demote curriculum phase.  The only promoted dimension is
+        # terrain difficulty, represented by one frontier per terrain column.
+        if hasattr(self, "terrain_sampling_stage"):
+            stages = self.terrain_sampling_stage.float()
+            self.extras["recovery_debug"]["sampling_stage_mean"] = (
+                stages.mean().item()
+            )
+            self.extras["recovery_debug"]["sampling_stage_bootstrap_frac"] = (
+                (stages == 0).float().mean().item()
+            )
+            self.extras["recovery_debug"]["sampling_stage_developing_frac"] = (
+                (stages == 1).float().mean().item()
+            )
+            self.extras["recovery_debug"]["sampling_stage_mature_frac"] = (
+                (stages == 2).float().mean().item()
+            )
 
         self.extras["recovery_debug"]["recovery_rate_ema"] = (
             self.recovery_rate_ema
@@ -1465,6 +1480,11 @@ class LeggedRobot(BaseTask):
         if self.cfg.env.train_recovery:
             self._update_recovery_curricula(env_ids)
 
+            # Select the terrain level, sampling role, and orientation bin for
+            # the new episode.  This must happen after the old episode outcome
+            # is consumed and before the new root state is initialized.
+            self._sample_recovery_curriculum_tasks(env_ids)
+
         # Reset DOFs
         self._call_train_eval(self._reset_dofs, env_ids)
 
@@ -1476,9 +1496,6 @@ class LeggedRobot(BaseTask):
 
         if self.cfg.env.train_recovery:
             self._call_train_eval(self._reset_root_states_fall_recovery, env_ids)
-
-            # Store the phase actually used for the newly initialized episode.
-            self.episode_orientation_phase[env_ids] = int(self.orientation_curriculum_phase)
         else:
             self._call_train_eval(self._reset_root_states, env_ids)
 
@@ -2908,15 +2925,24 @@ class LeggedRobot(BaseTask):
         self.root_states[env_ids, 0:2] = self.env_origins[env_ids, 0:2]
 
         # ------------------------------------------------------------
-        # Sample candidate orientations
+        # Sample candidate orientations for the episode's fixed bin.
+        # A normalized Gaussian quaternion is uniform on SO(3); sampling
+        # roll/pitch/yaw independently would bias the orientation density.
         # ------------------------------------------------------------
-        roll = (2.0 * torch.rand(num_resets, device=self.device) - 1.0) * torch.pi
-        pitch = (2.0 * torch.rand(num_resets, device=self.device) - 1.0) * torch.pi
-        yaw = (2.0 * torch.rand(num_resets, device=self.device) - 1.0) * torch.pi
-        quat = quat_from_euler_xyz(roll, pitch, yaw)
+        orientation_bins = self.episode_orientation_bin[env_ids]
+        quat = torch.randn(
+            num_resets,
+            4,
+            device=self.device,
+            dtype=self.root_states.dtype,
+        )
+        quat = quat / torch.norm(quat, dim=1, keepdim=True).clamp_min(1e-8)
         gravity = self.gravity_vec[env_ids]
         projected_gravity = quat_rotate_inverse(quat, gravity)
-        reject = self._get_orientation_rejection_mask(projected_gravity[:, 2])
+        reject = self._get_orientation_rejection_mask(
+            projected_gravity[:, 2],
+            orientation_bins,
+        )
 
         # ------------------------------------------------------------
         # Rejection sampling
@@ -2929,28 +2955,46 @@ class LeggedRobot(BaseTask):
 
             idx = reject.nonzero(as_tuple=False).flatten()
             count = idx.numel()
-            roll[idx] = (2.0 * torch.rand(count, device=self.device)- 1.0) * torch.pi
-            pitch[idx] = (2.0 * torch.rand(count, device=self.device) - 1.0) * torch.pi
-            yaw[idx] = (2.0 * torch.rand(count, device=self.device) - 1.0) * torch.pi
-            quat[idx] = quat_from_euler_xyz(roll[idx], pitch[idx], yaw[idx])
+            new_quat = torch.randn(
+                count,
+                4,
+                device=self.device,
+                dtype=self.root_states.dtype,
+            )
+            new_quat = new_quat / torch.norm(
+                new_quat,
+                dim=1,
+                keepdim=True,
+            ).clamp_min(1e-8)
+            quat[idx] = new_quat
             projected_gravity[idx] = quat_rotate_inverse(quat[idx], gravity[idx])
-            reject = self._get_orientation_rejection_mask(projected_gravity[:, 2])
+            reject = self._get_orientation_rejection_mask(
+                projected_gravity[:, 2],
+                orientation_bins,
+            )
 
         # ------------------------------------------------------------
         # Deterministic fallback
         # ------------------------------------------------------------
         if reject.any():
             idx = reject.nonzero(as_tuple=False).flatten()
-
-            if int(self.orientation_curriculum_phase) == 0:
-                # Inverted.
-                roll[idx] = torch.pi
-            else:
-                # Sideways; accepted by phases 1 and 2.
-                roll[idx] = 0.5 * torch.pi
-
-            pitch[idx] = 0.0
-            quat[idx] = quat_from_euler_xyz(roll[idx], pitch[idx], yaw[idx])
+            # Interior gravity-z targets for bins 0..3.  With pitch=0,
+            # projected gravity z is -cos(roll).
+            fallback_gz = torch.tensor(
+                [0.85, 0.45, 0.0, -0.50],
+                device=self.device,
+                dtype=self.root_states.dtype,
+            )[orientation_bins[idx]]
+            fallback_roll = torch.acos(torch.clamp(-fallback_gz, -1.0, 1.0))
+            fallback_pitch = torch.zeros_like(fallback_roll)
+            fallback_yaw = (
+                2.0 * torch.rand(idx.numel(), device=self.device) - 1.0
+            ) * torch.pi
+            quat[idx] = quat_from_euler_xyz(
+                fallback_roll,
+                fallback_pitch,
+                fallback_yaw,
+            )
 
         # Store the selected orientation before height sampling.
         self.root_states[env_ids, 3:7] = quat
@@ -3036,17 +3080,12 @@ class LeggedRobot(BaseTask):
         # ------------------------------------------------------------
         sampled_gravity = quat_rotate_inverse(quat, gravity)
         gravity_z = sampled_gravity[:, 2]
-        sideways_fraction = ((gravity_z > -0.7) & (gravity_z < 0.3)).float().mean().item()
-        inverted_fraction = (gravity_z >= 0.3).float().mean().item()
-        upright_fraction = (gravity_z < -0.7).float().mean().item()
-
         if self.common_step_counter % 1000 == 0:
+            bin_counts = torch.bincount(orientation_bins, minlength=4).float()
+            bin_fractions = bin_counts / float(max(num_resets, 1))
             print(
                 "[RESET ORIENTATION]",
-                f"phase={int(self.orientation_curriculum_phase) + 1}",
-                f"| upright={upright_fraction:.2f}",
-                f"| sideways={sideways_fraction:.2f}",
-                f"| inverted={inverted_fraction:.2f}",
+                f"bin fractions={bin_fractions.detach().cpu().tolist()}",
                 f"| gz min={gravity_z.min().item():.3f}",
                 f"mean={gravity_z.mean().item():.3f}",
                 f"max={gravity_z.max().item():.3f}",
@@ -3813,22 +3852,30 @@ class LeggedRobot(BaseTask):
             self.recovery_rate_ema = 0.0
             self.recovery_ema_initialized = False
 
-            # Fixed-window episode accumulator.
-            self.orientation_success_sum = 0.0
-            self.orientation_episode_count = 0
-            self.orientation_last_window_rate = 0.0
-
-            # 0 = strongly inverted/supine
-            # 1 = broad non-upright distribution
-            # 2 = sideways/partial-fall distribution
-            self.orientation_curriculum_phase = 0
-
-            # Records the orientation phase used at the beginning of
-            # each environment's current episode.
-            self.episode_orientation_phase = torch.zeros(
+            # Orientation is categorical and is sampled uniformly on every
+            # episode.  It is not promoted or demoted.
+            #   0 = strongly inverted, 1 = partially inverted,
+            #   2 = sideways,          3 = near-upright fallen.
+            self.episode_orientation_bin = torch.zeros(
                 self.num_envs,
                 device=self.device,
                 dtype=torch.long,
+            )
+
+            # Backward-compatible dashboard alias.  No code should interpret
+            # this value as a global curriculum phase anymore.
+            self.episode_orientation_phase = self.episode_orientation_bin
+
+            # Exact task labels captured at episode initialization.  These
+            # prevent stale episodes from voting after a frontier promotion.
+            self.episode_terrain_type = torch.full(
+                (self.num_envs,), -1, device=self.device, dtype=torch.long
+            )
+            self.episode_terrain_level = torch.full(
+                (self.num_envs,), -1, device=self.device, dtype=torch.long
+            )
+            self.episode_sampler_group = torch.full(
+                (self.num_envs,), -1, device=self.device, dtype=torch.long
             )
 
             # Maximum persistence counter reached during rollout
@@ -3988,10 +4035,99 @@ class LeggedRobot(BaseTask):
         # )
         # self.smoothed_torques = torch.zeros_like(self.torques)
 
-        # Curriculum buffers
-        # Accumulate outcomes at the environment’s current terrain level
+        # Legacy per-environment counters retained for old dashboards.  The
+        # active curriculum uses cell and frontier statistics initialized
+        # below, not these counters.
         self.terrain_curriculum_successes = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
         self.terrain_curriculum_trials = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+
+        if self.cfg.env.train_recovery:
+            self._init_recovery_curriculum_buffers()
+
+    def _init_recovery_curriculum_buffers(self):
+        """Initialize the terrain-frontier x orientation-bin task grid."""
+
+        terrain_cfg = self.cfg.terrain
+        num_types = int(terrain_cfg.num_cols)
+        num_levels = int(terrain_cfg.num_rows)
+        num_bins = 4
+
+        configured_max = int(getattr(
+            terrain_cfg,
+            "curriculum_max_level",
+            num_levels - 1,
+        ))
+        self.recovery_curriculum_max_level = max(
+            0,
+            min(configured_max, num_levels - 1),
+        )
+        start_level = int(getattr(terrain_cfg, "recovery_start_level", 0))
+        start_level = max(0, min(start_level, self.recovery_curriculum_max_level))
+
+        # One promoted frontier per physical terrain column.  Columns can map
+        # to repeated semantic terrain families; keeping separate frontiers
+        # also captures realization-specific difficulty.
+        self.terrain_frontier = torch.full(
+            (num_types,),
+            start_level,
+            device=self.device,
+            dtype=torch.long,
+        )
+
+        # Competence statistics for every (column, level, orientation-bin)
+        # cell.  All sampler groups update these diagnostic statistics.
+        grid_shape = (num_types, num_levels, num_bins)
+        self.recovery_cell_success_ema = torch.zeros(
+            grid_shape, device=self.device, dtype=torch.float
+        )
+        self.recovery_cell_trials = torch.zeros(
+            grid_shape, device=self.device, dtype=torch.long
+        )
+
+        # Only current-frontier episodes from sampler group 0 contribute to
+        # these promotion windows.
+        self.frontier_window_successes = torch.zeros(
+            (num_types, num_bins), device=self.device, dtype=torch.float
+        )
+        self.frontier_window_trials = torch.zeros(
+            (num_types, num_bins), device=self.device, dtype=torch.long
+        )
+        self.frontier_pass_windows = torch.zeros(
+            num_types, device=self.device, dtype=torch.long
+        )
+        self.frontier_last_mean_success = torch.zeros(
+            num_types, device=self.device, dtype=torch.float
+        )
+        self.frontier_last_lower_quartile = torch.zeros(
+            num_types, device=self.device, dtype=torch.float
+        )
+        self.frontier_review_count = torch.zeros(
+            num_types, device=self.device, dtype=torch.long
+        )
+
+        # One sampling stage per physical terrain column:
+        # 0 = bootstrap, 1 = developing, 2 = mature.
+        self.terrain_sampling_stage = torch.zeros(
+            num_types,
+            device=self.device,
+            dtype=torch.long,
+        )
+        self.recovery_total_promotions = 0
+
+        # Training starts at the configured easy level.  Terrain columns stay
+        # fixed; only the row/level is resampled at episode boundaries.
+        if self.custom_origins and self.num_train_envs > 0:
+            train_ids = torch.arange(
+                self.num_train_envs,
+                device=self.device,
+                dtype=torch.long,
+            )
+            train_types = self.terrain_types[train_ids]
+            self.terrain_levels[train_ids] = self.terrain_frontier[train_types]
+            self.env_origins[train_ids] = terrain_cfg.terrain_origins[
+                self.terrain_levels[train_ids],
+                train_types,
+            ]
 
     def _init_custom_buffers__(self):
         # domain randomization properties
@@ -4134,68 +4270,237 @@ class LeggedRobot(BaseTask):
         for curriculum in self.curricula:
             curriculum.set_to(low=low, high=high)
 
-    def _update_recovery_terrain_curriculum(self, ids, success):
+    def _get_recovery_sampling_probabilities(self, terrain_types):
         """
-        Update each environment's terrain row independently.
+        Return per-environment sampling probabilities.
 
-        Terrain column/type remains fixed.
+        Every physical terrain column owns an independent sampling stage.
+        Environments assigned to different columns can therefore use different
+        frontier/replay/next/coverage mixtures in the same reset batch.
         """
 
         cfg = self.cfg.terrain
+        terrain_types = terrain_types.to(device=self.device, dtype=torch.long)
 
-        if not getattr(cfg, "recovery_curriculum", False):
+        if terrain_types.numel() == 0:
+            empty = torch.zeros(0, device=self.device, dtype=torch.float)
+            return empty, empty, empty, empty
+
+        if (
+            (terrain_types < 0).any()
+            or (terrain_types >= self.terrain_sampling_stage.numel()).any()
+        ):
+            raise ValueError("terrain type is outside the configured column range")
+
+        # ------------------------------------------------------------
+        # Update each column's stage independently and monotonically.
+        # ------------------------------------------------------------
+        reviewed = self.frontier_review_count > 0
+        bootstrap_threshold = float(getattr(
+            cfg,
+            "bootstrap_success_threshold",
+            0.60,
+        ))
+
+        developing = (
+            reviewed
+            & (self.frontier_last_mean_success >= bootstrap_threshold)
+        )
+        self.terrain_sampling_stage[developing] = torch.maximum(
+            self.terrain_sampling_stage[developing],
+            torch.ones_like(self.terrain_sampling_stage[developing]),
+        )
+
+        mature_level = int(getattr(cfg, "mature_frontier_level", 3))
+        mature = self.terrain_frontier >= mature_level
+        self.terrain_sampling_stage[mature] = 2
+
+        env_stages = self.terrain_sampling_stage[terrain_types]
+
+        developing_probabilities = torch.tensor(
+            [
+                float(getattr(cfg, "developing_frontier_fraction", 0.75)),
+                float(getattr(cfg, "developing_replay_fraction", 0.15)),
+                float(getattr(cfg, "developing_next_fraction", 0.10)),
+                float(getattr(cfg, "developing_coverage_fraction", 0.00)),
+            ],
+            device=self.device,
+            dtype=torch.float,
+        )
+        mature_probabilities = torch.tensor(
+            [
+                float(getattr(cfg, "mature_frontier_fraction", 0.60)),
+                float(getattr(cfg, "mature_replay_fraction", 0.25)),
+                float(getattr(cfg, "mature_next_fraction", 0.10)),
+                float(getattr(cfg, "mature_coverage_fraction", 0.05)),
+            ],
+            device=self.device,
+            dtype=torch.float,
+        )
+        bootstrap_probabilities = torch.tensor(
+            [1.0, 0.0, 0.0, 0.0],
+            device=self.device,
+            dtype=torch.float,
+        )
+
+        configured_probabilities = torch.stack(
+            (
+                bootstrap_probabilities,
+                developing_probabilities,
+                mature_probabilities,
+            ),
+            dim=0,
+        )
+
+        if (configured_probabilities < 0.0).any():
+            raise ValueError(
+                "Recovery curriculum sampling weights must be nonnegative"
+            )
+
+        totals = configured_probabilities.sum(dim=1, keepdim=True)
+        if (totals <= 0.0).any():
+            raise ValueError(
+                "Every recovery sampling stage must have positive total weight"
+            )
+
+        configured_probabilities = configured_probabilities / totals
+        env_probabilities = configured_probabilities[env_stages]
+
+        return (
+            env_probabilities[:, 0],
+            env_probabilities[:, 1],
+            env_probabilities[:, 2],
+            env_probabilities[:, 3],
+        )
+
+    def _sample_recovery_curriculum_tasks(self, env_ids):
+        """
+        Assign the next task independently at every episode reset.
+
+        Sampler groups:
+            0 frontier: current promoted level; eligible to vote.
+            1 replay:   a strictly lower mastered level (or zero).
+            2 next:     one level above the frontier, clipped at max.
+            3 coverage: any terrain level, used only after maturation.
+
+        Orientation bin is always uniform over 0..3 and never promoted.
+        """
+
+        if len(env_ids) == 0:
             return
 
-        if not cfg.curriculum or not self.custom_origins:
+        env_ids = env_ids.to(device=self.device, dtype=torch.long)
+
+        # Both training and evaluation resets receive a categorical fallen
+        # orientation.  Only training environments participate in terrain
+        # frontier sampling and statistics.
+        self.episode_orientation_bin[env_ids] = torch.randint(
+            0,
+            4,
+            (env_ids.numel(),),
+            device=self.device,
+        )
+
+        train_ids = env_ids[env_ids < self.num_train_envs]
+        if train_ids.numel() == 0:
             return
 
-        if ids.numel() == 0:
-            return
+        terrain_types = self.terrain_types[train_ids]
+        levels = self.terrain_levels[train_ids].clone()
+        groups = torch.zeros_like(train_ids)
 
-        self.terrain_curriculum_successes[ids] += success.float()
-        self.terrain_curriculum_trials[ids] += 1
+        cfg = self.cfg.terrain
+        curriculum_enabled = (
+            bool(getattr(cfg, "recovery_curriculum", False))
+            and bool(cfg.curriculum)
+            and bool(self.custom_origins)
+        )
 
-        trials = self.terrain_curriculum_trials[ids]
-        successes = self.terrain_curriculum_successes[ids]
+        if curriculum_enabled:
+            frontier = self.terrain_frontier[terrain_types]
+            p_frontier, p_replay, p_next, p_coverage = (
+                self._get_recovery_sampling_probabilities(terrain_types)
+            )
+            u = torch.rand(train_ids.numel(), device=self.device)
 
-        success_rate = successes / trials.float().clamp_min(1.0)
+            replay_group = (u >= p_frontier) & (u < p_frontier + p_replay)
+            next_group = (
+                (u >= p_frontier + p_replay)
+                & (u < p_frontier + p_replay + p_next)
+            )
+            coverage_group = (
+                (u >= p_frontier + p_replay + p_next)
+                & (p_coverage > 0.0)
+            )
 
-        window = int(cfg.curriculum_window)
-        ready = trials >= window
+            groups[replay_group] = 1
+            groups[next_group] = 2
+            groups[coverage_group] = 3
 
-        promote = ready & (success_rate >= float(cfg.curriculum_promote_threshold))
-        demote = ready & (success_rate <= float(cfg.curriculum_demote_threshold))
-        old_levels = self.terrain_levels[ids].clone()
-        level_delta = promote.long() * int(cfg.curriculum_promote_step) - demote.long() * int(cfg.curriculum_demote_step)
-        max_level = min(int(cfg.curriculum_max_level), int(cfg.num_rows) - 1)
-        new_levels = torch.clamp(old_levels + level_delta, min=int(cfg.curriculum_min_level), max=max_level)
-        self.terrain_levels[ids] = new_levels
+            # Frontier group is the default.
+            levels = frontier.clone()
 
-        changed = new_levels != old_levels
-        changed_ids = ids[changed]
+            # Strictly lower replay when possible.  At frontier zero this
+            # correctly degenerates to level zero.
+            if replay_group.any():
+                replay_frontier = frontier[replay_group]
+                replay_levels = torch.floor(
+                    torch.rand(replay_frontier.numel(), device=self.device)
+                    * replay_frontier.clamp_min(1).float()
+                ).long()
+                levels[replay_group] = replay_levels
 
-        if changed_ids.numel() > 0:
-            self.env_origins[changed_ids] = cfg.terrain_origins[self.terrain_levels[changed_ids], self.terrain_types[changed_ids]]
+            if next_group.any():
+                levels[next_group] = torch.clamp(
+                    frontier[next_group] + 1,
+                    max=self.recovery_curriculum_max_level,
+                )
 
-        # Every completed terrain-evaluation window starts fresh,
-        # regardless of whether it resulted in promotion, demotion,
-        # or no level change.
-        reviewed_ids = ids[ready]
-        self.terrain_curriculum_successes[reviewed_ids] = 0.0
-        self.terrain_curriculum_trials[reviewed_ids] = 0
+            if coverage_group.any():
+                levels[coverage_group] = torch.randint(
+                    0,
+                    self.recovery_curriculum_max_level + 1,
+                    (int(coverage_group.sum().item()),),
+                    device=self.device,
+                )
+
+            self.terrain_levels[train_ids] = levels
+            self.env_origins[train_ids] = cfg.terrain_origins[
+                levels,
+                terrain_types,
+            ]
+
+        # Store exactly what this episode received.  Outcome accounting reads
+        # these labels instead of mutable global/current curriculum state.
+        self.episode_terrain_type[train_ids] = terrain_types
+        self.episode_terrain_level[train_ids] = levels
+        self.episode_sampler_group[train_ids] = groups
 
         tracking = self.extras.setdefault("recovery_tracking", {})
+        env_stages = self.terrain_sampling_stage[terrain_types]
+        tracking["sampling_stage_bootstrap_frac"] = (
+            (env_stages == 0).float().mean().item()
+        )
+        tracking["sampling_stage_developing_frac"] = (
+            (env_stages == 1).float().mean().item()
+        )
+        tracking["sampling_stage_mature_frac"] = (
+            (env_stages == 2).float().mean().item()
+        )
+        tracking["sample_frontier_frac"] = (groups == 0).float().mean().item()
+        tracking["sample_replay_frac"] = (groups == 1).float().mean().item()
+        tracking["sample_next_frac"] = (groups == 2).float().mean().item()
+        tracking["sample_coverage_frac"] = (groups == 3).float().mean().item()
 
-        train_levels = self.terrain_levels[:self.num_train_envs].float()
+    def _update_recovery_terrain_curriculum(self, ids, success):
+        """
+        Deprecated compatibility hook.
 
-        tracking["terrain_level_mean"] = train_levels.mean().item()
-        tracking["terrain_level_min"] = train_levels.min().item()
-        tracking["terrain_level_max"] = train_levels.max().item()
-        tracking["terrain_promote_frac"] = promote.float().mean().item()
-        tracking["terrain_demote_frac"] = demote.float().mean().item()
-
-        if ready.any():
-            tracking["terrain_window_success_rate"] = success_rate[ready].mean().item()
+        Terrain updates are now performed by _update_recovery_curricula using
+        balanced four-bin frontier windows.  In particular, failure never
+        demotes a terrain level.
+        """
+        return
 
     def _prepare_reward_function(self):
         """ Prepares a list of reward functions, whcih will be called to compute the total reward.
@@ -4874,135 +5179,45 @@ class LeggedRobot(BaseTask):
 
     def _update_recovery_orientation_curriculum(self, episode_success):
         """
-        Update the global orientation curriculum from a fixed
-        window of completed training episodes.
+        Deprecated compatibility hook.
 
-        Returns:
-            bool:
-                True when the orientation phase changed.
+        Orientation is now sampled uniformly as four fixed bins.  Keeping this
+        no-op prevents an old external caller from reintroducing coupling with
+        terrain promotion.
         """
-
-        cfg = self.cfg.terrain
-
-        if not getattr(cfg, "orientation_curriculum", True):
-            return False
-
-        if episode_success.numel() == 0:
-            return False
-
-        # Count episodes, not reset batches.
-        self.orientation_success_sum += (episode_success.float().sum().item())
-
-        self.orientation_episode_count += int(episode_success.numel())
-
-        update_window = int(cfg.orientation_update_window)
-
-        if self.orientation_episode_count < update_window:
-            return False
-
-        # Use every accumulated episode with equal weight.
-        window_rate = (self.orientation_success_sum / max(self.orientation_episode_count, 1))
-
-        self.orientation_last_window_rate = window_rate
-
-        self.orientation_success_sum = 0.0
-        self.orientation_episode_count = 0
-
-        alpha = float(cfg.orientation_ema_alpha)
-
-        if not self.recovery_ema_initialized:
-            self.recovery_rate_ema = window_rate
-            self.recovery_ema_initialized = True
-        else:
-            self.recovery_rate_ema = (
-                (1.0 - alpha) * self.recovery_rate_ema
-                + alpha * window_rate
-            )
-
-        old_phase = int(self.orientation_curriculum_phase)
-        new_phase = old_phase
-
-        ema = float(self.recovery_rate_ema)
-
-        # ------------------------------------------------------------
-        # Hysteretic orientation transitions
-        # ------------------------------------------------------------
-
-        if old_phase == 0:
-            if ema >= float(cfg.orientation_phase_1_enter):
-                new_phase = 1
-
-        elif old_phase == 1:
-            if ema >= float(cfg.orientation_phase_2_enter):
-                new_phase = 2
-            elif ema < float(cfg.orientation_phase_1_exit):
-                new_phase = 0
-
-        else:
-            if ema < float(cfg.orientation_phase_2_exit):
-                new_phase = 1
-
-        phase_changed = new_phase != old_phase
-
-        self.orientation_curriculum_phase = new_phase
-
-        tracking = self.extras.setdefault("recovery_tracking", {})
-
-        tracking["orientation_window_rate"] = window_rate
-        tracking["orientation_recovery_ema"] = ema
-        tracking["orientation_phase"] = new_phase + 1
-        tracking["orientation_window_episodes"] = update_window
-
-        if phase_changed:
-            print(
-                "[ORIENTATION CURRICULUM]",
-                f"phase {old_phase + 1} -> {new_phase + 1}",
-                f"| window rate={window_rate:.3f}",
-                f"| EMA={ema:.3f}",
-            )
-
-            # The old EMA describes performance under the old
-            # orientation distribution. Require fresh evidence under
-            # the newly selected phase before another phase transition.
-            self.recovery_rate_ema = 0.0
-            self.recovery_ema_initialized = False
-
-        return phase_changed
+        return False
 
     def _collect_recovery_episode_outcomes(self, env_ids):
         """
-        Obtain final outcomes for completed training episodes.
+        Obtain final binary outcomes and immutable task labels.
 
-        Returns:
-            ids:
-                Training environment IDs with genuine completed episodes.
-
-            success:
-                Boolean final episodic success values.
-
-            episode_phases:
-                Orientation phase under which each episode began.
+        Terminal/near-stand reset episodes are deliberately excluded: they are
+        useful for stabilizer training but are not fall-recovery evidence.
         """
+
+        def empty_result(ids):
+            empty_bool = torch.zeros(0, dtype=torch.bool, device=self.device)
+            empty_long = torch.zeros(0, dtype=torch.long, device=self.device)
+            return (
+                ids,
+                empty_bool,
+                empty_long,
+                empty_long,
+                empty_long,
+                empty_long,
+            )
 
         train_ids = env_ids[env_ids < self.num_train_envs]
 
         if train_ids.numel() == 0:
-            return (
-                train_ids,
-                torch.zeros(0, dtype=torch.bool, device=self.device),
-                torch.zeros(0, dtype=torch.long, device=self.device),
-            )
+            return empty_result(train_ids)
 
         # Exclude the artificial reset performed during env.reset().
         valid_episode = self.episode_length_buf[train_ids] > 0
         train_ids = train_ids[valid_episode]
 
         if train_ids.numel() == 0:
-            return (
-                train_ids,
-                torch.zeros(0, dtype=torch.bool, device=self.device),
-                torch.zeros(0, dtype=torch.long, device=self.device),
-            )
+            return empty_result(train_ids)
 
         success_reset = self.success_reset_buf[train_ids].bool()
         timeout = self.time_out_buf[train_ids].bool()
@@ -5014,11 +5229,14 @@ class LeggedRobot(BaseTask):
         ids = train_ids[completed]
 
         if ids.numel() == 0:
-            return (
-                ids,
-                torch.zeros(0, dtype=torch.bool, device=self.device),
-                torch.zeros(0, dtype=torch.long, device=self.device),
-            )
+            return empty_result(ids)
+
+        # reset_source describes how the current (ending) episode began.
+        # Only source 0 is a genuine fallen-state recovery task.
+        ids = ids[self.reset_source[ids] == 0]
+
+        if ids.numel() == 0:
+            return empty_result(ids)
 
         bad_state = self.bad_state_buf[ids].bool()
 
@@ -5044,86 +5262,260 @@ class LeggedRobot(BaseTask):
                 & (~bad_state)
             )
 
-        episode_phases = self.episode_orientation_phase[ids]
-
-        return ids, success, episode_phases
+        return (
+            ids,
+            success,
+            self.episode_terrain_type[ids],
+            self.episode_terrain_level[ids],
+            self.episode_orientation_bin[ids],
+            self.episode_sampler_group[ids],
+        )
 
     def _update_recovery_curricula(self, env_ids):
         """
-        Update independent curricula from the same completed
-        episodic outcomes.
+        Update the joint task grid and promote terrain frontiers.
 
-        Local controller:
-            per-environment terrain level.
-
-        Global controller:
-            shared fallen-orientation phase.
+        All genuine fallen episodes update competence diagnostics.  Only an
+        episode sampled from group 0 at the column's *current* frontier is
+        eligible to vote on promotion.  Therefore stale episodes, replay,
+        next-level probes, and coverage samples cannot accidentally promote or
+        demote the terrain curriculum.
         """
 
-        ids, success, episode_phases = self._collect_recovery_episode_outcomes(env_ids)
-
+        (
+            ids,
+            success,
+            terrain_types,
+            terrain_levels,
+            orientation_bins,
+            sampler_groups,
+        ) = self._collect_recovery_episode_outcomes(env_ids)
 
         if ids.numel() == 0:
             return
 
-        phase_before_update = int(self.orientation_curriculum_phase)
+        cfg = self.cfg.terrain
+        num_types = int(cfg.num_cols)
+        num_levels = int(cfg.num_rows)
+        num_bins = 4
 
-        # Ignore stale episodes that began under an older orientation
-        # phase and completed after a global phase transition.
-        current_phase_mask = episode_phases == phase_before_update
-        current_ids = ids[current_phase_mask]
-        current_success = success[current_phase_mask]
+        valid_labels = (
+            (terrain_types >= 0)
+            & (terrain_types < num_types)
+            & (terrain_levels >= 0)
+            & (terrain_levels < num_levels)
+            & (orientation_bins >= 0)
+            & (orientation_bins < num_bins)
+        )
 
-        if current_ids.numel() == 0:
+        if not valid_labels.all():
+            ids = ids[valid_labels]
+            success = success[valid_labels]
+            terrain_types = terrain_types[valid_labels]
+            terrain_levels = terrain_levels[valid_labels]
+            orientation_bins = orientation_bins[valid_labels]
+            sampler_groups = sampler_groups[valid_labels]
+
+        if ids.numel() == 0:
+            return
+
+        # Global fallen-episode EMA is logging only; it does not control either
+        # task dimension and therefore cannot couple the curricula.
+        batch_recovery_rate = success.float().mean().item()
+        global_ema_alpha = float(getattr(
+            cfg,
+            "recovery_rate_ema_alpha",
+            0.10,
+        ))
+        if not self.recovery_ema_initialized:
+            self.recovery_rate_ema = batch_recovery_rate
+            self.recovery_ema_initialized = True
+        else:
+            self.recovery_rate_ema = (
+                (1.0 - global_ema_alpha) * self.recovery_rate_ema
+                + global_ema_alpha * batch_recovery_rate
+            )
+
+        # ------------------------------------------------------------
+        # Cell competence statistics: all sampling groups contribute.
+        # ------------------------------------------------------------
+        flat_cell = (
+            (terrain_types * num_levels + terrain_levels) * num_bins
+            + orientation_bins
+        )
+        cell_count = torch.bincount(
+            flat_cell,
+            minlength=num_types * num_levels * num_bins,
+        )
+        cell_success = torch.bincount(
+            flat_cell,
+            weights=success.float(),
+            minlength=num_types * num_levels * num_bins,
+        )
+        active_cells = cell_count > 0
+
+        flat_trials = self.recovery_cell_trials.view(-1)
+        flat_ema = self.recovery_cell_success_ema.view(-1)
+        batch_rate = cell_success[active_cells] / cell_count[active_cells].float()
+        old_trials = flat_trials[active_cells]
+        alpha = float(getattr(cfg, "cell_success_ema_alpha", 0.10))
+        old_ema = flat_ema[active_cells]
+        updated_ema = (1.0 - alpha) * old_ema + alpha * batch_rate
+        updated_ema = torch.where(old_trials == 0, batch_rate, updated_ema)
+        flat_ema[active_cells] = updated_ema
+        flat_trials += cell_count.long()
+
+        curriculum_enabled = (
+            bool(getattr(cfg, "recovery_curriculum", False))
+            and bool(cfg.curriculum)
+            and bool(self.custom_origins)
+        )
+        if not curriculum_enabled:
             return
 
         # ------------------------------------------------------------
-        # Local controller first
+        # Promotion evidence: frontier group + non-stale frontier only.
         # ------------------------------------------------------------
-        self._update_recovery_terrain_curriculum(ids=current_ids, success=current_success)
+        current_frontier = self.terrain_frontier[terrain_types]
+        vote = (
+            (sampler_groups == 0)
+            & (terrain_levels == current_frontier)
+        )
 
-        # ------------------------------------------------------------
-        # Global controller second
-        # ------------------------------------------------------------
-        phase_changed = self._update_recovery_orientation_curriculum(episode_success=current_success)
+        if vote.any():
+            vote_key = terrain_types[vote] * num_bins + orientation_bins[vote]
+            vote_count = torch.bincount(
+                vote_key,
+                minlength=num_types * num_bins,
+            ).view(num_types, num_bins)
+            vote_success = torch.bincount(
+                vote_key,
+                weights=success[vote].float(),
+                minlength=num_types * num_bins,
+            ).view(num_types, num_bins)
+            self.frontier_window_trials += vote_count.long()
+            self.frontier_window_successes += vote_success
 
-        if phase_changed and getattr(self.cfg.terrain, "reset_terrain_windows_on_orientation_change", True):
-            # Keep terrain levels unchanged.
-            # Clear only partial evidence collected under the previous
-            # orientation distribution.
-            self.terrain_curriculum_successes[:self.num_train_envs] = 0.0
-            self.terrain_curriculum_trials[:self.num_train_envs] = 0
+        min_trials = max(
+            1,
+            int(getattr(cfg, "frontier_min_trials_per_bin", 64)),
+        )
+        ready = (self.frontier_window_trials >= min_trials).all(dim=1)
+        ready_types = ready.nonzero(as_tuple=False).flatten()
 
-    def _get_orientation_rejection_mask(self, gravity_z):
+        if ready_types.numel() == 0:
+            return
+
+        rates = (
+            self.frontier_window_successes[ready_types]
+            / self.frontier_window_trials[ready_types].float().clamp_min(1.0)
+        )
+        mean_rate = rates.mean(dim=1)
+        # There are exactly four bins, so the lower empirical quartile with
+        # "lower" interpolation is the worst bin.  This prevents three easy
+        # orientations from hiding failure in the fourth.
+        lower_quartile = torch.sort(rates, dim=1).values[:, 0]
+
+        self.frontier_last_mean_success[ready_types] = mean_rate
+        self.frontier_last_lower_quartile[ready_types] = lower_quartile
+        self.frontier_review_count[ready_types] += 1
+
+        mean_threshold = float(getattr(
+            cfg,
+            "frontier_mean_promote_threshold",
+            0.80,
+        ))
+        quartile_threshold = float(getattr(
+            cfg,
+            "frontier_lower_quartile_threshold",
+            0.70,
+        ))
+        passed = (
+            (mean_rate >= mean_threshold)
+            & (lower_quartile >= quartile_threshold)
+        )
+
+        self.frontier_pass_windows[ready_types] = torch.where(
+            passed,
+            self.frontier_pass_windows[ready_types] + 1,
+            torch.zeros_like(self.frontier_pass_windows[ready_types]),
+        )
+
+        required_windows = max(
+            1,
+            int(getattr(cfg, "frontier_required_windows", 2)),
+        )
+        promotable = (
+            self.frontier_pass_windows[ready_types] >= required_windows
+        ) & (
+            self.terrain_frontier[ready_types]
+            < self.recovery_curriculum_max_level
+        )
+        promoted_types = ready_types[promotable]
+
+        if promoted_types.numel() > 0:
+            old_levels = self.terrain_frontier[promoted_types].clone()
+            self.terrain_frontier[promoted_types] += 1
+            self.frontier_pass_windows[promoted_types] = 0
+            self.recovery_total_promotions += int(promoted_types.numel())
+            print(
+                "[RECOVERY TERRAIN FRONTIER]",
+                f"columns={promoted_types.detach().cpu().tolist()}",
+                f"levels={old_levels.detach().cpu().tolist()} -> "
+                f"{self.terrain_frontier[promoted_types].detach().cpu().tolist()}",
+            )
+
+        # Each reviewed column starts a fresh, balanced four-bin window.
+        self.frontier_window_successes[ready_types] = 0.0
+        self.frontier_window_trials[ready_types] = 0
+
+        tracking = self.extras.setdefault("recovery_tracking", {})
+        tracking["fallen_episode_success_ema"] = float(self.recovery_rate_ema)
+        tracking["frontier_level_mean"] = self.terrain_frontier.float().mean().item()
+        tracking["frontier_level_min"] = self.terrain_frontier.min().item()
+        tracking["frontier_level_max"] = self.terrain_frontier.max().item()
+        tracking["frontier_review_mean_success"] = mean_rate.mean().item()
+        tracking["frontier_review_lower_quartile"] = lower_quartile.mean().item()
+        tracking["frontier_promotions_total"] = int(self.recovery_total_promotions)
+        for bin_index in range(num_bins):
+            tracking[f"frontier_bin_{bin_index}_success"] = (
+                rates[:, bin_index].mean().item()
+            )
+
+    def _get_orientation_rejection_mask(self, gravity_z, orientation_bins):
         """
-        Return True for sampled orientations that should be rejected.
+        Return True when a candidate is outside its requested fallen bin.
 
         projected-gravity interpretation:
             upright:  gravity_z ~= -1
             sideways: gravity_z ~=  0
             inverted: gravity_z ~= +1
+
+        Bins:
+            0 strongly inverted:    [ 0.70,  1.00]
+            1 partially inverted:   [ 0.20,  0.70)
+            2 sideways:             [-0.20,  0.20)
+            3 near-upright fallen:  [-0.80, -0.20)
         """
 
-        phase = int(self.orientation_curriculum_phase)
+        if gravity_z.shape != orientation_bins.shape:
+            raise ValueError("gravity_z and orientation_bins must have equal shape")
 
-        if phase == 0:
-            # Accept strongly inverted orientations:
-            # gravity_z >= 0.30
-            return gravity_z < 0.30
+        if ((orientation_bins < 0) | (orientation_bins > 3)).any():
+            raise ValueError("orientation bin must be in [0, 3]")
 
-        if phase == 1:
-            # Accept broad non-upright orientations:
-            # gravity_z >= -0.10
-            return gravity_z < -0.10
+        lower = torch.tensor(
+            [0.70, 0.20, -0.20, -0.80],
+            device=gravity_z.device,
+            dtype=gravity_z.dtype,
+        )[orientation_bins]
+        upper = torch.tensor(
+            [1.0001, 0.70, 0.20, -0.20],
+            device=gravity_z.device,
+            dtype=gravity_z.dtype,
+        )[orientation_bins]
 
-        if phase == 2:
-            # Accept sideways and partial-fall orientations:
-            # -0.10 <= gravity_z <= 0.80
-            return (gravity_z < -0.10) | (gravity_z > 0.80)
-
-        raise RuntimeError(
-            f"Invalid orientation curriculum phase: {phase}"
-        )
+        return (gravity_z < lower) | (gravity_z >= upper)
 
     def _write_curriculum_grid_snapshot(self):
         """
@@ -5136,14 +5528,20 @@ class LeggedRobot(BaseTask):
             terrain_type:
                 Fixed terrain column/type assigned to each environment.
 
-            episode_orientation_phase:
-                Orientation phase used when the current episode was initialized.
+            episode_orientation_bin:
+                Fixed orientation category sampled for the current episode.
 
-            global_orientation_phase:
-                Current global phase selected by the EMA controller.
+            sampler_group:
+                0 frontier, 1 replay, 2 next-level probe, 3 coverage.
 
-            terrain_successes / terrain_trials:
-                Partial local terrain-curriculum window for each environment.
+            terrain_frontier:
+                Promoted difficulty frontier for every physical terrain column.
+
+            terrain_sampling_stage:
+                Per-column stage: 0 bootstrap, 1 developing, 2 mature.
+
+            cell_success_ema / cell_trials:
+                Statistics for (terrain column, level, orientation bin).
         """
 
         # Match the existing recovery-grid write frequency.
@@ -5156,9 +5554,12 @@ class LeggedRobot(BaseTask):
         required_attributes = (
             "terrain_levels",
             "terrain_types",
-            "episode_orientation_phase",
-            "terrain_curriculum_successes",
-            "terrain_curriculum_trials",
+            "episode_orientation_bin",
+            "episode_sampler_group",
+            "terrain_frontier",
+            "terrain_sampling_stage",
+            "recovery_cell_success_ema",
+            "recovery_cell_trials",
         )
 
         if not all(hasattr(self, name) for name in required_attributes):
@@ -5177,15 +5578,63 @@ class LeggedRobot(BaseTask):
 
         np.savez_compressed(
             temporary_path,
+            curriculum_schema_version=np.asarray(2, dtype=np.int16),
             step=np.asarray(int(self.common_step_counter), dtype=np.int64),
             terrain_level=self.terrain_levels[:num_train_envs].detach().cpu().numpy().astype(np.int16),
             terrain_type=self.terrain_types[:num_train_envs].detach().cpu().numpy().astype(np.int16),
+            episode_orientation_bin=self.episode_orientation_bin[:num_train_envs].detach().cpu().numpy().astype(np.int16),
+            sampler_group=self.episode_sampler_group[:num_train_envs].detach().cpu().numpy().astype(np.int16),
+            terrain_frontier=self.terrain_frontier.detach().cpu().numpy().astype(np.int16),
+            cell_success_ema=self.recovery_cell_success_ema.detach().cpu().numpy().astype(np.float32),
+            cell_trials=self.recovery_cell_trials.detach().cpu().numpy().astype(np.int32),
+            frontier_window_successes=self.frontier_window_successes.detach().cpu().numpy().astype(np.float32),
+            frontier_window_trials=self.frontier_window_trials.detach().cpu().numpy().astype(np.int32),
+            frontier_pass_windows=self.frontier_pass_windows.detach().cpu().numpy().astype(np.int16),
+            frontier_review_count=self.frontier_review_count.detach().cpu().numpy().astype(np.int32),
+            frontier_last_mean_success=self.frontier_last_mean_success.detach().cpu().numpy().astype(np.float32),
+            frontier_last_worst_bin_success=self.frontier_last_lower_quartile.detach().cpu().numpy().astype(np.float32),
+            terrain_sampling_stage=self.terrain_sampling_stage.detach().cpu().numpy().astype(np.int16),
+            env_sampling_stage=self.terrain_sampling_stage[
+                self.terrain_types[:num_train_envs]
+            ].detach().cpu().numpy().astype(np.int16),
+            # Backward-compatible key.  It is now a per-column vector rather
+            # than the old global scalar.
+            sampling_stage=self.terrain_sampling_stage.detach().cpu().numpy().astype(np.int16),
+            # Backward-compatible keys for an older dashboard.  "phase" now
+            # contains the bin ID and -1 means there is no global phase.
             episode_orientation_phase=self.episode_orientation_phase[:num_train_envs].detach().cpu().numpy().astype(np.int16),
-            global_orientation_phase=np.asarray(int(self.orientation_curriculum_phase), dtype=np.int16),
+            global_orientation_phase=np.asarray(-1, dtype=np.int16),
+            recovery_success_ema=np.asarray(float(self.recovery_rate_ema), dtype=np.float32),
             orientation_ema=np.asarray(float(self.recovery_rate_ema), dtype=np.float32),
             terrain_successes=self.terrain_curriculum_successes[:num_train_envs].detach().cpu().numpy().astype(np.float32),
             terrain_trials=self.terrain_curriculum_trials[:num_train_envs].detach().cpu().numpy().astype(np.int16),
             num_terrain_levels=np.asarray(int(self.cfg.terrain.num_rows), dtype=np.int16,),
+            num_terrain_types=np.asarray(int(self.cfg.terrain.num_cols), dtype=np.int16),
+            num_orientation_bins=np.asarray(4, dtype=np.int16),
+            frontier_min_trials_per_bin=np.asarray(
+                int(getattr(self.cfg.terrain, "frontier_min_trials_per_bin", 64)),
+                dtype=np.int32,
+            ),
+            frontier_mean_promote_threshold=np.asarray(
+                float(getattr(self.cfg.terrain, "frontier_mean_promote_threshold", 0.80)),
+                dtype=np.float32,
+            ),
+            frontier_worst_bin_threshold=np.asarray(
+                float(getattr(self.cfg.terrain, "frontier_lower_quartile_threshold", 0.70)),
+                dtype=np.float32,
+            ),
+            frontier_required_windows=np.asarray(
+                int(getattr(self.cfg.terrain, "frontier_required_windows", 2)),
+                dtype=np.int16,
+            ),
+            curriculum_max_level=np.asarray(
+                int(self.recovery_curriculum_max_level),
+                dtype=np.int16,
+            ),
+            mature_frontier_level=np.asarray(
+                int(getattr(self.cfg.terrain, "mature_frontier_level", 3)),
+                dtype=np.int16,
+            ),
         )
 
         temporary_path.replace(grid_path)
