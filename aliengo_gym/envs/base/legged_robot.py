@@ -1292,35 +1292,54 @@ class LeggedRobot(BaseTask):
         g_z = self.projected_gravity[:, 2]
 
         upright = g_z < cfg.recovery_upright_threshold
-        # stable_height = (self.root_states[:, 2] > cfg.recovery_height_success)
+
         local_terrain_height = self._get_local_terrain_height()
-
         relative_base_height = (
-            self.root_states[:, 2]
-            - local_terrain_height
+            self.root_states[:, 2] - local_terrain_height
         )
-        stable_height = (relative_base_height > cfg.recovery_height_success)
-        low_velocity = (torch.norm(self.base_lin_vel[:, :2], dim=1) < cfg.recovery_lin_vel_threshold)
-        low_ang_vel = (torch.norm(self.base_ang_vel, dim=1) < cfg.recovery_ang_vel_threshold)
-        posture_error = torch.norm(self.dof_pos - self.default_dof_pos, dim=1)
-        good_posture = (posture_error < cfg.recovery_posture_threshold)
+        stable_height = (
+            relative_base_height > cfg.recovery_height_success
+        )
 
-        # foot_contacts = (self.contact_forces[:, self.feet_indices, 2] > cfg.recovery_contact_force_threshold).sum(dim=1)
-        # stable_contacts = (foot_contacts >= cfg.recovery_min_foot_contacts)
+        # Horizontal velocity
+        low_velocity = (
+            torch.norm(self.base_lin_vel[:, :2], dim=1)
+            < cfg.recovery_lin_vel_threshold
+        )
 
-        # FOR FINETUNING
+        # Prefer world-frame vertical velocity.
+        low_vertical_velocity = (
+            torch.abs(self.root_states[:, 9])
+            < cfg.recovery_vertical_vel_threshold
+        )
+
+        low_ang_vel = (
+            torch.norm(self.base_ang_vel, dim=1)
+            < cfg.recovery_ang_vel_threshold
+        )
+
+        posture_error = torch.norm(
+            self.dof_pos - self.default_dof_pos,
+            dim=1,
+        )
+        good_posture = (
+            posture_error < cfg.recovery_posture_threshold
+        )
+
         foot_contact = (
             self.contact_forces[:, self.feet_indices, 2]
             > cfg.recovery_contact_force_threshold
         )
 
-        foot_xy_vel = torch.norm(self.foot_velocities[:, :, :2], dim=-1)
+        foot_xy_vel = torch.norm(
+            self.foot_velocities[:, :, :2],
+            dim=-1,
+        )
 
         non_slipping_feet = foot_contact & (
             foot_xy_vel < cfg.recovery_foot_slip_vel_threshold
         )
 
-        # stable_contacts = non_slipping_feet.sum(dim=1) >= cfg.recovery_min_foot_contacts
         if getattr(cfg, "require_non_slipping_contacts", False):
             stable_contacts = (
                 non_slipping_feet.sum(dim=1)
@@ -1332,20 +1351,34 @@ class LeggedRobot(BaseTask):
                 >= cfg.recovery_min_foot_contacts
             )
 
+        # Reject recovery supported by trunk, hips, thighs or calves.
+        if self.base_contact_indices.numel() > 0:
+            nonfoot_force = torch.norm(
+                self.contact_forces[:, self.base_contact_indices, :],
+                dim=-1,
+            )
+
+            no_nonfoot_contact = (
+                nonfoot_force.max(dim=1).values
+                < cfg.recovery_nonfoot_contact_threshold
+            )
+        else:
+            no_nonfoot_contact = torch.ones(
+                self.num_envs,
+                dtype=torch.bool,
+                device=self.device,
+            )
+
         recovered = (
             upright
             & stable_height
             & low_velocity
+            & low_vertical_velocity
             & low_ang_vel
             & good_posture
             & stable_contacts
+            & no_nonfoot_contact
         )
-
-        # Per-step EMA update
-        # self.recovery_rate_ema = (
-        #     0.95 * self.recovery_rate_ema
-        #     + 0.05 * recovered.float().mean().item()
-        # )
 
         self.recovery_counter[recovered] += 1
         self.recovery_counter[~recovered] = 0
@@ -4783,7 +4816,8 @@ class LeggedRobot(BaseTask):
 
         #############
         all_bodies = torch.arange(self.num_bodies, device=self.device)
-        feet = torch.tensor(self.feet_indices, device=self.device)
+        # feet = torch.tensor(self.feet_indices, device=self.device)
+        feet = self.feet_indices.to(device=self.device, dtype=torch.long)
 
         mask = torch.ones_like(all_bodies, dtype=torch.bool)
         mask[feet] = False
