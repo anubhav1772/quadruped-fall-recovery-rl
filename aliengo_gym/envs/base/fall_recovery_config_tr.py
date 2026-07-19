@@ -108,52 +108,14 @@ class FallRecoveryConfig(BaseCfg):
         mesh_type = "trimesh" # none, plane, heightfield or trimesh
         curriculum = True
 
-        num_rows = 10
-        num_cols = 20
-
-        # ------------------------------------------------------------
-        # Independent terrain curriculum
-        # ------------------------------------------------------------
         # Recovery-driven terrain progression.
         recovery_curriculum = True
 
-        curriculum_window = 5
-        curriculum_promote_threshold = 0.8
-        curriculum_demote_threshold = 0.2
+        num_rows = 10       # difficulty levels: 0 – 9
+        num_cols = 20       # physical terrain columns
 
-        curriculum_promote_step = 1
-        curriculum_demote_step = 1
-
-        curriculum_min_level = 0
+        recovery_start_level = 0
         curriculum_max_level = 9 # (num_row - 1)
-
-
-        # ------------------------------------------------------------
-        # Independent global orientation curriculum
-        # ------------------------------------------------------------
-
-        orientation_curriculum = True
-
-        # Number of completed training episodes used for one
-        # orientation-performance update.
-        orientation_update_window = 256
-
-        # Episodic recovery EMA used only for fallen-orientation difficulty.
-        orientation_ema_alpha = 0.10
-
-        # Hysteresis thresholds prevent rapid phase oscillation.
-        orientation_phase_1_enter = 0.60
-        orientation_phase_1_exit = 0.40
-
-        orientation_phase_2_enter = 0.80
-        orientation_phase_2_exit = 0.60
-
-        # Avoid mixing terrain-window statistics across orientation phases.
-        reset_terrain_windows_on_orientation_change = True
-
-        # Easy initial terrain rows
-        min_init_terrain_level = 0
-        max_init_terrain_level = 2
 
         static_friction = 1.0
         dynamic_friction = 1.0
@@ -168,14 +130,14 @@ class FallRecoveryConfig(BaseCfg):
 
         measured_points_x = [
             -0.40, -0.35, -0.30, -0.25, -0.20, -0.15, -0.10, -0.05,
-             0.00,
-             0.05,  0.10,  0.15,  0.20,  0.25,  0.30,  0.35,
+            0.00,
+            0.05,  0.10,  0.15,  0.20,  0.25,  0.30,  0.35,
         ]
 
         measured_points_y = [
             -0.25, -0.20, -0.15, -0.10, -0.05,
-             0.00,
-             0.05,  0.10,  0.15,  0.20,  0.25,
+            0.00,
+            0.05,  0.10,  0.15,  0.20,  0.25,
         ]
 
         terrain_noise_magnitude = 0.03
@@ -208,6 +170,35 @@ class FallRecoveryConfig(BaseCfg):
         #     0.10,  # random noise: 2 columns
         #     0.15,  # half-flat half-rough: 3 columns
         # ]
+
+        # Promotion evidence
+        frontier_min_trials_per_bin = 64
+        frontier_mean_promote_threshold = 0.80
+        frontier_lower_quartile_threshold = 0.70
+        frontier_required_windows = 2
+
+        # Cell competence logging
+        cell_success_ema_alpha = 0.10
+        recovery_rate_ema_alpha = 0.10
+
+        # Per-terrain-column sampling-stage transitions.  A column enters the
+        # developing stage after it has a reviewed frontier window with at
+        # least this mean success.  It enters mature independently when that
+        # column's own frontier reaches mature_frontier_level.
+        bootstrap_success_threshold = 0.60
+        mature_frontier_level = 3
+
+        # Developing stage
+        developing_frontier_fraction = 0.75
+        developing_replay_fraction = 0.15
+        developing_next_fraction = 0.10
+        developing_coverage_fraction = 0.00
+
+        # Mature stage
+        mature_frontier_fraction = 0.60
+        mature_replay_fraction = 0.25
+        mature_next_fraction = 0.10
+        mature_coverage_fraction = 0.05
 
     class domain_rand(BaseCfg.domain_rand):
         # trunk_mass_range = [4.0, 28.0]
