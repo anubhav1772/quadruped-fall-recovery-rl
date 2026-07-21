@@ -46,12 +46,15 @@ class CoRLRewards:
 
     def _height_progress(self):
         """
-        Soft normalized body-height progress from recovery_height_min to recovery_height_target.
+        Dense terrain-relative height progress.
         Returns 0 when body is too low and 1 near target standing height.
+        This is deliberately softer than the hard recovery success threshold.
         """
         body_height = self.get_body_height()
+
         h_min = self.env.cfg.rewards.recovery_height_min
         h_target = self.env.cfg.rewards.recovery_height_target
+
         return torch.clamp((body_height - h_min) / (h_target - h_min), 0.0, 1.0)
 
     def _height_success(self):
@@ -138,23 +141,25 @@ class CoRLRewards:
     ######## dense success reward ########
     def _reward_recovery_progress(self):
         """
-        Dense recovery progress reward.
+        Staged dense recovery reward:
+
+        1. rotate toward upright,
+        2. establish useful foot support,
+        3. raise the body,
+        4. combine all three.
         """
         env = self.env
 
         gz = env.projected_gravity[:, 2]
 
-        # Inverted/back = 0, sideways = 0.5, upright = 1
         orientation_progress = torch.clamp(
             (1.0 - gz) * 0.5,
             0.0,
             1.0,
         )
 
-        # Soft terrain-relative height progress
         height_progress = self._height_progress()
 
-        # Smooth loaded and non-slipping foot support
         support_progress = torch.clamp(
             self._smooth_support_count() / 3.0,
             0.0,
@@ -162,9 +167,10 @@ class CoRLRewards:
         )
 
         return (
-            0.45 * orientation_progress
+            0.15 * orientation_progress
             + 0.30 * orientation_progress * height_progress
-            + 0.25 * orientation_progress * height_progress * support_progress
+            + 0.25 * orientation_progress * support_progress
+            + 0.30 * orientation_progress * height_progress * support_progress
         )
 
     ######## sparse success reward ########
@@ -256,51 +262,22 @@ class CoRLRewards:
 
         return upright_reward * stability_factor
 
-    # def _reward_height_alignment(self):
-    #     """Rewards maintaining the desired base height."""
-    #     body_height = self.env.root_states[:, 2]
-    #     target_height = self.env.cfg.rewards.base_height_target
-    #     g_z = self.env.projected_gravity[:,2]
-    #     # prevents the agent from farming height while upside down
-    #     upright_factor = torch.clamp(-g_z, 0.0, 1.0)
-    #     return upright_factor * torch.exp(
-    #         -torch.square(target_height - body_height)
-    #     )
-
-    # def _reward_height_alignment(self):
-    #     """
-    #     Rewards body-height recovery only when the robot is reasonably upright.
-    #     Uses height_progress instead of raw Gaussian height tracking for clearer recovery shaping.
-    #     """
-    #     # low height     -> low reward
-    #     # standing height -> high reward
-    #     g_z = self.env.projected_gravity[:, 2]
-    #     upright_factor = torch.clamp(-g_z, 0.0, 1.0)
-    #     height_progress = self._height_progress()
-    #     return upright_factor * height_progress
-
-    # def _reward_height_alignment(self):
-    #     env = self.env
-
-    #     g_z = env.projected_gravity[:, 2]
-    #     upright_factor = torch.clamp(-g_z, 0.0, 1.0)
-    #     height_progress = self._height_progress()
-
-    #     # Do not gate height by support yet.
-    #     return upright_factor * height_progress
-    #
-
     def _reward_height_alignment(self):
         env = self.env
 
-        g_z = env.projected_gravity[:, 2]
-        upright_factor = torch.clamp(-g_z, 0.0, 1.0)
+        upright_factor = torch.clamp(
+            -env.projected_gravity[:, 2],
+            0.0,
+            1.0,
+        )
 
         height_progress = self._height_progress()
+        loaded_support = self._loaded_support_gate()
 
-        support_gate = self._loaded_support_gate()
+        # Preserve a small height gradient before feet are fully loaded.
+        support_factor = 0.20 + 0.80 * loaded_support
 
-        return upright_factor * support_gate * height_progress
+        return upright_factor * support_factor * height_progress
 
 
     ###############################################
@@ -556,38 +533,68 @@ class CoRLRewards:
     #     contact_reward = torch.clamp(num_contacts - 2, min=0.0) / 2.0
     #     return contact_reward * upright_factor
 
+    # def _reward_feet_on_ground(self):
+    #     env = self.env
+
+    #     # Activate only when the robot is already near upright.
+    #     upright_gate = torch.clamp(
+    #         (-env.projected_gravity[:, 2] - 0.65) / 0.30,
+    #         0.0,
+    #         1.0
+    #     )
+
+    #     base_height = self.get_body_height()
+    #     # Activate mostly once the body is raised.
+    #     height_gate = torch.clamp(
+    #         (base_height - 0.26) / 0.07,
+    #         0.0,
+    #         1.0
+    #     )
+
+    #     foot_fz = env.contact_forces[:, env.feet_indices, 2].clamp_min(0.0)
+
+    #     # Soft contact score, not strict no-slip.
+    #     contact_score = torch.clamp((foot_fz - 1.0) / 10.0, 0.0, 1.0)
+    #     contact_count_soft = contact_score.sum(dim=1)
+
+    #     # 1 foot -> little reward, 3 feet -> high reward.
+    #     support_contact_progress = torch.clamp(
+    #         (contact_count_soft - 1.0) / 2.0,
+    #         0.0,
+    #         1.0
+    #     )
+
+    #     return upright_gate * height_gate * support_contact_progress
+
     def _reward_feet_on_ground(self):
         env = self.env
 
-        # Activate only when the robot is already near upright.
         upright_gate = torch.clamp(
             (-env.projected_gravity[:, 2] - 0.65) / 0.30,
             0.0,
-            1.0
+            1.0,
         )
 
-        base_height = self.get_body_height()
-        # Activate mostly once the body is raised.
-        height_gate = torch.clamp(
-            (base_height - 0.26) / 0.07,
-            0.0,
-            1.0
-        )
+        height_gate = 0.20 + 0.80 * self._height_progress()
 
         foot_fz = env.contact_forces[:, env.feet_indices, 2].clamp_min(0.0)
 
-        # Soft contact score, not strict no-slip.
-        contact_score = torch.clamp((foot_fz - 1.0) / 10.0, 0.0, 1.0)
+        contact_score = torch.clamp(
+            (foot_fz - 1.0) / 10.0,
+            0.0,
+            1.0,
+        )
+
         contact_count_soft = contact_score.sum(dim=1)
 
-        # 1 foot -> little reward, 3 feet -> high reward.
         support_contact_progress = torch.clamp(
             (contact_count_soft - 1.0) / 2.0,
             0.0,
-            1.0
+            1.0,
         )
 
         return upright_gate * height_gate * support_contact_progress
+
 
     # def _reward_posture(self):
     #     """
@@ -605,83 +612,34 @@ class CoRLRewards:
     #     upright_factor = torch.clamp((-g_z - 0.4) / 0.5, 0.0, 1.0)
     #     return r_posture * upright_factor
 
-    # def _reward_posture(self):
-    #     # FINETUNE
-    #     q = self.env.dof_pos[:, :self.env.num_actuated_dof]
-    #     q_stand = self.env.default_dof_pos[:, :self.env.num_actuated_dof]
-
-    #     posture_error = torch.norm(q - q_stand, dim=1)
-
-    #     r_posture = torch.exp(-1.5 * posture_error)
-
-    #     g_z = self.env.projected_gravity[:, 2]
-    #     upright_factor = torch.clamp((-g_z - 0.4) / 0.5, 0.0, 1.0)
-
-    #     # height_gate = torch.clamp(
-    #     #     (self.env.root_states[:, 2] - 0.18) / 0.12,
-    #     #     0.0,
-    #     #     1.0
-    #     # )
-
-    #     height_gate = torch.clamp(
-    #         (self.env.root_states[:, 2] - 0.26) / 0.07,
-    #         0.0,
-    #         1.0
-    #     )
-
-    #     return r_posture * upright_factor * height_gate
-
-
-    # def _reward_posture(self):
-    #     env = self.env
-
-    #     q = env.dof_pos[:, :env.num_actuated_dof]
-    #     q_stand = env.default_dof_pos[:, :env.num_actuated_dof]
-
-    #     posture_error = torch.norm(q - q_stand, dim=1)
-    #     r_posture = torch.exp(-0.6 * posture_error)
-
-    #     upright_gate = torch.clamp(
-    #         (-env.projected_gravity[:, 2] - 0.70) / 0.25,
-    #         0.0,
-    #         1.0
-    #     )
-
-    #     height_gate = torch.clamp(
-    #         (env.root_states[:, 2] - 0.28) / 0.05,
-    #         0.0,
-    #         1.0
-    #     )
-
-    #     return upright_gate * height_gate * r_posture
-    #
-
     def _reward_posture(self):
+        """
+        Rewards joints being close to the standing posture.
+        The reward gradually activates as the robot approaches upright orientation.
+
+        -g_z ≤ 0.40: no posture reward.
+        0.40 < -g_z < 0.90: progressively activates.
+        -g_z ≥ 0.90: fully upright-gated.
+        At low height: only 20% of the posture signal is available.
+        As body height rises: it smoothly increases to 100%.
+        """
         env = self.env
 
         q = env.dof_pos[:, :env.num_actuated_dof]
         q_stand = env.default_dof_pos[:, :env.num_actuated_dof]
 
         posture_error = torch.norm(q - q_stand, dim=1)
-        r_posture = torch.exp(-0.6 * posture_error)
+        posture_score = torch.exp(-0.6 * posture_error)
 
         upright_gate = torch.clamp(
-            (-env.projected_gravity[:, 2] - 0.70) / 0.25,
+            (-env.projected_gravity[:, 2] - 0.40) / 0.50,
             0.0,
             1.0,
         )
 
-        body_height = self.get_body_height()
-        height_gate = torch.clamp(
-            (body_height - 0.28) / 0.05,
-            0.0,
-            1.0,
-        )
+        height_gate = 0.20 + 0.80 * self._height_progress()
 
-        support_gate = self._stable_support_gate()
-
-        return upright_gate * height_gate * support_gate * r_posture
-
+        return upright_gate * height_gate * posture_score
 
 
     def _reward_base_height(self):
