@@ -67,12 +67,11 @@ class FallRecoveryConfig(BaseCfg):
     class env(BaseCfg.env):
         train_recovery = True
 
-        # Terminal-stabilizer stage:
-        # keep episodes alive after recovery so the policy learns to hold stance.
+        # Episodes terminate after stable recovery
         terminate_on_recovery_success = True
 
         # Full fallen-state training
-        terminal_stance_reset_prob = 0.0
+        terminal_stance_reset_prob = 0.10
 
         debug_clean_terminal_reset = False
         debug_zero_actions = False
@@ -94,6 +93,23 @@ class FallRecoveryConfig(BaseCfg):
 
         record_video = True
         max_video_frames = 400 # (for episode length of 450)
+
+        # Physical terrain columns used for video recording.
+        # One different column is recorded every video interval.
+        # video_probe_columns = list(range(20))
+
+        # one representative per enabled terrain family instead of all 20 physical columns
+        video_probe_columns = [
+            0,   # descending smooth slope
+            9,   # stairs direction 1
+            10,  # stairs direction 2
+            11,  # discrete obstacles
+            13,  # stepping stones
+            14,  # random terrain
+            16,  # half-flat/half-rough
+            5,   # rough slope
+            2,   # smooth slope
+        ]
 
         priv_observe_friction = True
         priv_observe_ground_friction = False
@@ -200,6 +216,15 @@ class FallRecoveryConfig(BaseCfg):
         mature_next_fraction = 0.10
         mature_coverage_fraction = 0.05
 
+        # Fall-recovery XY spawn distribution
+        # keeps 25% easy center samples while making 75% genuinely off-center
+        recovery_center_spawn_fraction = 0.25
+        recovery_center_spawn_jitter = 0.15
+
+        # Off-center annulus, safely inside the 5 m × 5 m terrain cell
+        recovery_spawn_min_radius = 0.55
+        recovery_spawn_max_radius = 1.25
+
     class domain_rand(BaseCfg.domain_rand):
         # trunk_mass_range = [4.0, 28.0]
         # hip_mass_range   = [0.3, 0.7]
@@ -233,6 +258,7 @@ class FallRecoveryConfig(BaseCfg):
         randomize_motor_strength = False
 
     class normalization(BaseCfg.normalization):
+        clip_actions = 10.0
         com_displacement_range = [-0.05, 0.05]
         friction_range = [0.5, 1.8]
         Kp_factor_range = [0.9, 1.1]
@@ -257,7 +283,7 @@ class FallRecoveryConfig(BaseCfg):
     class rewards(BaseCfg.rewards):
         base_height_target = 0.34
 
-        recovery_height_min = 0.18
+        recovery_height_min = 0.05
         recovery_height_success = 0.28
         recovery_height_target = 0.34
 
@@ -272,29 +298,32 @@ class FallRecoveryConfig(BaseCfg):
         recovery_contact_force_threshold = 1.0
         recovery_min_foot_contacts = 3
 
-        recovery_success_steps = 10
-        require_non_slipping_contacts = False
+        recovery_success_steps = 25     # 0.5 seconds
+        require_non_slipping_contacts = True
 
         # Retained for diagnostics and later stages
         recovery_foot_slip_vel_threshold = 0.12
 
+        recovery_vertical_vel_threshold = 0.15
+        recovery_nonfoot_contact_threshold = 5.0
+
+        recovery_bonus_delay_s = 0.5
+
 
     class reward_scales(BaseCfg.reward_scales):
-        # Main recovery objective
-        recovery_bonus = 200.0  # effective 4.0 (recovery_bonus * dt)
+        # Main objective
+        recovery_bonus = 2500.0     # effective 50.0 (recovery_bonus * dt)
+        recovery_progress = 20.0
 
-        # Use the name that actually exists in CoRLRewards.
-        # Your config suggests _reward_recovery_progress is the current function.
-        recovery_progress = 30.0
-
-        upright_orientation = 6.0
+        # Final recovery refinement
+        upright_orientation = 3.0
         height_alignment = 2.0
-        posture = 6.0
-        feet_on_ground = 2.0
+        posture = 3.0
+        feet_on_ground = 1.0
 
         # Stability
-        base_orientation = -0.3
-        base_ang_vel = -0.02
+        base_orientation = 0.0
+        base_ang_vel = -0.01
 
         # Motor regularization
         action = -1.0e-3
@@ -304,19 +333,21 @@ class FallRecoveryConfig(BaseCfg):
 
         # Safety
         dof_pos_limits = -0.1
-        joint_vel_limit = -5.0e-4
-        base_contact = -0.05
+        joint_vel_limit = 0.0
+        base_contact = -0.5
 
-        # Weak exploration-safe regularization
-        feet_slip = -5.0e-3
-        body_slip = -5.0e-3
+        # Exploration-safe regularization
+        feet_slip = 0.0
+        body_slip = 0.0
         action_smoothness_1 = -1.0e-3
         action_smoothness_2 = -2.0e-4
 
-        # Disable terminal fine-tuning rewards
+        # Late-gated slip penalty
+        loaded_foot_slip = -1.0
+
+        # Keep morphology-specific terminal shaping disabled
         stand_still_action = 0.0
         late_nonfoot_contact = 0.0
-        loaded_foot_slip = 0.0
         support_deficit = 0.0
         front_leg_error = 0.0
         loaded_foot_support = 0.0
@@ -325,5 +356,54 @@ class FallRecoveryConfig(BaseCfg):
         rear_leg_separation = 0.0
         rear_leg_crossing = 0.0
         terminal_action_prior = 0.0
-
         base_height = 0.0
+
+
+    # class reward_scales(BaseCfg.reward_scales):
+    #     # Main recovery objective
+    #     recovery_bonus = 200.0  # effective 4.0 (recovery_bonus * dt)
+
+    #     # Use the name that actually exists in CoRLRewards.
+    #     # Your config suggests _reward_recovery_progress is the current function.
+    #     recovery_progress = 30.0
+
+    #     upright_orientation = 6.0
+    #     height_alignment = 2.0
+    #     posture = 6.0
+    #     feet_on_ground = 2.0
+
+    #     # Stability
+    #     base_orientation = -0.3
+    #     base_ang_vel = -0.02
+
+    #     # Motor regularization
+    #     action = -1.0e-3
+    #     torques = -2.0e-4
+    #     dof_acc = -5.0e-8
+    #     dof_vel = -1.0e-4
+
+    #     # Safety
+    #     dof_pos_limits = -0.1
+    #     joint_vel_limit = -5.0e-4
+    #     base_contact = -0.05
+
+    #     # Weak exploration-safe regularization
+    #     feet_slip = -5.0e-3
+    #     body_slip = -5.0e-3
+    #     action_smoothness_1 = -1.0e-3
+    #     action_smoothness_2 = -2.0e-4
+
+    #     # Disable terminal fine-tuning rewards
+    #     stand_still_action = 0.0
+    #     late_nonfoot_contact = 0.0
+    #     loaded_foot_slip = 0.0
+    #     support_deficit = 0.0
+    #     front_leg_error = 0.0
+    #     loaded_foot_support = 0.0
+    #     stable_foot_support = 0.0
+    #     stance_region = 0.0
+    #     rear_leg_separation = 0.0
+    #     rear_leg_crossing = 0.0
+    #     terminal_action_prior = 0.0
+
+    #     base_height = 0.0
