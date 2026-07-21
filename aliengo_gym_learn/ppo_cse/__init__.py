@@ -488,17 +488,46 @@ class Runner:
 
         # print(f"Num vid frames {len(self.env.video_frames)}")
         # STOP + SAVE RECORDING
-        if self.env.record_now and len(self.env.video_frames) >= self.env.max_video_frames:
-            print(f"[VIDEO] Saving video at iter {it}")
+        if (
+            self.env.record_now
+            and len(self.env.video_frames) >= self.env.max_video_frames
+        ):
+            env_id = int(self.env.record_env_id)
+
+            terrain_column = int(
+                self.env.terrain_types[env_id].item()
+            )
+            terrain_level = int(
+                self.env.terrain_levels[env_id].item()
+            )
+            orientation_bin = int(
+                self.env.episode_orientation_bin[env_id].item()
+            )
+            sampler_group = int(
+                self.env.episode_sampler_group[env_id].item()
+            )
+
+            tag = (
+                f"iter_{it}"
+                f"_column_{terrain_column}"
+                f"_level_{terrain_level}"
+                f"_bin_{orientation_bin}"
+                f"_group_{sampler_group}"
+            )
+
+            print(f"[VIDEO] Saving {tag}")
 
             try:
                 self.env.stop_recording(
-                    tag=f"iter_{it}",
-                    telegram_fn=safe_send_gif
+                    tag=tag,
+                    telegram_fn=safe_send_gif,
                 )
             except Exception as e:
                 print(f"[VIDEO ERROR] {e}")
-                self.env.stop_recording(tag=f"iter_{it}", telegram_fn=None)
+                self.env.stop_recording(
+                    tag=tag,
+                    telegram_fn=None,
+                )
 
 
     # def log_video(self, it):
