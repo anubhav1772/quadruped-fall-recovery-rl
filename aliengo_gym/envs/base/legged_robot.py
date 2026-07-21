@@ -213,9 +213,9 @@ class LeggedRobot(BaseTask):
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_net_contact_force_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
-        if self.record_now:
-            self.gym.step_graphics(self.sim)
-            self.gym.render_all_camera_sensors(self.sim)
+        # if self.record_now:
+        #     self.gym.step_graphics(self.sim)
+        #     self.gym.render_all_camera_sensors(self.sim)
 
         self.episode_length_buf += 1
         self.common_step_counter += 1
@@ -2955,7 +2955,89 @@ class LeggedRobot(BaseTask):
         # ------------------------------------------------------------
         # XY position
         # ------------------------------------------------------------
-        self.root_states[env_ids, 0:2] = self.env_origins[env_ids, 0:2]
+        # self.root_states[env_ids, 0:2] = self.env_origins[env_ids, 0:2]
+
+        # ------------------------------------------------------------
+        # XY spawn: mixture of center replay and off-center terrain
+        # ------------------------------------------------------------
+        center_fraction = float(getattr(
+            cfg.terrain,
+            "recovery_center_spawn_fraction",
+            0.25,
+        ))
+        center_jitter = float(getattr(
+            cfg.terrain,
+            "recovery_center_spawn_jitter",
+            0.15,
+        ))
+        min_radius = float(getattr(
+            cfg.terrain,
+            "recovery_spawn_min_radius",
+            0.55,
+        ))
+        max_radius = float(getattr(
+            cfg.terrain,
+            "recovery_spawn_max_radius",
+            1.25,
+        ))
+
+        offsets = torch.zeros(
+            num_resets,
+            2,
+            device=self.device,
+            dtype=self.root_states.dtype,
+        )
+
+        center_mask = (
+            torch.rand(num_resets, device=self.device)
+            < center_fraction
+        )
+        off_center_mask = ~center_mask
+
+        # Small center-region jitter for easy/replay samples.
+        if center_mask.any():
+            count = int(center_mask.sum().item())
+
+            offsets[center_mask] = (
+                2.0 * torch.rand(
+                    count,
+                    2,
+                    device=self.device,
+                    dtype=self.root_states.dtype,
+                ) - 1.0
+            ) * center_jitter
+
+        # Uniform-area sampling inside an annulus.
+        if off_center_mask.any():
+            count = int(off_center_mask.sum().item())
+
+            angle = (
+                2.0
+                * torch.pi
+                * torch.rand(
+                    count,
+                    device=self.device,
+                    dtype=self.root_states.dtype,
+                )
+            )
+
+            radius_u = torch.rand(
+                count,
+                device=self.device,
+                dtype=self.root_states.dtype,
+            )
+
+            radius = torch.sqrt(
+                min_radius ** 2
+                + radius_u * (max_radius ** 2 - min_radius ** 2)
+            )
+
+            offsets[off_center_mask, 0] = radius * torch.cos(angle)
+            offsets[off_center_mask, 1] = radius * torch.sin(angle)
+
+        self.root_states[env_ids, 0:2] = (
+            self.env_origins[env_ids, 0:2] + offsets
+        )
 
         # ------------------------------------------------------------
         # Sample candidate orientations for the episode's fixed bin.
@@ -3127,7 +3209,11 @@ class LeggedRobot(BaseTask):
         # ------------------------------------------------------------
         # Video bookkeeping
         # ------------------------------------------------------------
-        if cfg.env.record_video and bool((env_ids == 0).any()):
+        if (
+            cfg.env.record_video
+            and hasattr(self, "record_env_id")
+            and bool((env_ids == self.record_env_id).any())
+        ):
             if self.complete_video_frames is None:
                 self.complete_video_frames = []
             else:
@@ -3686,7 +3772,11 @@ class LeggedRobot(BaseTask):
                                                          gymtorch.unwrap_tensor(self.root_states),
                                                          gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
 
-            if cfg.env.record_video and 0 in env_ids:
+            if (
+                cfg.env.record_video
+                and hasattr(self, "record_env_id")
+                and bool((env_ids == self.record_env_id).any())
+            ):
                 if self.complete_video_frames is None:
                     self.complete_video_frames = []
                 else:
@@ -4789,25 +4879,99 @@ class LeggedRobot(BaseTask):
             self.termination_contact_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0],
                                                                                         self.actor_handles[0],
                                                                                         termination_contact_names[i])
-        # if recording video, set up camera
+        # ------------------------------------------------------------
+        # Video cameras: one probe camera per requested terrain column
+        # ------------------------------------------------------------
+        self.video_probe_env_ids = []
+        self.video_probe_cameras = []
+        self.video_probe_columns = []
+        self.video_probe_index = -1
+
+        self.record_env_id = 0
+        self.rendering_camera = None
+
         if self.cfg.env.record_video:
             self.camera_props = gymapi.CameraProperties()
             self.camera_props.width = 360
             self.camera_props.height = 240
-            self.camera_props.enable_tensors = False # True (on gcp headless) #False (local)
-            self.rendering_camera = self.gym.create_camera_sensor(self.envs[0], self.camera_props)
+            self.camera_props.enable_tensors = False
 
-            if self.rendering_camera == -1:
-                raise RuntimeError("❌ Camera creation failed — EGL not working")
+            requested_columns = getattr(
+                self.cfg.env,
+                "video_probe_columns",
+                list(range(self.cfg.terrain.num_cols)),
+            )
 
-            self.gym.set_camera_location(self.rendering_camera, self.envs[0], gymapi.Vec3(1.5, 1, 3.0),
-                                         gymapi.Vec3(0, 0, 0))
+            for terrain_column in requested_columns:
+                terrain_column = int(terrain_column)
+
+                candidates = torch.nonzero(
+                    self.terrain_types[:self.num_train_envs] == terrain_column,
+                    as_tuple=False,
+                ).flatten()
+
+                if candidates.numel() == 0:
+                    print(
+                        f"[VIDEO WARNING] No training environment found "
+                        f"for terrain column {terrain_column}"
+                    )
+                    continue
+
+                # Select one representative environment from this column.
+                candidate_index = candidates.numel() // 2
+                env_id = int(candidates[candidate_index].item())
+
+                camera = self.gym.create_camera_sensor(
+                    self.envs[env_id],
+                    self.camera_props,
+                )
+
+                if camera == -1:
+                    raise RuntimeError(
+                        f"Camera creation failed for video probe env {env_id}"
+                    )
+
+                origin = self.env_origins[env_id]
+                ox = float(origin[0].item())
+                oy = float(origin[1].item())
+                oz = float(origin[2].item())
+
+                self.gym.set_camera_location(
+                    camera,
+                    self.envs[env_id],
+                    gymapi.Vec3(ox + 1.2, oy - 1.5, oz + 0.9),
+                    gymapi.Vec3(ox, oy, oz),
+                )
+
+                self.video_probe_columns.append(terrain_column)
+                self.video_probe_env_ids.append(env_id)
+                self.video_probe_cameras.append(camera)
+
+            if len(self.video_probe_cameras) == 0:
+                raise RuntimeError("No video probe cameras were created")
+
+            self.record_env_id = self.video_probe_env_ids[0]
+            self.rendering_camera = self.video_probe_cameras[0]
+
+            print("[VIDEO] Probe columns:", self.video_probe_columns)
+            print("[VIDEO] Probe env IDs:", self.video_probe_env_ids)
+
+            # Existing evaluation camera can remain if evaluation is used.
             if self.eval_cfg is not None:
-                self.rendering_camera_eval = self.gym.create_camera_sensor(self.envs[self.num_train_envs],
-                                                                           self.camera_props)
-                self.gym.set_camera_location(self.rendering_camera_eval, self.envs[self.num_train_envs],
-                                             gymapi.Vec3(1.5, 1, 3.0),
-                                             gymapi.Vec3(0, 0, 0))
+                eval_env_id = self.num_train_envs
+
+                self.rendering_camera_eval = self.gym.create_camera_sensor(
+                    self.envs[eval_env_id],
+                    self.camera_props,
+                )
+
+                self.gym.set_camera_location(
+                    self.rendering_camera_eval,
+                    self.envs[eval_env_id],
+                    gymapi.Vec3(1.5, 1.0, 3.0),
+                    gymapi.Vec3(0.0, 0.0, 0.0),
+                )
+
         self.video_writer = None
         self.video_frames = []
         self.video_frames_eval = []
@@ -4827,92 +4991,180 @@ class LeggedRobot(BaseTask):
 
     def render(self, mode="rgb_array"):
         assert mode == "rgb_array"
-        bx, by, bz = self.root_states[0, 0], self.root_states[0, 1], self.root_states[0, 2]
-        self.gym.set_camera_location(self.rendering_camera, self.envs[0], gymapi.Vec3(bx, by - 1.0, bz + 1.0),
-                                     gymapi.Vec3(bx, by, bz))
+
+        env_id = int(self.record_env_id)
+
+        bx = float(self.root_states[env_id, 0].item())
+        by = float(self.root_states[env_id, 1].item())
+        bz = float(self.root_states[env_id, 2].item())
+
+        self.gym.set_camera_location(
+            self.rendering_camera,
+            self.envs[env_id],
+            gymapi.Vec3(bx + 1.2, by - 1.5, bz + 0.8),
+            gymapi.Vec3(bx, by, bz - 0.05),
+        )
+
         self.gym.step_graphics(self.sim)
         self.gym.render_all_camera_sensors(self.sim)
-        img = self.gym.get_camera_image(self.sim, self.envs[0], self.rendering_camera, gymapi.IMAGE_COLOR)
-        w, h = img.shape
-        return img.reshape([w, h // 4, 4])
+
+        img = self.gym.get_camera_image(
+            self.sim,
+            self.envs[env_id],
+            self.rendering_camera,
+            gymapi.IMAGE_COLOR,
+        )
+
+        return img.reshape(
+            self.camera_props.height,
+            self.camera_props.width,
+            4,
+        )
 
     def _render_headless(self):
-        if self.record_now:
-            bx, by, bz = self.root_states[0, 0], self.root_states[0, 1], self.root_states[0, 2]
+        record_train = (
+            self.record_now
+            and self.rendering_camera is not None
+        )
+
+        record_eval = (
+            self.record_eval_now
+            and self.eval_cfg is not None
+            and hasattr(self, "rendering_camera_eval")
+        )
+
+        if not record_train and not record_eval:
+            return
+
+        # Update training probe camera
+        if record_train:
+            env_id = int(self.record_env_id)
+
+            bx = float(self.root_states[env_id, 0].item())
+            by = float(self.root_states[env_id, 1].item())
+            bz = float(self.root_states[env_id, 2].item())
 
             self.gym.set_camera_location(
                 self.rendering_camera,
-                self.envs[0],
-                gymapi.Vec3(bx, by - 1.0, bz + 1.0),
-                gymapi.Vec3(bx, by, bz)
+                self.envs[env_id],
+                gymapi.Vec3(
+                    bx + 1.2,
+                    by - 1.5,
+                    bz + 0.8,
+                ),
+                gymapi.Vec3(
+                    bx,
+                    by,
+                    bz - 0.05,
+                ),
             )
 
-            self.gym.step_graphics(self.sim)
-            self.gym.render_all_camera_sensors(self.sim)
+        # Update evaluation camera
+        if record_eval:
+            eval_env_id = int(self.num_train_envs)
 
-            img = self.gym.get_camera_image(
-                self.sim,
-                self.envs[0],
-                self.rendering_camera,
-                gymapi.IMAGE_COLOR
-            )
-
-            # if img is not None:
-            #     print("IMG SIZE:", img.size)
-
-            if img is None or img.size == 0:
-                return
-
-            frame = img.reshape(
-                (self.camera_props.height, self.camera_props.width, 4)
-            )
-            frame = frame[:, :, :3].astype(np.uint8)
-
-            if len(self.video_frames) < self.max_video_frames:
-                self.video_frames.append(frame)
-
-            # if len(self.video_frames) < self.max_video_frames:
-            #     print("APPEND FRAME")
-            #     self.video_frames.append(frame)
-            #     print("NEW LEN:", len(self.video_frames))
-
-        # EVAL
-        if self.record_now and self.eval_cfg is not None:
-            bx, by, bz = self.root_states[self.num_train_envs, 0], self.root_states[self.num_train_envs, 1], \
-                         self.root_states[self.num_train_envs, 2]
+            bx = float(self.root_states[eval_env_id, 0].item())
+            by = float(self.root_states[eval_env_id, 1].item())
+            bz = float(self.root_states[eval_env_id, 2].item())
 
             self.gym.set_camera_location(
                 self.rendering_camera_eval,
-                self.envs[self.num_train_envs],
-                gymapi.Vec3(bx, by - 1.0, bz + 1.0),
-                gymapi.Vec3(bx, by, bz)
+                self.envs[eval_env_id],
+                gymapi.Vec3(
+                    bx + 1.2,
+                    by - 1.5,
+                    bz + 0.8,
+                ),
+                gymapi.Vec3(
+                    bx,
+                    by,
+                    bz - 0.05,
+                ),
             )
 
-            self.gym.step_graphics(self.sim)
-            self.gym.render_all_camera_sensors(self.sim)
+        # Render all created sensors once.
+        self.gym.step_graphics(self.sim)
+        self.gym.render_all_camera_sensors(self.sim)
+
+        # Read training image
+        if record_train:
+            env_id = int(self.record_env_id)
 
             img = self.gym.get_camera_image(
                 self.sim,
-                self.envs[self.num_train_envs],
+                self.envs[env_id],
+                self.rendering_camera,
+                gymapi.IMAGE_COLOR,
+            )
+
+            if img is not None and img.size > 0:
+                frame = img.reshape(
+                    self.camera_props.height,
+                    self.camera_props.width,
+                    4,
+                )
+                frame = frame[:, :, :3].astype(np.uint8)
+
+                if len(self.video_frames) < self.max_video_frames:
+                    self.video_frames.append(frame)
+
+        # Read evaluation image
+        if record_eval:
+            eval_env_id = int(self.num_train_envs)
+
+            img = self.gym.get_camera_image(
+                self.sim,
+                self.envs[eval_env_id],
                 self.rendering_camera_eval,
-                gymapi.IMAGE_COLOR
+                gymapi.IMAGE_COLOR,
             )
 
-            if img is None or img.size == 0:
-                return
+            if img is not None and img.size > 0:
+                frame = img.reshape(
+                    self.camera_props.height,
+                    self.camera_props.width,
+                    4,
+                )
+                frame = frame[:, :, :3].astype(np.uint8)
 
-            frame = img.reshape(
-                (self.camera_props.height, self.camera_props.width, 4)
-            )
-            frame = frame[:, :, :3].astype(np.uint8)
+                if len(self.video_frames_eval) < self.max_video_frames:
+                    self.video_frames_eval.append(frame)
 
-            if len(self.video_frames_eval) < self.max_video_frames:
-                self.video_frames_eval.append(frame)
+    # def start_recording(self):
+    #     # self.complete_video_frames = None
+    #     self.video_frames = []
+    #     self.record_now = True
 
     def start_recording(self):
-        # self.complete_video_frames = None
+        if len(self.video_probe_cameras) == 0:
+            print("[VIDEO WARNING] No video probe cameras available")
+            return
+
+        # Move to the next terrain column.
+        self.video_probe_index = (
+            self.video_probe_index + 1
+        ) % len(self.video_probe_cameras)
+
+        self.record_env_id = self.video_probe_env_ids[self.video_probe_index]
+
+        self.rendering_camera = self.video_probe_cameras[self.video_probe_index]
+
         self.video_frames = []
+        self.complete_video_frames = []
         self.record_now = True
+
+        env_id = int(self.record_env_id)
+
+        print(
+            "[VIDEO] Started",
+            f"env={env_id}",
+            f"column={int(self.terrain_types[env_id].item())}",
+            f"level={int(self.terrain_levels[env_id].item())}",
+            f"orientation_bin="
+            f"{int(self.episode_orientation_bin[env_id].item())}",
+            f"sampler_group="
+            f"{int(self.episode_sampler_group[env_id].item())}",
+        )
 
     def start_recording_eval(self):
         # self.complete_video_frames_eval = None
@@ -5192,24 +5444,42 @@ class LeggedRobot(BaseTask):
 
         return heights.view(len(env_ids), -1) * self.terrain.cfg.vertical_scale
 
+    # def _get_local_terrain_height(self):
+    #     """
+    #     Effective terrain height over the robot support footprint.
+    #     Assumes self.measured_heights has shape [num_envs, num_points].
+    #     """
+    #     heights = self.measured_heights
+
+    #     sorted_heights = torch.sort(
+    #         heights,
+    #         dim=1,
+    #     ).values
+
+    #     # Remove the lowest and highest 10%.
+    #     trim = max(1, heights.shape[1] // 10)
+
+    #     trimmed_heights = sorted_heights[:, trim:-trim]
+
+    #     return trimmed_heights.mean(dim=1)
+
     def _get_local_terrain_height(self):
         """
-        Effective terrain height over the robot support footprint.
-        Assumes self.measured_heights has shape [num_envs, num_points].
+        Robust supporting-surface height near the robot.
+
+        A high quantile ignores deep gaps between stepping stones while remaining
+        less sensitive than the absolute maximum to a single raised obstacle.
         """
         heights = self.measured_heights
 
-        sorted_heights = torch.sort(
-            heights,
-            dim=1,
-        ).values
+        if not torch.is_tensor(heights) or heights.ndim != 2:
+            return torch.zeros(
+                self.num_envs,
+                device=self.device,
+                dtype=self.root_states.dtype,
+            )
 
-        # Remove the lowest and highest 10%.
-        trim = max(1, heights.shape[1] // 10)
-
-        trimmed_heights = sorted_heights[:, trim:-trim]
-
-        return trimmed_heights.mean(dim=1)
+        return torch.quantile(heights, 0.80, dim=1)
 
     def _update_recovery_orientation_curriculum(self, episode_success):
         """
