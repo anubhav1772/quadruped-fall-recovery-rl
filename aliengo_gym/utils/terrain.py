@@ -273,6 +273,9 @@ class Terrain:
         stone_distance = lerp(0.05, 0.30)
         stepping_stones_height = lerp(0.0, 0.04)
 
+        # Avoid Isaac Gym's extremely deep default stepping-stone holes.
+        stepping_stones_depth = lerp(0.10, 0.40)
+
         stepping_stones_size = max(stepping_stones_size, 2.0 * cfg.horizontal_scale)
         stone_distance = max(stone_distance, cfg.horizontal_scale)
 
@@ -364,12 +367,20 @@ class Terrain:
 
         elif choice < proportions[5]:
             # Stepping stones.
+            # terrain_utils.stepping_stones_terrain(
+            #     terrain,
+            #     stone_size=stepping_stones_size,
+            #     stone_distance=stone_distance,
+            #     max_height=stepping_stones_height,
+            #     platform_size=0.4,
+            # )
             terrain_utils.stepping_stones_terrain(
                 terrain,
                 stone_size=stepping_stones_size,
                 stone_distance=stone_distance,
                 max_height=stepping_stones_height,
                 platform_size=0.4,
+                depth=-stepping_stones_depth,
             )
 
         elif choice < proportions[6]:
