@@ -79,8 +79,9 @@ class FallRecoveryConfig(BaseCfg):
 
         # Do not restrict recovery exploration initially
         terminal_action_clip = None
-        near_crouch_action_clip = None
-        near_stand_action_clip = None
+
+        near_crouch_action_clip = None #2.0
+        near_stand_action_clip = None #0.90
 
         debug_log_terminal_reset = False
 
@@ -298,8 +299,8 @@ class FallRecoveryConfig(BaseCfg):
         recovery_contact_force_threshold = 1.0
         recovery_min_foot_contacts = 3
 
-        recovery_success_steps = 25     # 0.5 seconds
-        require_non_slipping_contacts = True
+        recovery_success_steps = 10     # 0.2 seconds (10x0.02), dt = 0.02 = 0.005 x 4
+        require_non_slipping_contacts = False
 
         # Retained for diagnostics and later stages
         recovery_foot_slip_vel_threshold = 0.12
@@ -337,8 +338,8 @@ class FallRecoveryConfig(BaseCfg):
         base_contact = -0.5
 
         # Exploration-safe regularization
-        feet_slip = 0.0
-        body_slip = 0.0
+        body_slip = -5.0e-3
+        feet_slip = -5.0e-3
         action_smoothness_1 = -1.0e-3
         action_smoothness_2 = -2.0e-4
 
