@@ -122,7 +122,13 @@ class LeggedRobot(BaseTask):
             self.gravity_vec,
         )
 
-        z = self.root_states[:, 2]
+        # z = self.root_states[:, 2]
+        local_terrain_height = self._get_local_terrain_height()
+
+        relative_base_height = (
+            self.root_states[:, 2]
+            - local_terrain_height
+        )
 
         self.near_crouch_clip_frac = torch.tensor(
             0.0,
@@ -145,7 +151,7 @@ class LeggedRobot(BaseTask):
         if near_crouch_action_clip is not None:
             near_crouch = (
                 (g_now[:, 2] < -0.45)
-                & (z > 0.18)
+                & (relative_base_height > 0.18)
             )
 
             self.near_crouch_clip_frac = near_crouch.float().mean()
@@ -160,7 +166,7 @@ class LeggedRobot(BaseTask):
         if near_stand_action_clip is not None:
             near_stand = (
                 (g_now[:, 2] < -0.75)
-                & (z > 0.27)
+                & (relative_base_height > 0.27)
             )
 
             self.near_stand_clip_frac = near_stand.float().mean()
@@ -171,11 +177,7 @@ class LeggedRobot(BaseTask):
                     clip_actions,
                 )
 
-        self.actions = torch.clamp(
-            actions,
-            -effective_clip,
-            effective_clip,
-        ).to(self.device)
+        self.actions = torch.clamp(actions, -effective_clip, effective_clip).to(self.device)
 
         # step physics and render each frame
         self.prev_base_pos = self.base_pos.clone()
