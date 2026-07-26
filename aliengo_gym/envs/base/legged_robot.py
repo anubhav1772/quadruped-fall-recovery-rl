@@ -406,53 +406,41 @@ class LeggedRobot(BaseTask):
     #
 
     def check_termination(self):
-        self.reset_buf = torch.zeros(
-            self.num_envs,
-            dtype=torch.bool,
-            device=self.device,
-        )
+        self.reset_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
-        # ------------------------------------------------------------
         # Recovery success should be detected in check_recovery_success().
         # During terminal-stabilizer training, do NOT terminate on success.
         # The policy must learn to remain stable after reaching recovery.
-        # ------------------------------------------------------------
         if not hasattr(self, "success_reset_buf"):
-            self.success_reset_buf = torch.zeros(
-                self.num_envs,
-                dtype=torch.bool,
-                device=self.device,
-            )
+            self.success_reset_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         self.success_reset_buf[:] = False
 
-        if self.cfg.env.train_recovery:
-            terminate_on_success = getattr(
-                self.cfg.env,
-                "terminate_on_recovery_success",
-                False,
-            )
+        # if self.cfg.env.train_recovery:
+        #     terminate_on_success = getattr(self.cfg.env, "terminate_on_recovery_success", False)
 
-            if terminate_on_success:
-                success_reset = (
-                    self.recovery_counter
-                    >= self.cfg.rewards.recovery_success_steps
-                )
-                self.success_reset_buf[:] = success_reset
-                self.reset_buf |= success_reset
+        #     if terminate_on_success:
+        #         success_reset = (self.recovery_counter >= self.cfg.rewards.recovery_success_steps)
+        #         self.success_reset_buf[:] = success_reset
+        #         self.reset_buf |= success_reset
 
-        # ------------------------------------------------------------
+
+        if (self.cfg.env.train_recovery and getattr(self.cfg.env, "terminate_on_recovery_success", True)):
+            success_reset = self.recovery_counter >= self.cfg.rewards.recovery_success_steps
+            self.success_reset_buf[:] = success_reset
+            self.reset_buf |= self.success_reset_buf
+
         # Timeout
-        # ------------------------------------------------------------
         self.time_out_buf = (
             self.episode_length_buf > self.cfg.env.max_episode_length
         )
         self.reset_buf |= self.time_out_buf
 
-        # ------------------------------------------------------------
         # Bad / exploded physics state reset
-        # ------------------------------------------------------------
-        root_z = self.root_states[:, 2]
+        # root_z = self.root_states[:, 2]
+        local_terrain_height = self._get_local_terrain_height()
+        relative_base_height = self.root_states[:, 2] - local_terrain_height
+
         lin_vel_norm = torch.norm(self.root_states[:, 7:10], dim=1)
         ang_vel_norm = torch.norm(self.root_states[:, 10:13], dim=1)
 
@@ -463,8 +451,8 @@ class LeggedRobot(BaseTask):
             | torch.isinf(self.dof_pos).any(dim=1)
             | torch.isnan(self.dof_vel).any(dim=1)
             | torch.isinf(self.dof_vel).any(dim=1)
-            | (root_z < -1.0)
-            | (root_z > 2.0)
+            | (relative_base_height < -1.0)
+            | (relative_base_height > 2.0)
             | (lin_vel_norm > 20.0)
             | (ang_vel_norm > 50.0)
         )
@@ -472,9 +460,7 @@ class LeggedRobot(BaseTask):
         self.bad_state_buf = bad_state
         self.reset_buf |= self.bad_state_buf
 
-        # ------------------------------------------------------------
         # Debug logging
-        # ------------------------------------------------------------
         if not hasattr(self, "extras"):
             self.extras = {}
 
@@ -484,8 +470,8 @@ class LeggedRobot(BaseTask):
         self.extras["recovery_debug"]["success_reset_frac"] = self.success_reset_buf.float().mean().item()
         self.extras["recovery_debug"]["timeout_frac"] = self.time_out_buf.float().mean().item()
         self.extras["recovery_debug"]["bad_state_frac"] = self.bad_state_buf.float().mean().item()
-        self.extras["recovery_debug"]["root_z_min"] = root_z.min().item()
-        self.extras["recovery_debug"]["root_z_max"] = root_z.max().item()
+        self.extras["recovery_debug"]["relative_base_height_min"] = relative_base_height.min().item()
+        self.extras["recovery_debug"]["relative_base_height_max"] = relative_base_height.max().item()
         self.extras["recovery_debug"]["lin_vel_norm_max"] = lin_vel_norm.max().item()
         self.extras["recovery_debug"]["ang_vel_norm_max"] = ang_vel_norm.max().item()
 
@@ -1524,15 +1510,26 @@ class LeggedRobot(BaseTask):
         self._call_train_eval(self._reset_dofs, env_ids)
 
         # Reset ROOT STATE
-        # if self.cfg.env.train_recovery:
-        #     self._call_train_eval(self._reset_root_states_fall_recovery, env_ids)
-        # else:
-        #     self._call_train_eval(self._reset_root_states, env_ids)
-
         if self.cfg.env.train_recovery:
             self._call_train_eval(self._reset_root_states_fall_recovery, env_ids)
+
+            # First observation after a reset contains orientation and velocity from the previous episode
+            # Important: since projected gravity is primary fall-orientation observation.
+            # Fix:
+            reset_quat = self.root_states[env_ids, 3:7]
+
+            self.base_lin_vel[env_ids] = quat_rotate_inverse(reset_quat, self.root_states[env_ids, 7:10])
+            self.base_ang_vel[env_ids] = quat_rotate_inverse(reset_quat, self.root_states[env_ids, 10:13])
+            self.projected_gravity[env_ids] = quat_rotate_inverse(reset_quat, self.gravity_vec[env_ids])
+
+            if hasattr(self, "last_root_vel"):
+                self.last_root_vel[env_ids] = self.root_states[env_ids, 7:13]
+
+            # Covers both fallen and terminal reset environments.
+            self._sync_recovery_control_history_after_reset(env_ids)
         else:
             self._call_train_eval(self._reset_root_states, env_ids)
+
 
         # Domain randomization
         self._call_train_eval(self._randomize_dof_props, env_ids)
@@ -1582,9 +1579,7 @@ class LeggedRobot(BaseTask):
             #         )
             #     self.episode_sums[key][train_env_ids] = 0.
             for key in self.episode_sums.keys():
-                self.extras["train/episode"]['rew_' + key] = torch.mean(
-                    self.episode_sums[key][train_env_ids]
-                )
+                self.extras["train/episode"]['rew_' + key] = torch.mean(self.episode_sums[key][train_env_ids])
                 self.episode_sums[key][train_env_ids] = 0.
         eval_env_ids = env_ids[env_ids >= self.num_train_envs]
         if len(eval_env_ids) > 0:
@@ -2761,28 +2756,6 @@ class LeggedRobot(BaseTask):
         torques = torques * self.motor_strengths
         return torch.clip(torques, -self.torque_limits, self.torque_limits)
 
-    # def _reset_dofs(self, env_ids, cfg):
-    #     """ Resets DOF position and velocities of selected environmments
-    #     Positions are randomly selected within 0.5:1.5 x default positions.
-    #     Velocities are set to zero.
-
-    #     Args:
-    #         env_ids (List[int]): Environemnt ids
-    #     """
-
-    #     if self.cfg.env.train_recovery:
-    #         self.dof_pos[env_ids] = self.default_dof_pos + 0.5 * torch.randn(len(env_ids), self.num_dof, device=self.device)
-    #         self.dof_vel[env_ids] = 0.5 * torch.randn(len(env_ids), self.num_dof, device=self.device)
-    #         # self.dof_vel[env_ids] = 0.
-    #     else:
-    #         self.dof_pos[env_ids] = self.default_dof_pos * torch_rand_float(0.5, 1.5, (len(env_ids), self.num_dof),
-    #                                                                         device=self.device)
-    #         self.dof_vel[env_ids] = 0.
-
-    #     env_ids_int32 = env_ids.to(dtype=torch.int32)
-    #     self.gym.set_dof_state_tensor_indexed(self.sim,
-    #                                           gymtorch.unwrap_tensor(self.dof_state),
-    #                                           gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
 
     def _reset_dofs(self, env_ids, cfg):
         if self.cfg.env.train_recovery:
@@ -2801,151 +2774,6 @@ class LeggedRobot(BaseTask):
             len(env_ids_int32)
         )
 
-    # def _reset_root_states_fall_recovery(self, env_ids, cfg):
-    #     num_resets = len(env_ids)
-
-    #     # 1. XY position from terrain origins
-    #     self.root_states[env_ids, 0:2] = self.env_origins[env_ids, 0:2]
-
-    #     # 2. Orientation curriculum
-    #     progress = torch.clamp(
-    #         torch.tensor(self.common_step_counter, device=self.device) / 5e6,
-    #         0.0, 1.0
-    #     )
-
-    #     min_roll  = 0.6 + 0.4 * progress
-    #     min_pitch = 0.4 + 0.4 * progress
-    #     max_roll  = 0.8 + 1.2 * progress
-    #     max_pitch = 0.5 + 0.8 * progress
-
-    #     mag_roll  = min_roll  + (max_roll  - min_roll)  * torch.rand(num_resets, device=self.device) ** 0.5
-    #     mag_pitch = min_pitch + (max_pitch - min_pitch) * torch.rand(num_resets, device=self.device) ** 0.5
-
-    #     sign_roll  = torch.where(torch.rand(num_resets, device=self.device) > 0.5,  1.0, -1.0)
-    #     sign_pitch = torch.where(torch.rand(num_resets, device=self.device) > 0.5,  1.0, -1.0)
-
-    #     roll  = sign_roll  * mag_roll
-    #     pitch = sign_pitch * mag_pitch
-    #     yaw   = torch.rand(num_resets, device=self.device) * 2 * torch.pi - torch.pi
-
-    #     quat    = quat_from_euler_xyz(roll, pitch, yaw)
-    #     gravity = self.gravity_vec[env_ids]
-    #     g       = quat_rotate_inverse(quat, gravity)
-
-    #     # Reject near-upright (gz < -0.1) AND fully supine (gz > 0.8)
-    #     # Keep sideways + partial falls: gz in [-0.1, 0.8]
-    #     # mask = (g[:, 2] < -0.1) | (g[:, 2] > 0.8)
-    #     # Use rollout_recovered as curriculum signal (already tracked in your debug)
-    #     # recovery_rate = self.rollout_recovered.float().mean().item()
-    #     recovery_rate = self.recovery_rate_ema
-
-    #     if recovery_rate < 0.25:
-    #         # Phase 1: supine only - easiest, symmetric
-    #         mask = g[:, 2] < 0.1 #0.3
-    #     elif recovery_rate < 0.55:
-    #         # Phase 2: all fallen states including sideways
-    #         mask = g[:, 2] < -0.1
-    #     else:
-    #         # Phase 3: exclude easy supine, force harder sideways
-    #         mask = (g[:, 2] < -0.1) | (g[:, 2] > 0.8)
-
-    #     max_iters = 20
-    #     for _ in range(max_iters):
-    #         if not mask.any():
-    #             break
-    #         idx = mask.nonzero(as_tuple=False).flatten()
-    #         roll[idx]  = (torch.rand(len(idx), device=self.device) * 2 - 1) * torch.pi
-    #         pitch[idx] = (torch.rand(len(idx), device=self.device) * 2 - 1) * torch.pi
-    #         quat[idx]  = quat_from_euler_xyz(roll[idx], pitch[idx], yaw[idx])
-    #         g[idx]     = quat_rotate_inverse(quat[idx], gravity[idx])
-    #         # mask       = (g[:, 2] < -0.1) | (g[:, 2] > 0.8)
-    #         if recovery_rate < 0.25:
-    #             # Phase 1: supine only — easiest, symmetric
-    #             mask = g[:, 2] < 0.3
-    #         elif recovery_rate < 0.55:
-    #             # Phase 2: all fallen states including sideways
-    #             mask = g[:, 2] < -0.1
-    #         else:
-    #             # Phase 3: exclude easy supine, force harder sideways
-    #             mask = (g[:, 2] < -0.1) | (g[:, 2] > 0.8)
-
-    #     # 3. Height: low enough to land quickly, varied
-    #     # Robot-aware spawn height
-    #     if self.cfg.env.robot == "go1":
-    #         self.root_states[env_ids, 2] = 0.15 + 0.06 * torch.rand(num_resets, device=self.device)
-    #     else:  # aliengo
-    #         self.root_states[env_ids, 2] = 0.18 + 0.08 * torch.rand(num_resets, device=self.device)
-
-    #     # 4. Orientation
-    #     self.root_states[env_ids, 3:7] = quat
-
-    #     # 5. Velocities — small linear only, NO angular at reset
-    #     vel = torch.zeros(num_resets, 6, device=self.device)
-    #     vel[:, 0:3] = 0.05 * torch.randn(num_resets, 3, device=self.device)
-    #     vel[:, 2]   = torch.clamp(vel[:, 2], -0.1, 0.0)
-    #     # vel[:, 3:6] = 0  ← keep zero, don't add angular vel at reset
-    #     self.root_states[env_ids, 7:13] = vel
-
-    #     # 6. Push to sim
-    #     env_ids_int32 = env_ids.to(dtype=torch.int32)
-
-    #     self.gym.set_dof_state_tensor_indexed(
-    #         self.sim,
-    #         gymtorch.unwrap_tensor(self.dof_state),
-    #         gymtorch.unwrap_tensor(env_ids_int32),
-    #         len(env_ids_int32)
-    #     )
-
-    #     self.gym.set_actor_root_state_tensor_indexed(
-    #         self.sim,
-    #         gymtorch.unwrap_tensor(self.root_states),
-    #         gymtorch.unwrap_tensor(env_ids_int32),
-    #         len(env_ids_int32)
-    #     )
-
-    #     # 7. Settle — enough steps for body to land and stop bouncing
-    #     #    dt=0.005s × 25 steps = 125ms — sufficient for ~0.2m drop
-    #     zero_torques = torch.zeros_like(self.torques)
-    #     settle_steps = 20 if self.cfg.env.robot == "go1" else 25
-    #     for _ in range(settle_steps):
-    #         self.gym.set_dof_actuation_force_tensor(
-    #             self.sim, gymtorch.unwrap_tensor(zero_torques)
-    #         )
-    #         self.gym.simulate(self.sim)
-    #         self.gym.fetch_results(self.sim, True)
-
-    #     self.gym.refresh_actor_root_state_tensor(self.sim)
-    #     self.gym.refresh_net_contact_force_tensor(self.sim)
-    #     self.gym.refresh_dof_state_tensor(self.sim)
-    #     self.gym.refresh_rigid_body_state_tensor(self.sim)
-
-    #     # 8. Debug — recompute gz from fresh quat
-    #     fresh_quat = self.root_states[env_ids, 3:7]
-    #     g_post     = quat_rotate_inverse(fresh_quat, self.gravity_vec[env_ids])
-    #     gz         = g_post[:, 2]
-
-    #     sideways = ((gz > -0.7) & (gz < 0.3)).float().mean()
-    #     fallen   = (gz >= 0.3).float().mean()
-    #     upright  = (gz < -0.7).float().mean()
-    #     print(f"[POST-SETTLE] upright={upright:.2f} sideways={sideways:.2f} fallen={fallen:.2f} | "
-    #           f"gz min={gz.min():.3f} mean={gz.mean():.3f} max={gz.max():.3f}")
-
-    #     if cfg.env.record_video and 0 in env_ids:
-    #         if self.complete_video_frames is None:
-    #             self.complete_video_frames = []
-    #         else:
-    #             self.complete_video_frames = self.video_frames[:]
-    #         self.video_frames = []
-
-    #     if cfg.env.record_video and self.eval_cfg is not None and self.num_train_envs in env_ids:
-    #         if self.complete_video_frames_eval is None:
-    #             self.complete_video_frames_eval = []
-    #         else:
-    #             self.complete_video_frames_eval = self.video_frames_eval[:]
-    #         self.video_frames_eval = []
-
-
-
 
     def _reset_root_states_fall_recovery_fallen(self, env_ids, cfg):
         if len(env_ids) == 0:
@@ -2954,116 +2782,49 @@ class LeggedRobot(BaseTask):
         env_ids = env_ids.to(device=self.device, dtype=torch.long)
         num_resets = len(env_ids)
 
-        # ------------------------------------------------------------
         # XY position
-        # ------------------------------------------------------------
         # self.root_states[env_ids, 0:2] = self.env_origins[env_ids, 0:2]
 
-        # ------------------------------------------------------------
         # XY spawn: mixture of center replay and off-center terrain
-        # ------------------------------------------------------------
-        center_fraction = float(getattr(
-            cfg.terrain,
-            "recovery_center_spawn_fraction",
-            0.25,
-        ))
-        center_jitter = float(getattr(
-            cfg.terrain,
-            "recovery_center_spawn_jitter",
-            0.15,
-        ))
-        min_radius = float(getattr(
-            cfg.terrain,
-            "recovery_spawn_min_radius",
-            0.55,
-        ))
-        max_radius = float(getattr(
-            cfg.terrain,
-            "recovery_spawn_max_radius",
-            1.25,
-        ))
+        center_fraction = float(getattr(cfg.terrain, "recovery_center_spawn_fraction", 0.25))
+        center_jitter = float(getattr(cfg.terrain, "recovery_center_spawn_jitter", 0.15))
+        min_radius = float(getattr(cfg.terrain, "recovery_spawn_min_radius", 0.55))
+        max_radius = float(getattr(cfg.terrain, "recovery_spawn_max_radius", 1.25))
 
-        offsets = torch.zeros(
-            num_resets,
-            2,
-            device=self.device,
-            dtype=self.root_states.dtype,
-        )
+        offsets = torch.zeros(num_resets, 2, device=self.device, dtype=self.root_states.dtype)
 
-        center_mask = (
-            torch.rand(num_resets, device=self.device)
-            < center_fraction
-        )
+        center_mask = torch.rand(num_resets, device=self.device) < center_fraction
         off_center_mask = ~center_mask
 
         # Small center-region jitter for easy/replay samples.
         if center_mask.any():
             count = int(center_mask.sum().item())
-
-            offsets[center_mask] = (
-                2.0 * torch.rand(
-                    count,
-                    2,
-                    device=self.device,
-                    dtype=self.root_states.dtype,
-                ) - 1.0
-            ) * center_jitter
+            offsets[center_mask] = (2.0 * torch.rand(count, 2, device=self.device, dtype=self.root_states.dtype) - 1.0) * center_jitter
 
         # Uniform-area sampling inside an annulus.
         if off_center_mask.any():
             count = int(off_center_mask.sum().item())
+            angle = 2.0 * torch.pi * torch.rand(count, device=self.device, dtype=self.root_states.dtype)
 
-            angle = (
-                2.0
-                * torch.pi
-                * torch.rand(
-                    count,
-                    device=self.device,
-                    dtype=self.root_states.dtype,
-                )
-            )
-
-            radius_u = torch.rand(
-                count,
-                device=self.device,
-                dtype=self.root_states.dtype,
-            )
-
-            radius = torch.sqrt(
-                min_radius ** 2
-                + radius_u * (max_radius ** 2 - min_radius ** 2)
-            )
+            radius_u = torch.rand(count, device=self.device, dtype=self.root_states.dtype)
+            radius = torch.sqrt(min_radius ** 2 + radius_u * (max_radius ** 2 - min_radius ** 2))
 
             offsets[off_center_mask, 0] = radius * torch.cos(angle)
             offsets[off_center_mask, 1] = radius * torch.sin(angle)
 
-        self.root_states[env_ids, 0:2] = (
-            self.env_origins[env_ids, 0:2] + offsets
-        )
+        self.root_states[env_ids, 0:2] = self.env_origins[env_ids, 0:2] + offsets
 
-        # ------------------------------------------------------------
         # Sample candidate orientations for the episode's fixed bin.
         # A normalized Gaussian quaternion is uniform on SO(3); sampling
         # roll/pitch/yaw independently would bias the orientation density.
-        # ------------------------------------------------------------
         orientation_bins = self.episode_orientation_bin[env_ids]
-        quat = torch.randn(
-            num_resets,
-            4,
-            device=self.device,
-            dtype=self.root_states.dtype,
-        )
+        quat = torch.randn(num_resets, 4, device=self.device, dtype=self.root_states.dtype)
         quat = quat / torch.norm(quat, dim=1, keepdim=True).clamp_min(1e-8)
         gravity = self.gravity_vec[env_ids]
         projected_gravity = quat_rotate_inverse(quat, gravity)
-        reject = self._get_orientation_rejection_mask(
-            projected_gravity[:, 2],
-            orientation_bins,
-        )
+        reject = self._get_orientation_rejection_mask(projected_gravity[:, 2], orientation_bins)
 
-        # ------------------------------------------------------------
         # Rejection sampling
-        # ------------------------------------------------------------
         max_iterations = 32
 
         for _ in range(max_iterations):
@@ -3072,46 +2833,22 @@ class LeggedRobot(BaseTask):
 
             idx = reject.nonzero(as_tuple=False).flatten()
             count = idx.numel()
-            new_quat = torch.randn(
-                count,
-                4,
-                device=self.device,
-                dtype=self.root_states.dtype,
-            )
-            new_quat = new_quat / torch.norm(
-                new_quat,
-                dim=1,
-                keepdim=True,
-            ).clamp_min(1e-8)
+            new_quat = torch.randn(count, 4, device=self.device, dtype=self.root_states.dtype)
+            new_quat = new_quat / torch.norm(new_quat, dim=1, keepdim=True).clamp_min(1e-8)
             quat[idx] = new_quat
             projected_gravity[idx] = quat_rotate_inverse(quat[idx], gravity[idx])
-            reject = self._get_orientation_rejection_mask(
-                projected_gravity[:, 2],
-                orientation_bins,
-            )
+            reject = self._get_orientation_rejection_mask(projected_gravity[:, 2], orientation_bins)
 
-        # ------------------------------------------------------------
         # Deterministic fallback
-        # ------------------------------------------------------------
         if reject.any():
             idx = reject.nonzero(as_tuple=False).flatten()
             # Interior gravity-z targets for bins 0..3.  With pitch=0,
             # projected gravity z is -cos(roll).
-            fallback_gz = torch.tensor(
-                [0.85, 0.45, 0.0, -0.50],
-                device=self.device,
-                dtype=self.root_states.dtype,
-            )[orientation_bins[idx]]
+            fallback_gz = torch.tensor([0.85, 0.45, 0.0, -0.50], device=self.device, dtype=self.root_states.dtype)[orientation_bins[idx]]
             fallback_roll = torch.acos(torch.clamp(-fallback_gz, -1.0, 1.0))
             fallback_pitch = torch.zeros_like(fallback_roll)
-            fallback_yaw = (
-                2.0 * torch.rand(idx.numel(), device=self.device) - 1.0
-            ) * torch.pi
-            quat[idx] = quat_from_euler_xyz(
-                fallback_roll,
-                fallback_pitch,
-                fallback_yaw,
-            )
+            fallback_yaw = (2.0 * torch.rand(idx.numel(), device=self.device) - 1.0) * torch.pi
+            quat[idx] = quat_from_euler_xyz(fallback_roll, fallback_pitch, fallback_yaw)
 
         # Store the selected orientation before height sampling.
         self.root_states[env_ids, 3:7] = quat
@@ -3120,9 +2857,7 @@ class LeggedRobot(BaseTask):
         # than root_states[:, 3:7].
         self.base_quat[env_ids] = quat
 
-        # ------------------------------------------------------------
         # Terrain-relative spawn height
-        # ------------------------------------------------------------
 
         # Z does not affect the height-map XY indices.
         self.root_states[env_ids, 2] = 0.0
@@ -3141,9 +2876,7 @@ class LeggedRobot(BaseTask):
         # Keep cached base state consistent with the reset state.
         self.base_pos[env_ids] = self.root_states[env_ids, 0:3]
 
-        # ------------------------------------------------------------
         # Initial root velocities
-        # ------------------------------------------------------------
         root_velocity = torch.zeros(num_resets, 6, device=self.device, dtype=self.root_states.dtype)
 
         root_velocity[:, 0:3] = 0.05 * torch.randn(num_resets, 3, device=self.device)
@@ -3154,9 +2887,7 @@ class LeggedRobot(BaseTask):
         # Initial angular velocity remains zero.
         self.root_states[env_ids, 7:13] = root_velocity
 
-        # ------------------------------------------------------------
         # Push reset state to Isaac Gym
-        # ------------------------------------------------------------
         env_ids_int32 = env_ids.to(dtype=torch.int32)
 
         self.gym.set_dof_state_tensor_indexed(
@@ -3177,14 +2908,10 @@ class LeggedRobot(BaseTask):
         # That would advance all environments outside the normal
         # policy-step/reward/observation pipeline.
 
-        # ------------------------------------------------------------
         # Reset policy and controller history
-        # ------------------------------------------------------------
-        self._sync_recovery_control_history_after_reset(env_ids)
+        # self._sync_recovery_control_history_after_reset(env_ids)
 
-        # ------------------------------------------------------------
         # Reset-source diagnostics
-        # ------------------------------------------------------------
         if not hasattr(self, "terminal_reset_buf"):
             self.terminal_reset_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
@@ -3192,9 +2919,7 @@ class LeggedRobot(BaseTask):
 
         self._mark_recovery_reset_source(env_ids, source_value=0.0)
 
-        # ------------------------------------------------------------
         # Orientation diagnostics
-        # ------------------------------------------------------------
         sampled_gravity = quat_rotate_inverse(quat, gravity)
         gravity_z = sampled_gravity[:, 2]
         if self.common_step_counter % 1000 == 0:
@@ -3208,9 +2933,7 @@ class LeggedRobot(BaseTask):
                 f"max={gravity_z.max().item():.3f}",
             )
 
-        # ------------------------------------------------------------
         # Video bookkeeping
-        # ------------------------------------------------------------
         if (
             cfg.env.record_video
             and hasattr(self, "record_env_id")
@@ -3234,55 +2957,6 @@ class LeggedRobot(BaseTask):
             self.video_frames_eval = []
 
 
-    # def _reset_root_states_fall_recovery(self, env_ids, cfg):
-    #     """
-    #     Recovery reset dispatcher.
-
-    #     Keeps the external reset call unchanged:
-
-    #         self._call_train_eval(self._reset_root_states_fall_recovery, env_ids)
-
-    #     Internally, it chooses between:
-    #         0 = normal fallen-state reset
-    #         1 = near-terminal standing reset
-
-    #     For the next short stabilization run, use:
-    #         cfg.env.terminal_stance_reset_prob = 1.0
-
-    #     Later:
-    #         0.7 terminal / 0.3 fallen
-    #         0.4 terminal / 0.6 fallen
-    #         0.0 terminal / 1.0 fallen
-    #     """
-
-    #     if len(env_ids) == 0:
-    #         return
-
-    #     terminal_prob = getattr(cfg.env, "terminal_stance_reset_prob", 0.0)
-    #     terminal_prob = float(terminal_prob)
-
-    #     if terminal_prob <= 0.0:
-    #         self._reset_root_states_fall_recovery_fallen(env_ids, cfg)
-    #         return
-
-    #     if terminal_prob >= 1.0:
-    #         self._reset_root_states_recovery_terminal_stance(env_ids, cfg)
-    #         return
-
-    #     use_terminal = (
-    #         torch.rand(len(env_ids), device=self.device) < terminal_prob
-    #     )
-
-    #     terminal_env_ids = env_ids[use_terminal]
-    #     fallen_env_ids = env_ids[~use_terminal]
-
-    #     if len(terminal_env_ids) > 0:
-    #         self._reset_root_states_recovery_terminal_stance(terminal_env_ids, cfg)
-
-    #     if len(fallen_env_ids) > 0:
-    #         self._reset_root_states_fall_recovery_fallen(fallen_env_ids, cfg)
-    #
-
     def _reset_root_states_fall_recovery(self, env_ids, cfg):
         """
         Fall-recovery reset dispatcher.
@@ -3294,20 +2968,16 @@ class LeggedRobot(BaseTask):
         if len(env_ids) == 0:
             return
 
-        # ------------------------------------------------------------
         # DEBUG MODE:
         # Force clean terminal stance only.
         # This checks whether the terminal pose itself is physically valid.
-        # ------------------------------------------------------------
         if getattr(cfg.env, "debug_clean_terminal_reset", False):
             self._reset_root_states_recovery_terminal_stance(env_ids, cfg)
             return
 
-        # ------------------------------------------------------------
         # TRAINING MODE:
         # Mix terminal-stance resets and normal fallen resets.
         # Important: mask must have shape [len(env_ids)], not [num_envs].
-        # ------------------------------------------------------------
         terminal_prob = getattr(cfg.env, "terminal_stance_reset_prob", 0.0)
 
         reset_sample = torch.rand(len(env_ids), device=self.device)
@@ -3348,286 +3018,96 @@ class LeggedRobot(BaseTask):
             f"Unexpected default_dof_pos shape: {self.default_dof_pos.shape}"
         )
 
-
-    # def _reset_root_states_recovery_terminal_stance(self, env_ids, cfg):
-    #     """
-    #     Near-terminal recovery reset.
-
-    #     Purpose:
-    #         Train the missing final skill:
-    #             near-standing -> reduce foot slip -> stabilize contacts -> handoff-ready
-
-    #     Important:
-    #         Do NOT zero-torque settle here.
-    #         Zero-torque settling is useful for fallen resets, but for near-standing
-    #         resets it can immediately collapse the robot before the policy acts.
-    #     """
-
-    #     if len(env_ids) == 0:
-    #         return
-
-    #     num_resets = len(env_ids)
-    #     env_ids_int32 = env_ids.to(dtype=torch.int32)
-
-    #     # ------------------------------------------------------------
-    #     # 1. Base position
-    #     # ------------------------------------------------------------
-    #     self.root_states[env_ids, 0:2] = self.env_origins[env_ids, 0:2]
-
-    #     if self.cfg.env.robot == "go1":
-    #         # Near standing but not always exactly perfect.
-    #         self.root_states[env_ids, 2] = torch_rand_float(
-    #             0.305, 0.335, (num_resets, 1), device=self.device
-    #         ).squeeze(1)
-    #     else:
-    #         self.root_states[env_ids, 2] = torch_rand_float(
-    #             0.40, 0.46, (num_resets, 1), device=self.device
-    #         ).squeeze(1)
-
-    #     # ------------------------------------------------------------
-    #     # 2. Base orientation
-    #     # ------------------------------------------------------------
-    #     roll = torch_rand_float(
-    #         -0.08, 0.08, (num_resets, 1), device=self.device
-    #     ).squeeze(1)
-
-    #     pitch = torch_rand_float(
-    #         -0.08, 0.08, (num_resets, 1), device=self.device
-    #     ).squeeze(1)
-
-    #     yaw = torch_rand_float(
-    #         -torch.pi, torch.pi, (num_resets, 1), device=self.device
-    #     ).squeeze(1)
-
-    #     quat = quat_from_euler_xyz(roll, pitch, yaw)
-    #     self.root_states[env_ids, 3:7] = quat
-
-    #     # ------------------------------------------------------------
-    #     # 3. Base velocity
-    #     # ------------------------------------------------------------
-    #     self.root_states[env_ids, 7:13] = 0.0
-
-    #     # Small horizontal perturbation only.
-    #     self.root_states[env_ids, 7:9] = torch_rand_float(
-    #         -0.03, 0.03, (num_resets, 2), device=self.device
-    #     )
-
-    #     # Very small angular perturbation.
-    #     self.root_states[env_ids, 10:13] = torch_rand_float(
-    #         -0.08, 0.08, (num_resets, 3), device=self.device
-    #     )
-
-    #     # ------------------------------------------------------------
-    #     # 4. Joint state
-    #     # ------------------------------------------------------------
-    #     q_nominal = self._get_default_dof_pos_for_env_ids(env_ids)
-
-    #     # Easier terminal reset for first stability/debug run.
-    #     q_noise = 0.01 * torch.randn(
-    #         num_resets, self.num_dof, device=self.device
-    #     )
-
-    #     q_min = self.dof_pos_limits[:, 0].unsqueeze(0)
-    #     q_max = self.dof_pos_limits[:, 1].unsqueeze(0)
-
-    #     q_reset = torch.minimum(
-    #         torch.maximum(q_nominal + q_noise, q_min),
-    #         q_max,
-    #     )
-
-    #     self.dof_pos[env_ids] = q_reset
-    #     self.dof_vel[env_ids] = 0.0
-
-    #     # Store the exact reset pose so we can test whether this pose is physically stable
-    #     # when the PD controller holds it.
-    #     if not hasattr(self, "debug_hold_dof_pos"):
-    #         self.debug_hold_dof_pos = torch.zeros_like(self.dof_pos)
-
-    #     self.debug_hold_dof_pos[env_ids] = q_reset
-
-    #     # ------------------------------------------------------------
-    #     # 5. Push state to simulator
-    #     # ------------------------------------------------------------
-    #     self.gym.set_dof_state_tensor_indexed(
-    #         self.sim,
-    #         gymtorch.unwrap_tensor(self.dof_state),
-    #         gymtorch.unwrap_tensor(env_ids_int32),
-    #         len(env_ids_int32),
-    #     )
-
-    #     self.gym.set_actor_root_state_tensor_indexed(
-    #         self.sim,
-    #         gymtorch.unwrap_tensor(self.root_states),
-    #         gymtorch.unwrap_tensor(env_ids_int32),
-    #         len(env_ids_int32),
-    #     )
-
-    #     self.gym.refresh_actor_root_state_tensor(self.sim)
-    #     self.gym.refresh_net_contact_force_tensor(self.sim)
-    #     self.gym.refresh_dof_state_tensor(self.sim)
-    #     self.gym.refresh_rigid_body_state_tensor(self.sim)
-
-    #     # ------------------------------------------------------------
-    #     # 6. Critical: remove stale action/target history
-    #     # ------------------------------------------------------------
-    #     self._sync_recovery_control_history_after_reset(env_ids)
-
-    #     # 1 = terminal reset. Useful for dashboard/debugging.
-    #     self._mark_recovery_reset_source(env_ids, source_value=1.0)
-
-    #     # ------------------------------------------------------------
-    #     # 7. Video buffer handling
-    #     # ------------------------------------------------------------
-    #     if cfg.env.record_video and 0 in env_ids:
-    #         if self.complete_video_frames is None:
-    #             self.complete_video_frames = []
-    #         else:
-    #             self.complete_video_frames = self.video_frames[:]
-    #         self.video_frames = []
-
-    #     if cfg.env.record_video and self.eval_cfg is not None and self.num_train_envs in env_ids:
-    #         if self.complete_video_frames_eval is None:
-    #             self.complete_video_frames_eval = []
-    #         else:
-    #             self.complete_video_frames_eval = self.video_frames_eval[:]
-    #         self.video_frames_eval = []
-    #
-
     def _reset_root_states_recovery_terminal_stance(self, env_ids, cfg):
         """
-        Clean terminal-stance reset.
+        Reset selected recovery environments to an upright near-handoff stance.
 
-        Purpose:
-            Create a physically valid near-handoff standing state.
+        The robot is placed at the center of its terrain cell, with its base at the
+        configured standing height above a conservative estimate of the local
+        terrain elevation. Root velocities are cleared and the joints are placed
+        in the default standing pose.
 
-        This is NOT a fallen reset. It should initialize the robot in an upright,
-        feet-on-ground, no-body-contact standing pose.
+        This function does not advance the simulator. Contact forces and foot-contact
+        diagnostics therefore become meaningful only after the next normal physics
+        step.
 
-        Use this first with:
-            debug_hold_reset_pose = True
+        For isolated validation, use:
             debug_clean_terminal_reset = True
-            terminal_stance_reset_prob = 1.0
+            debug_hold_reset_pose = True
 
-        Expected result:
-            stable_height high
-            nonfoot_contact_env_frac near 0
-            foot_contact_count_mean around 3-4
-            base_height_mean around 0.30-0.34
+        When debug_clean_terminal_reset is enabled, terminal_stance_reset_prob is
+        bypassed because every selected environment receives this reset.
         """
 
         if len(env_ids) == 0:
             return
 
-        num_resets = len(env_ids)
-        env_ids_int32 = env_ids.to(dtype=torch.int32)
+        env_ids = env_ids.to(device=self.device, dtype=torch.long)
+        num_resets = env_ids.numel()
 
-        # ------------------------------------------------------------
-        # 1. Root position: clean standing height.
-        # ------------------------------------------------------------
+        env_ids_int32 = env_ids.to(dtype=torch.int32).contiguous()
+
+        # 1. Place the robot at the center of its terrain cell.
         self.root_states[env_ids, 0:2] = self.env_origins[env_ids, 0:2]
 
-        # Use a conservative standing height.
-        # Your previous debug showed base_height_mean ~0.19, which is too low.
-        self.root_states[env_ids, 2] = self.env_origins[env_ids, 2] + 0.34
-
-        # ------------------------------------------------------------
-        # 2. Root orientation: exactly upright.
-        # Quaternion format: x, y, z, w
-        # ------------------------------------------------------------
-        upright_quat = torch.tensor(
-            [0.0, 0.0, 0.0, 1.0],
-            device=self.device,
-            dtype=self.root_states.dtype,
-        ).repeat(num_resets, 1)
+        # 2. Set an exactly upright orientation.
+        # Isaac Gym quaternion convention: x, y, z, w.
+        upright_quat = torch.zeros(num_resets, 4, device=self.device, dtype=self.root_states.dtype)
+        upright_quat[:, 3] = 1.0
 
         self.root_states[env_ids, 3:7] = upright_quat
 
-        # ------------------------------------------------------------
-        # 3. Root velocities: zero.
-        # ------------------------------------------------------------
+        # base_quat is currently a view of root_states, but this assignment makes
+        # the dependency required by _get_heights() explicit.
+        self.base_quat[env_ids] = upright_quat
+
+        # 3. Compute terrain-relative standing height.
+        # Z does not affect the XY height-map lookup.
+        self.root_states[env_ids, 2] = 0.0
+
+        terminal_height_map = self._get_heights(env_ids, cfg)
+
+        local_ground_height = torch.quantile(terminal_height_map, 0.80, dim=1)
+
+        default_standing_height = float(getattr(cfg.rewards, "recovery_height_target", 0.34))
+        standing_height = float(getattr(cfg.env, "terminal_stance_base_height", default_standing_height))
+
+        self.root_states[env_ids, 2] = local_ground_height + standing_height
+
+        # 4. Clear root linear and angular velocities.
         self.root_states[env_ids, 7:13] = 0.0
 
-        # ------------------------------------------------------------
-        # 4. Joint pose: use default standing pose.
-        # Do NOT use a crouched/low pose here.
-        # ------------------------------------------------------------
+        # 5. Set the default standing joint configuration.
         q_reset = self._get_default_dof_pos_for_env_ids(env_ids).clone()
 
         self.dof_pos[env_ids, :self.num_dof] = q_reset[:, :self.num_dof]
         self.dof_vel[env_ids, :self.num_dof] = 0.0
 
-        # ------------------------------------------------------------
-        # 5. Store exact reset pose for debug_hold_reset_pose.
-        # step() will command this pose through the PD controller.
-        # ------------------------------------------------------------
+        # Used only when debug_hold_reset_pose is enabled.
         if hasattr(self, "debug_hold_dof_pos"):
             self.debug_hold_dof_pos[env_ids] = q_reset
 
-        # ------------------------------------------------------------
-        # 6. Reset action and target histories.
-        # This prevents artificial action-smoothness / PD transient spikes.
-        # ------------------------------------------------------------
-        n = min(self.num_actions, self.num_dof)
-
-        if hasattr(self, "joint_pos_target"):
-            self.joint_pos_target[env_ids, :n] = q_reset[:, :n]
-
-        if hasattr(self, "last_joint_pos_target"):
-            self.last_joint_pos_target[env_ids, :n] = q_reset[:, :n]
-
-        if hasattr(self, "last_last_joint_pos_target"):
-            self.last_last_joint_pos_target[env_ids, :n] = q_reset[:, :n]
-
-        if hasattr(self, "actions"):
-            self.actions[env_ids] = 0.0
-
-        if hasattr(self, "last_actions"):
-            self.last_actions[env_ids] = 0.0
-
-        if hasattr(self, "last_last_actions"):
-            self.last_last_actions[env_ids] = 0.0
-
-        if hasattr(self, "last_dof_vel"):
-            self.last_dof_vel[env_ids] = 0.0
-
-        if hasattr(self, "torques"):
-            self.torques[env_ids] = 0.0
-
-        if hasattr(self, "last_torques"):
-            self.last_torques[env_ids] = 0.0
-
-        # ------------------------------------------------------------
-        # 7. Mark reset source for dashboard.
-        # ------------------------------------------------------------
+        # 6. Record the reset source.
         if not hasattr(self, "terminal_reset_buf"):
-            self.terminal_reset_buf = torch.zeros(
-                self.num_envs,
-                device=self.device,
-                dtype=torch.bool,
-            )
+            self.terminal_reset_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
         self.terminal_reset_buf[env_ids] = True
+        self._mark_recovery_reset_source(env_ids, source_value=1.0)
 
-        self._mark_recovery_reset_source(env_ids, source_value=1.0)  # 1 = terminal reset
-
-        # ------------------------------------------------------------
-        # 8. Push state to simulator.
-        # Keep this if your reset functions directly update Isaac Gym tensors.
-        # If your reset_idx already does this globally later, duplicate setting is
-        # harmless but slightly redundant.
-        # ------------------------------------------------------------
+        # 7. These writes are required because this function modifies both the
+        # root state and the DOF state after _reset_dofs() has already run.
         self.gym.set_actor_root_state_tensor_indexed(
             self.sim,
             gymtorch.unwrap_tensor(self.root_states),
             gymtorch.unwrap_tensor(env_ids_int32),
-            len(env_ids_int32),
+            env_ids_int32.numel(),
         )
 
         self.gym.set_dof_state_tensor_indexed(
             self.sim,
             gymtorch.unwrap_tensor(self.dof_state),
             gymtorch.unwrap_tensor(env_ids_int32),
-            len(env_ids_int32),
+            env_ids_int32.numel(),
         )
 
 
@@ -4519,12 +3999,14 @@ class LeggedRobot(BaseTask):
         # Both training and evaluation resets receive a categorical fallen
         # orientation.  Only training environments participate in terrain
         # frontier sampling and statistics.
-        self.episode_orientation_bin[env_ids] = torch.randint(
-            0,
-            4,
-            (env_ids.numel(),),
-            device=self.device,
-        )
+        # self.episode_orientation_bin[env_ids] = torch.randint(
+        #     0,
+        #     4,
+        #     (env_ids.numel(),),
+        #     device=self.device,
+        # )
+        orientation_probs = torch.as_tensor(self.cfg.env.orientation_probs, dtype=torch.float32, device=self.device)
+        self.episode_orientation_bin[env_ids] = torch.multinomial(orientation_probs, num_samples=env_ids.numel(), replacement=True)
 
         train_ids = env_ids[env_ids < self.num_train_envs]
         if train_ids.numel() == 0:
@@ -5720,10 +5202,11 @@ class LeggedRobot(BaseTask):
         # There are exactly four bins, so the lower empirical quartile with
         # "lower" interpolation is the worst bin.  This prevents three easy
         # orientations from hiding failure in the fourth.
-        lower_quartile = torch.sort(rates, dim=1).values[:, 0]
+        # worst orientation bin
+        worst_bin_success = torch.sort(rates, dim=1).values[:, 0]
 
         self.frontier_last_mean_success[ready_types] = mean_rate
-        self.frontier_last_lower_quartile[ready_types] = lower_quartile
+        self.frontier_last_lower_quartile[ready_types] = worst_bin_success
         self.frontier_review_count[ready_types] += 1
 
         mean_threshold = float(getattr(
@@ -5738,7 +5221,7 @@ class LeggedRobot(BaseTask):
         ))
         passed = (
             (mean_rate >= mean_threshold)
-            & (lower_quartile >= quartile_threshold)
+            & (worst_bin_success >= quartile_threshold)
         )
 
         self.frontier_pass_windows[ready_types] = torch.where(
@@ -5781,7 +5264,7 @@ class LeggedRobot(BaseTask):
         tracking["frontier_level_min"] = self.terrain_frontier.min().item()
         tracking["frontier_level_max"] = self.terrain_frontier.max().item()
         tracking["frontier_review_mean_success"] = mean_rate.mean().item()
-        tracking["frontier_review_lower_quartile"] = lower_quartile.mean().item()
+        tracking["frontier_review_lower_quartile"] = worst_bin_success.mean().item()
         tracking["frontier_promotions_total"] = int(self.recovery_total_promotions)
         for bin_index in range(num_bins):
             tracking[f"frontier_bin_{bin_index}_success"] = (
