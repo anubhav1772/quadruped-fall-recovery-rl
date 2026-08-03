@@ -636,6 +636,24 @@ class CoRLRewards:
         return upright_gate * height_gate * posture_score
 
 
+    def _reward_base_lin_vel(self):
+        env = self.env
+
+        upright_gate = torch.clamp((-env.projected_gravity[:, 2] - 0.70) / 0.25, 0.0, 1.0)
+
+        body_height = self.get_body_height()
+        height_gate = torch.clamp((body_height - 0.27) / 0.06, 0.0, 1.0)
+
+        stable_count = self._terminal_stable_support_count()
+        support_gate = torch.clamp((stable_count - 1.5) / 1.0, 0.0, 1.0)
+
+        terminal_gate = upright_gate * height_gate * support_gate
+
+        lin_vel_cost = torch.sum(torch.square(env.base_lin_vel), dim=1)
+
+        return terminal_gate * lin_vel_cost
+
+
     def _reward_base_height(self):
         """
         Raw target-height reward without upright/contact gating.
@@ -827,8 +845,7 @@ class CoRLRewards:
 
     def _reward_stand_still_action(self):
         """
-        Penalize nonzero terminal actions after the robot is upright and raised.
-
+        Penalize sustained nonzero terminal actions after the robot is upright and raised.
         A weak penalty remains active before stable support is fully established,
         then increases as stable multi-foot support develops.
         """
