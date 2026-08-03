@@ -67,11 +67,14 @@ class FallRecoveryConfig(BaseCfg):
     class env(BaseCfg.env):
         train_recovery = True
 
+        debug_log_height_comparison = False
+
         # Episodes terminate after stable recovery
         terminate_on_recovery_success = True
 
         # Full fallen-state training
-        terminal_stance_reset_prob = 0.10
+        terminal_stance_reset_prob = 0.15 #0.05
+        orientation_probs = [0.50, 0.20, 0.20, 0.10]
 
         debug_clean_terminal_reset = False
         debug_zero_actions = False
@@ -89,7 +92,9 @@ class FallRecoveryConfig(BaseCfg):
         num_observations = 42  # ang_vel(3) in base + observe_only_ang_vel adds 3 more + gravity(3) + dof_pos(12) + dof_vel(12) + actions(12)
         num_scalar_observations = 42
         num_privileged_obs = 26 + 176
-        episode_length_s = 9  # longer episodes to allow full recovery sequences (9/4*0.005 = 450)
+        # policy_dt = 0.005 * 4 = 0.02 s
+        # episode_steps = 9 / 0.02 = 450
+        episode_length_s = 9  # 9 / (0.005 * 4) = 450 control steps
         observe_only_ang_vel = True  # prepend ang_vel again for emphasis in recovery task (gives 45 obs total)
 
         record_video = True
@@ -104,8 +109,8 @@ class FallRecoveryConfig(BaseCfg):
             0,   # descending smooth slope
             9,   # stairs direction 1
             10,  # stairs direction 2
-            11,  # discrete obstacles
-            13,  # stepping stones
+            # 11,  # discrete obstacles
+            # 13,  # stepping stones
             14,  # random terrain
             16,  # half-flat/half-rough
             5,   # rough slope
@@ -189,9 +194,9 @@ class FallRecoveryConfig(BaseCfg):
         # ]
 
         # Promotion evidence
-        frontier_min_trials_per_bin = 64
-        frontier_mean_promote_threshold = 0.80
-        frontier_lower_quartile_threshold = 0.70
+        frontier_min_trials_per_bin = 32
+        frontier_mean_promote_threshold = 0.60   #0.80
+        frontier_lower_quartile_threshold = 0.50 #0.70
         frontier_required_windows = 2
 
         # Cell competence logging
@@ -255,7 +260,7 @@ class FallRecoveryConfig(BaseCfg):
 
         randomize_restitution = False
 
-        randomize_base_mass = False
+        randomize_base_mass = True
         randomize_motor_strength = False
 
     class normalization(BaseCfg.normalization):
@@ -288,6 +293,13 @@ class FallRecoveryConfig(BaseCfg):
         recovery_height_success = 0.28
         recovery_height_target = 0.34
 
+        loaded_foot_force_threshold = 3.0   # score begins increasing
+        full_load_force_threshold = 20.0    # score reaches 1
+        # minimum vertical ground-reaction force required
+        # for a foot to be counted as a valid contact
+        recovery_contact_force_threshold = 12.0 #1.0
+        recovery_min_foot_contacts = 3
+
         upright_sigma_strict = 0.25
         upright_sigma_soft = 0.35
 
@@ -296,27 +308,75 @@ class FallRecoveryConfig(BaseCfg):
         recovery_ang_vel_threshold = 1.2
         recovery_posture_threshold = 2.0
 
-        recovery_contact_force_threshold = 1.0
-        recovery_min_foot_contacts = 3
-
-        recovery_success_steps = 10     # 0.2 seconds (10x0.02), dt = 0.02 = 0.005 x 4
-        require_non_slipping_contacts = False
+        # recovery_success_steps = 10     # Stage I: 0.2 seconds (10x0.02), dt = 0.02 = 0.005 x 4
+        recovery_success_steps = 20     # Stage II
+        require_non_slipping_contacts = True #False
 
         # Retained for diagnostics and later stages
         recovery_foot_slip_vel_threshold = 0.12
 
         recovery_vertical_vel_threshold = 0.15
         recovery_nonfoot_contact_threshold = 5.0
+        height_alignment_sigma = 0.06
 
         recovery_bonus_delay_s = 0.5
 
+    # Stage I
+    # class reward_scales(BaseCfg.reward_scales):
+    #     # Main objective
+    #     recovery_bonus = 5000.0     # effective 100.0 (recovery_bonus * dt)
+    #     recovery_progress = 20.0
 
+    #     # Recovery shaping
+    #     upright_orientation = 3.0
+    #     height_alignment = 2.0
+    #     posture = 3.0
+    #     feet_on_ground = 1.0
+
+    #     # Stability
+    #     base_orientation = 0.0
+    #     base_ang_vel = -1.0e-2
+
+    #     # Weak regularization
+    #     action = -1.0e-3
+    #     torques = -2.0e-4
+    #     dof_acc = -5.0e-8
+    #     dof_vel = -1.0e-4
+
+    #     # Safety
+    #     dof_pos_limits = -0.1
+    #     joint_vel_limit = 0.0
+    #     base_contact = -0.5
+
+    #     # Exploration-safe slip/smoothness
+    #     body_slip = -5.0e-3
+    #     feet_slip = -5.0e-3
+    #     action_smoothness_1 = -1.0e-3
+    #     action_smoothness_2 = -2.0e-4
+
+    #     # Late-gated, so it does not suppress rolling
+    #     loaded_foot_slip = -1.0
+
+    #     # Disable terminal-refinement objectives in Stage 1
+    #     stand_still_action = 0.0
+    #     late_nonfoot_contact = 0.0
+    #     support_deficit = 0.0
+    #     front_leg_error = 0.0
+    #     loaded_foot_support = 0.0
+    #     stable_foot_support = 0.0
+    #     stance_region = 0.0
+    #     rear_leg_separation = 0.0
+    #     rear_leg_crossing = 0.0
+    #     terminal_action_prior = 0.0
+    #     base_height = 0.0
+
+    # Stage II
     class reward_scales(BaseCfg.reward_scales):
         # Main objective
-        recovery_bonus = 2500.0     # effective 50.0 (recovery_bonus * dt)
-        recovery_progress = 20.0
+        recovery_bonus = 5000.0     # effective 100.0 (recovery_bonus * dt)
+        recovery_progress = 8.0
 
-        # Final recovery refinement
+        # Final-pose shaping
         upright_orientation = 3.0
         height_alignment = 2.0
         posture = 3.0
@@ -324,13 +384,14 @@ class FallRecoveryConfig(BaseCfg):
 
         # Stability
         base_orientation = 0.0
-        base_ang_vel = -0.01
+        base_ang_vel = -0.03
 
         # Motor regularization
         action = -1.0e-3
         torques = -2.0e-4
         dof_acc = -5.0e-8
         dof_vel = -1.0e-4
+        ang_vel_limit = 0.0
 
         # Safety
         dof_pos_limits = -0.1
@@ -343,68 +404,24 @@ class FallRecoveryConfig(BaseCfg):
         action_smoothness_1 = -1.0e-3
         action_smoothness_2 = -2.0e-4
 
-        # Late-gated slip penalty
-        loaded_foot_slip = -1.0
+        # Balance positive support against slip penalty
+        loaded_foot_slip = -0.25
 
         # Keep morphology-specific terminal shaping disabled
-        stand_still_action = 0.0
         late_nonfoot_contact = 0.0
-        support_deficit = 0.0
-        front_leg_error = 0.0
-        loaded_foot_support = 0.0
-        stable_foot_support = 0.0
-        stance_region = 0.0
-        rear_leg_separation = 0.0
-        rear_leg_crossing = 0.0
         terminal_action_prior = 0.0
         base_height = 0.0
+        # Your data showed excessive front width
+        front_leg_error = 0.0 #-0.5
+        # Gentle stance refinement
+        stance_region = 0.0 #0.2
 
+        # Establish loaded, stable support
+        loaded_foot_support = 2.0
+        support_deficit = -1.0
+        stand_still_action = -1.0e-3
+        stable_foot_support = 5.0
 
-    # class reward_scales(BaseCfg.reward_scales):
-    #     # Main recovery objective
-    #     recovery_bonus = 200.0  # effective 4.0 (recovery_bonus * dt)
-
-    #     # Use the name that actually exists in CoRLRewards.
-    #     # Your config suggests _reward_recovery_progress is the current function.
-    #     recovery_progress = 30.0
-
-    #     upright_orientation = 6.0
-    #     height_alignment = 2.0
-    #     posture = 6.0
-    #     feet_on_ground = 2.0
-
-    #     # Stability
-    #     base_orientation = -0.3
-    #     base_ang_vel = -0.02
-
-    #     # Motor regularization
-    #     action = -1.0e-3
-    #     torques = -2.0e-4
-    #     dof_acc = -5.0e-8
-    #     dof_vel = -1.0e-4
-
-    #     # Safety
-    #     dof_pos_limits = -0.1
-    #     joint_vel_limit = -5.0e-4
-    #     base_contact = -0.05
-
-    #     # Weak exploration-safe regularization
-    #     feet_slip = -5.0e-3
-    #     body_slip = -5.0e-3
-    #     action_smoothness_1 = -1.0e-3
-    #     action_smoothness_2 = -2.0e-4
-
-    #     # Disable terminal fine-tuning rewards
-    #     stand_still_action = 0.0
-    #     late_nonfoot_contact = 0.0
-    #     loaded_foot_slip = 0.0
-    #     support_deficit = 0.0
-    #     front_leg_error = 0.0
-    #     loaded_foot_support = 0.0
-    #     stable_foot_support = 0.0
-    #     stance_region = 0.0
-    #     rear_leg_separation = 0.0
-    #     rear_leg_crossing = 0.0
-    #     terminal_action_prior = 0.0
-
-    #     base_height = 0.0
+        # Rear geometry is not currently the bottleneck
+        rear_leg_separation = 0.0
+        rear_leg_crossing = 0.0
