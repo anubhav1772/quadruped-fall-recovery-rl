@@ -63,13 +63,15 @@ class PPO_Args(PrefixProto):
     use_clipped_value_loss = True
 
     clip_param = 0.2
-    entropy_coef = 0.005
+
+    # entropy_coef = 0.01 # Stage I
+    entropy_coef = 0.001 # Stage II
 
     num_learning_epochs = 5
     num_mini_batches = 4
 
-    learning_rate = 5e-4
-    adaptation_module_learning_rate = 5e-4
+    learning_rate = 1e-4 #3e-4
+    adaptation_module_learning_rate = 1e-4 #3e-4
     num_adaptation_module_substeps = 1
 
     schedule = "adaptive"
@@ -97,9 +99,7 @@ class PPO:
         self.actor_critic = actor_critic
         self.actor_critic.to(device)
 
-        # ------------------------------------------------------------
         # Freeze adaptation module for recovery fine-tuning
-        # ------------------------------------------------------------
         if getattr(PPO_Args, "freeze_adaptation_module", False):
             for p in self.actor_critic.adaptation_module.parameters():
                 p.requires_grad_(False)
