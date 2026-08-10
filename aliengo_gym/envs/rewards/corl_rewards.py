@@ -503,7 +503,10 @@ class CoRLRewards:
         # 1 stable foot -> 0
         # 2 stable feet -> 0.5
         # 3+ stable feet -> 1
-        support_score = torch.clamp((stable_count - 1.0) / 2.0, 0.0, 1.0)
+        # Stage I-III
+        # support_score = torch.clamp((stable_count - 1.0) / 2.0, 0.0, 1.0)
+        # Stage IV
+        support_score = torch.clamp((stable_count - 1.0) / 2.5, 0.0, 1.0)
 
         return upright_gate * height_gate * support_score
 
@@ -713,10 +716,10 @@ class CoRLRewards:
             front_sep = y[:, 0] - y[:, 1]
             rear_sep = y[:, 2] - y[:, 3]
 
-            front_sep_err = torch.clamp(0.22 - front_sep, min=0.0)
-            rear_sep_err = torch.clamp(0.24 - rear_sep, min=0.0)
+            front_sep_err = torch.clamp(0.24 - front_sep, min=0.0)
+            rear_sep_err  = torch.clamp(0.24 - rear_sep, min=0.0)
 
-            sep_err = 0.25 * front_sep_err + 0.75 * rear_sep_err
+            sep_err = 0.75 * front_sep_err + 0.25 * rear_sep_err
 
             return upright_gate * height_gate * torch.exp(-8.0 * sep_err)
 
@@ -897,7 +900,10 @@ class CoRLRewards:
         loaded_count = load_score.sum(dim=1)
 
         # Reward progress from roughly 1 loaded foot to 3 loaded feet.
-        support_progress = torch.clamp((loaded_count - 1.0) / 2.0, 0.0, 1.0)
+        # Stage I-III
+        # support_progress = torch.clamp((loaded_count - 1.0) / 2.0, 0.0, 1.0)
+        # Stage IV
+        support_progress = torch.clamp((loaded_count - 1.0) / 2.5, 0.0, 1.0)
 
         return upright_gate * height_gate * support_progress
 
