@@ -107,7 +107,8 @@ class RunnerArgs(PrefixProto, cli=False):
     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-07-22/train_fall_recovery/175905.477939"
     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-07-27/train_fall_recovery/085751.292955"
     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-08-04/train_fall_recovery/114326.956585"
-    resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-08-10/train_fall_recovery/083357.460470"
+    # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-08-10/train_fall_recovery/083357.460470"
+    resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-08-11/train_fall_recovery/085416.875723"
     # terminal_action_clip = 0.30
     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-06-03/train_fall_recovery/101441.711985"
     # terminal_action_clip = 0.50
@@ -121,9 +122,9 @@ class RunnerArgs(PrefixProto, cli=False):
     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-06-04/train_fall_recovery/094324.831941"
     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-06-04/train_fall_recovery/123700.778927"
 
-    checkpoint = 22800 #19600 #6000          # "last" or iteration number, e.g. 8717
+    checkpoint = 25200 #22800 #19600 #6000          # "last" or iteration number, e.g. 8717
     resume_optimizer = False     # keep False for recovery fine-tuning
-    resume_iteration = 22801 #19601 #6001     # set manually if you want logs to continue from old iter
+    resume_iteration = 25201 #22801 #19601 #6001     # set manually if you want logs to continue from old iter
 
 class Runner:
 
