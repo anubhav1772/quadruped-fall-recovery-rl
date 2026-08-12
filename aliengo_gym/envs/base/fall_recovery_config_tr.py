@@ -493,4 +493,5 @@ class FallRecoveryConfig(BaseCfg):
 
         stand_still_action = -1.0e-3
 
-        rear_leg_separation = 1.0
+        stance_separation = 1.0
+        leg_crossing = -1.0
