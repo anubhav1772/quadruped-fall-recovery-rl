@@ -18,6 +18,7 @@ from aliengo_gym.utils.terrain import Terrain
 # from .fall_recovery_config_go1 import FallRecoveryConfig as Cfg
 from .fall_recovery_config_tr import FallRecoveryConfig as Cfg
 from pathlib import Path
+import numpy as np
 
 
 class LeggedRobot(BaseTask):
@@ -265,6 +266,9 @@ class LeggedRobot(BaseTask):
 
         self._post_physics_step_callback()
 
+        # Compare old q80 estimate against the new estimator.
+        self._log_local_height_comparison()
+
         # ------------------------------------------------------------
         # Temporary terminal post-reset stability diagnostic
         # ------------------------------------------------------------
@@ -357,6 +361,280 @@ class LeggedRobot(BaseTask):
 
         if self.cfg.env.record_video:
             self._render_headless()
+
+    @torch.no_grad()
+    def _log_local_height_comparison(self):
+        """
+        Compare the old q80 terrain estimate against the active
+        support-aware local terrain-height estimator.
+
+        Call once per control step after measured_heights, foot states,
+        and contact forces have been refreshed.
+        """
+
+        if not getattr(self.cfg.env, "debug_log_height_comparison", False):
+            return
+
+        # Log at the same approximate frequency as the other dashboard metrics.
+        if self.common_step_counter % 50 != 0:
+            return
+
+        heights = self.measured_heights
+
+        if (
+            not torch.is_tensor(heights)
+            or heights.ndim != 2
+            or heights.shape[0] != self.num_envs
+        ):
+            return
+
+        # Old estimator.
+        q80_height = torch.quantile(
+            heights,
+            0.80,
+            dim=1,
+        )
+
+        # New active estimator.
+        new_height = self._get_local_terrain_height()
+
+        root_z = self.root_states[:, 2]
+
+        relative_height_q80 = root_z - q80_height
+        relative_height_new = root_z - new_height
+
+        # Positive value means q80 selected a higher terrain surface
+        # and therefore reported a lower relative base height.
+        q80_bias = q80_height - new_height
+
+        foot_fz = self.contact_forces[
+            :, self.feet_indices, 2
+        ].clamp_min(0.0)
+
+        loaded_threshold = float(
+            getattr(
+                self.cfg.rewards,
+                "loaded_foot_force_threshold",
+                3.0,
+            )
+        )
+
+        loaded_feet = foot_fz > loaded_threshold
+        loaded_count = loaded_feet.float().sum(dim=1)
+
+        # States where support information is reasonably meaningful.
+        support_mask = loaded_count >= 2.0
+
+        # Hypothesis-relevant masks.
+        bias_2cm = q80_bias > 0.02
+        bias_4cm = q80_bias > 0.04
+        bias_6cm = q80_bias > 0.06
+
+        tracking = self.extras.setdefault(
+            "recovery_tracking",
+            {},
+        )
+
+        tracking["height_comparison_step"] = int(
+            self.common_step_counter
+        )
+
+        # ---------------------------------------------------------
+        # Global q80-versus-new comparison
+        # ---------------------------------------------------------
+        tracking["height_q80_mean"] = q80_height.mean().item()
+        tracking["height_new_mean"] = new_height.mean().item()
+
+        tracking["height_q80_minus_new_mean"] = q80_bias.mean().item()
+        tracking["height_q80_minus_new_abs_mean"] = (
+            q80_bias.abs().mean().item()
+        )
+        tracking["height_q80_minus_new_max"] = q80_bias.max().item()
+        tracking["height_q80_minus_new_min"] = q80_bias.min().item()
+
+        tracking["height_q80_bias_gt_2cm_frac"] = (
+            bias_2cm.float().mean().item()
+        )
+        tracking["height_q80_bias_gt_4cm_frac"] = (
+            bias_4cm.float().mean().item()
+        )
+        tracking["height_q80_bias_gt_6cm_frac"] = (
+            bias_6cm.float().mean().item()
+        )
+
+        # ---------------------------------------------------------
+        # Effect on the actual relative-height signal
+        # ---------------------------------------------------------
+        tracking["relative_height_q80_mean"] = (
+            relative_height_q80.mean().item()
+        )
+        tracking["relative_height_new_mean"] = (
+            relative_height_new.mean().item()
+        )
+        tracking["relative_height_new_minus_q80_mean"] = (
+            relative_height_new
+            - relative_height_q80
+        ).mean().item()
+
+        # How often q80 and the new estimator disagree on the
+        # hard recovery-height gate.
+        success_height = float(
+            self.cfg.rewards.recovery_height_success
+        )
+
+        stable_height_q80 = (
+            relative_height_q80 > success_height
+        )
+        stable_height_new = (
+            relative_height_new > success_height
+        )
+
+        tracking["height_gate_disagreement_frac"] = (
+            stable_height_q80 != stable_height_new
+        ).float().mean().item()
+
+        tracking["q80_fails_new_passes_height_frac"] = (
+            (~stable_height_q80) & stable_height_new
+        ).float().mean().item()
+
+        tracking["q80_passes_new_fails_height_frac"] = (
+            stable_height_q80 & (~stable_height_new)
+        ).float().mean().item()
+
+        # ---------------------------------------------------------
+        # Comparison only when at least two feet are loaded
+        # ---------------------------------------------------------
+        if support_mask.any():
+            supported_bias = q80_bias[support_mask]
+
+            tracking["supported_q80_minus_new_mean"] = (
+                supported_bias.mean().item()
+            )
+            tracking["supported_q80_minus_new_abs_mean"] = (
+                supported_bias.abs().mean().item()
+            )
+            tracking["supported_q80_bias_gt_4cm_frac"] = (
+                supported_bias > 0.04
+            ).float().mean().item()
+        else:
+            tracking["supported_q80_minus_new_mean"] = 0.0
+            tracking["supported_q80_minus_new_abs_mean"] = 0.0
+            tracking["supported_q80_bias_gt_4cm_frac"] = 0.0
+
+        tracking["height_debug_loaded_foot_count_mean"] = (
+            loaded_count.mean().item()
+        )
+
+        # ---------------------------------------------------------
+        # Active-estimator diagnostics
+        # ---------------------------------------------------------
+        if hasattr(self, "local_height_center"):
+            tracking["height_center_mean"] = (
+                self.local_height_center.mean().item()
+            )
+
+        if hasattr(self, "local_height_support"):
+            tracking["height_support_mean"] = (
+                self.local_height_support.mean().item()
+            )
+
+        if hasattr(self, "local_height_support_alpha"):
+            support_alpha = self.local_height_support_alpha
+
+            tracking["height_support_alpha_mean"] = (
+                support_alpha.mean().item()
+            )
+
+            tracking["height_support_alpha_gt_050_frac"] = (
+                support_alpha > 0.50
+            ).float().mean().item()
+
+        if hasattr(self, "local_height_effective_load"):
+            tracking["height_effective_load_mean"] = (
+                self.local_height_effective_load.mean().item()
+            )
+
+        # ---------------------------------------------------------
+        # Front/rear foot-clearance diagnostics
+        # ---------------------------------------------------------
+        if hasattr(self, "local_height_foot_ground"):
+            foot_clearance = (
+                self.foot_positions[:, :, 2]
+                - self.local_height_foot_ground
+            )
+
+            front_clearance = foot_clearance[:, 0:2]
+            rear_clearance = foot_clearance[:, 2:4]
+
+            tracking["front_foot_clearance_mean"] = (
+                front_clearance.mean().item()
+            )
+
+            tracking["rear_foot_clearance_mean"] = (
+                rear_clearance.mean().item()
+            )
+
+            # Focus on the proposed failure condition.
+            large_positive_bias = q80_bias > 0.04
+
+            # The hypothesis concerns the near-standing phase,
+            # not arbitrary fallen/rolling states.
+            near_upright = self.projected_gravity[:, 2] < -0.75
+
+            hypothesis_mask = (
+                large_positive_bias
+                & near_upright
+                & support_mask
+            )
+
+            tracking["height_hypothesis_mask_frac"] = (
+                hypothesis_mask.float().mean().item()
+            )
+
+            if hypothesis_mask.any():
+                tracking["biased_front_clearance_mean"] = (
+                    front_clearance[hypothesis_mask].mean().item()
+                )
+
+                tracking["biased_rear_clearance_mean"] = (
+                    rear_clearance[hypothesis_mask].mean().item()
+                )
+
+                tracking["biased_front_loaded_frac"] = (
+                    loaded_feet[hypothesis_mask, 0:2]
+                    .float()
+                    .mean()
+                    .item()
+                )
+
+                tracking["biased_rear_loaded_frac"] = (
+                    loaded_feet[hypothesis_mask, 2:4]
+                    .float()
+                    .mean()
+                    .item()
+                )
+            else:
+                tracking["biased_front_clearance_mean"] = 0.0
+                tracking["biased_rear_clearance_mean"] = 0.0
+                tracking["biased_front_loaded_frac"] = 0.0
+                tracking["biased_rear_loaded_frac"] = 0.0
+
+        if self.common_step_counter % 500 == 0:
+            print(
+                "\n[HEIGHT COMPARISON]",
+                f"step={self.common_step_counter}",
+                f"q80={q80_height.mean().item():.4f}",
+                f"new={new_height.mean().item():.4f}",
+                f"q80-new={q80_bias.mean().item():.4f}",
+                f"abs_diff={q80_bias.abs().mean().item():.4f}",
+                f">4cm_frac={bias_4cm.float().mean().item():.4f}",
+                f"gate_disagreement="
+                f"{(stable_height_q80 != stable_height_new).float().mean().item():.4f}",
+                f"q80_fail_new_pass="
+                f"{((~stable_height_q80) & stable_height_new).float().mean().item():.4f}",
+                f"loaded_feet={loaded_count.mean().item():.2f}",
+                flush=True,
+            )
 
     # def check_termination(self):
     #     """ Check if environments need to be reset
@@ -1102,19 +1380,9 @@ class LeggedRobot(BaseTask):
 
         cfg = self.cfg.rewards
 
-        foot_contact = (
-            self.contact_forces[:, self.feet_indices, 2]
-            > cfg.recovery_contact_force_threshold
-        )
-
-        foot_xy_vel = torch.norm(
-            self.foot_velocities[:, :, :2],
-            dim=-1
-        )
-
-        non_slipping_feet = foot_contact & (
-            foot_xy_vel < 0.10
-        )
+        foot_contact = self.contact_forces[:, self.feet_indices, 2] > cfg.recovery_contact_force_threshold
+        foot_xy_vel = torch.norm(self.foot_velocities[:, :, :2], dim=-1)
+        non_slipping_feet = foot_contact & (foot_xy_vel < 0.10)
 
         posture_error = torch.norm(
             self.dof_pos[:, :self.num_actuated_dof]
@@ -1122,105 +1390,119 @@ class LeggedRobot(BaseTask):
             dim=1
         )
 
-        relative_base_height = (
-            self.root_states[:, 2]
-            - self._get_local_terrain_height()
-        )
+        relative_base_height = self.root_states[:, 2] - self._get_local_terrain_height()
+
+        nonfoot_force = torch.norm(self.contact_forces[:, self.base_contact_indices, :], dim=-1).max(dim=1).values
+        no_nonfoot_contact = nonfoot_force < cfg.recovery_nonfoot_contact_threshold
+
+        # handoff_ready = (
+        #         (self.projected_gravity[:, 2] < cfg.recovery_upright_threshold)  # usually -0.90
+        #         & (relative_base_height > 0.30)                                  # stricter than 0.28 success
+        #         & (torch.norm(self.base_lin_vel[:, :2], dim=1) < 0.25)
+        #         & (torch.norm(self.base_ang_vel, dim=1) < 1.00)
+        #         & (posture_error < 1.80)
+        #         & (non_slipping_feet.sum(dim=1) >= 3)
+        #     )
 
         handoff_ready = (
-                (self.projected_gravity[:, 2] < cfg.recovery_upright_threshold)  # usually -0.90
-                & (relative_base_height > 0.30)                                  # stricter than 0.28 success
-                & (torch.norm(self.base_lin_vel[:, :2], dim=1) < 0.25)
-                & (torch.norm(self.base_ang_vel, dim=1) < 1.00)
-                & (posture_error < 1.80)
-                & (non_slipping_feet.sum(dim=1) >= 3)
-            )
+            (self.projected_gravity[:, 2] < cfg.recovery_upright_threshold)
+            & (relative_base_height > 0.30)
+            & (torch.norm(self.base_lin_vel[:, :2], dim=1) < 0.15)
+            & (torch.abs(self.base_lin_vel[:, 2]) < 0.10)
+            & (torch.norm(self.base_ang_vel, dim=1) < 0.50)
+            & (posture_error < 1.80)
+            & (non_slipping_feet.sum(dim=1) >= 3)
+            & no_nonfoot_contact
+        )
+
 
         return handoff_ready
 
     def _write_recovery_grid_snapshot(
-            self,
-            upright,
-            stable_height,
-            low_velocity,
-            low_ang_vel,
-            good_posture,
-            stable_contacts,
-            recovered,
-            stable_recovery,
-        ):
-            """
-            Writes per-environment recovery gate status for dashboard visualization.
+        self,
+        upright,
+        stable_height,
+        low_velocity,
+        low_vertical_velocity,
+        low_ang_vel,
+        good_posture,
+        stable_contacts,
+        no_nonfoot_contact,
+        recovered,
+        stable_recovery,
+    ):
+        """
+        Writes per-environment recovery gate status for dashboard visualization.
 
-            Status code:
-                0 = not upright
-                1 = upright, but height failed
-                2 = upright + height, but velocity failed
-                3 = velocity okay, but posture failed
-                4 = posture okay, but contact/slip failed
-                5 = instant recovered
-                6 = stable recovered
-            """
+        Status code:
+            0 = not upright
+            1 = upright, but height failed
+            2 = upright + height, but motion stability failed
+                (horizontal velocity, vertical velocity, or angular velocity)
+            3 = motion stable, but posture failed
+            4 = posture okay, but support/contact condition failed
+                (insufficient foot support or non-foot contact)
+            5 = all recovery gates passed at the current step
+            6 = recovery gates sustained for recovery_success_steps
+        """
 
-            # Write infrequently; do not write every physics step.
-            if self.common_step_counter % 50 != 0:
-                return
+        # Write infrequently; do not write every physics step.
+        if self.common_step_counter % 50 != 0:
+            return
 
-            status = torch.zeros(self.num_envs, device=self.device, dtype=torch.int32)
+        # Compound gates
+        motion_stable = low_velocity & low_vertical_velocity & low_ang_vel
 
-            status[~upright] = 0
+        contact_stable = stable_contacts & no_nonfoot_contact
 
-            status[upright & ~stable_height] = 1
+        # Default is status 0: not upright.
+        status = torch.zeros(self.num_envs, device=self.device, dtype=torch.int32)
 
-            status[
-                upright
-                & stable_height
-                & ~(low_velocity & low_ang_vel)
-            ] = 2
+        # Hierarchical recovery state
+        # 0: not upright
+        status[~upright] = 0
+        # 1: upright, but insufficient height
+        status[upright & ~stable_height] = 1
+        # 2: upright + raised, but still moving too much
+        status[upright & stable_height & ~motion_stable] = 2
+        # 3: dynamically stable, but posture is not standing-like
+        status[upright & stable_height & motion_stable & ~good_posture] = 3
+        # 4: posture is good, but terminal support/contact is invalid
+        status[upright & stable_height & motion_stable & good_posture & ~contact_stable] = 4
+        # 5: all instantaneous recovery gates passed
+        status[recovered] = 5
+        # 6: recovery condition sustained for the required duration
+        status[stable_recovery] = 6
 
-            status[
-                upright
-                & stable_height
-                & low_velocity
-                & low_ang_vel
-                & ~good_posture
-            ] = 3
-
-            status[
-                upright
-                & stable_height
-                & low_velocity
-                & low_ang_vel
-                & good_posture
-                & ~stable_contacts
-            ] = 4
-
-            status[recovered] = 5
-            status[stable_recovery] = 6
-
-            # Use your run/log directory if available.
-            # Replace this with your actual run directory variable if you have one.
-            import numpy as np
-            from pathlib import Path
-
-            if not hasattr(self, "recovery_grid_path"):
-                # fallback: current working directory
-                self.recovery_grid_path = Path("recovery_grid.npz")
-                print(f"[WARN] recovery_grid_path was not set; using {self.recovery_grid_path.resolve()}")
-
-            np.savez_compressed(
-                self.recovery_grid_path,
-                step=int(self.common_step_counter),
-                status=status.detach().cpu().numpy(),
-                upright=upright.detach().cpu().numpy(),
-                stable_height=stable_height.detach().cpu().numpy(),
-                low_velocity=low_velocity.detach().cpu().numpy(),
-                low_ang_vel=low_ang_vel.detach().cpu().numpy(),
-                good_posture=good_posture.detach().cpu().numpy(),
-                stable_contacts=stable_contacts.detach().cpu().numpy(),
-                recovered=recovered.detach().cpu().numpy(),
-                stable_recovery=stable_recovery.detach().cpu().numpy(),
+        # Output path
+        if not hasattr(self, "recovery_grid_path"):
+            self.recovery_grid_path = Path("recovery_grid.npz")
+            print(
+                "[WARN] recovery_grid_path was not set; "
+                f"using {self.recovery_grid_path.resolve()}"
             )
+
+        # Save snapshot
+        np.savez_compressed(
+            self.recovery_grid_path,
+            step=int(self.common_step_counter),
+            status=status.detach().cpu().numpy(),
+
+            upright=upright.detach().cpu().numpy(),
+            stable_height=stable_height.detach().cpu().numpy(),
+
+            low_velocity=low_velocity.detach().cpu().numpy(),
+            low_vertical_velocity=low_vertical_velocity.detach().cpu().numpy(),
+            low_ang_vel=low_ang_vel.detach().cpu().numpy(),
+
+            good_posture=good_posture.detach().cpu().numpy(),
+
+            stable_contacts=stable_contacts.detach().cpu().numpy(),
+            no_nonfoot_contact=no_nonfoot_contact.detach().cpu().numpy(),
+
+            recovered=recovered.detach().cpu().numpy(),
+            stable_recovery=stable_recovery.detach().cpu().numpy(),
+        )
 
     def _write_reset_source_grid_snapshot(self):
         """
@@ -1282,80 +1564,36 @@ class LeggedRobot(BaseTask):
         upright = g_z < cfg.recovery_upright_threshold
 
         local_terrain_height = self._get_local_terrain_height()
-        relative_base_height = (
-            self.root_states[:, 2] - local_terrain_height
-        )
-        stable_height = (
-            relative_base_height > cfg.recovery_height_success
-        )
+        relative_base_height = self.root_states[:, 2] - local_terrain_height
+        stable_height = relative_base_height > cfg.recovery_height_success
 
         # Horizontal velocity
-        low_velocity = (
-            torch.norm(self.base_lin_vel[:, :2], dim=1)
-            < cfg.recovery_lin_vel_threshold
-        )
+        low_velocity = torch.norm(self.base_lin_vel[:, :2], dim=1) < cfg.recovery_lin_vel_threshold
 
         # Prefer world-frame vertical velocity.
-        low_vertical_velocity = (
-            torch.abs(self.root_states[:, 9])
-            < cfg.recovery_vertical_vel_threshold
-        )
+        low_vertical_velocity = torch.abs(self.root_states[:, 9]) < cfg.recovery_vertical_vel_threshold
 
-        low_ang_vel = (
-            torch.norm(self.base_ang_vel, dim=1)
-            < cfg.recovery_ang_vel_threshold
-        )
+        low_ang_vel = torch.norm(self.base_ang_vel, dim=1) < cfg.recovery_ang_vel_threshold
 
-        posture_error = torch.norm(
-            self.dof_pos - self.default_dof_pos,
-            dim=1,
-        )
-        good_posture = (
-            posture_error < cfg.recovery_posture_threshold
-        )
+        posture_error = torch.norm(self.dof_pos - self.default_dof_pos, dim=1)
+        good_posture = posture_error < cfg.recovery_posture_threshold
 
-        foot_contact = (
-            self.contact_forces[:, self.feet_indices, 2]
-            > cfg.recovery_contact_force_threshold
-        )
+        foot_contact = self.contact_forces[:, self.feet_indices, 2] > cfg.recovery_contact_force_threshold
 
-        foot_xy_vel = torch.norm(
-            self.foot_velocities[:, :, :2],
-            dim=-1,
-        )
-
-        non_slipping_feet = foot_contact & (
-            foot_xy_vel < cfg.recovery_foot_slip_vel_threshold
-        )
+        foot_xy_vel = torch.norm(self.foot_velocities[:, :, :2], dim=-1)
+        non_slipping_feet = foot_contact & (foot_xy_vel < cfg.recovery_foot_slip_vel_threshold)
 
         if getattr(cfg, "require_non_slipping_contacts", False):
-            stable_contacts = (
-                non_slipping_feet.sum(dim=1)
-                >= cfg.recovery_min_foot_contacts
-            )
+            stable_contacts = non_slipping_feet.sum(dim=1) >= cfg.recovery_min_foot_contacts
         else:
-            stable_contacts = (
-                foot_contact.sum(dim=1)
-                >= cfg.recovery_min_foot_contacts
-            )
+            stable_contacts = foot_contact.sum(dim=1) >= cfg.recovery_min_foot_contacts
 
         # Reject recovery supported by trunk, hips, thighs or calves.
         if self.base_contact_indices.numel() > 0:
-            nonfoot_force = torch.norm(
-                self.contact_forces[:, self.base_contact_indices, :],
-                dim=-1,
-            )
-
-            no_nonfoot_contact = (
-                nonfoot_force.max(dim=1).values
-                < cfg.recovery_nonfoot_contact_threshold
-            )
+            nonfoot_force = torch.norm(self.contact_forces[:, self.base_contact_indices, :], dim=-1)
+            no_nonfoot_contact = nonfoot_force.max(dim=1).values < cfg.recovery_nonfoot_contact_threshold
         else:
-            no_nonfoot_contact = torch.ones(
-                self.num_envs,
-                dtype=torch.bool,
-                device=self.device,
-            )
+            no_nonfoot_contact = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
 
         recovered = (
             upright
@@ -1443,22 +1681,12 @@ class LeggedRobot(BaseTask):
         # terrain difficulty, represented by one frontier per terrain column.
         if hasattr(self, "terrain_sampling_stage"):
             stages = self.terrain_sampling_stage.float()
-            self.extras["recovery_debug"]["sampling_stage_mean"] = (
-                stages.mean().item()
-            )
-            self.extras["recovery_debug"]["sampling_stage_bootstrap_frac"] = (
-                (stages == 0).float().mean().item()
-            )
-            self.extras["recovery_debug"]["sampling_stage_developing_frac"] = (
-                (stages == 1).float().mean().item()
-            )
-            self.extras["recovery_debug"]["sampling_stage_mature_frac"] = (
-                (stages == 2).float().mean().item()
-            )
+            self.extras["recovery_debug"]["sampling_stage_mean"] = stages.mean().item()
+            self.extras["recovery_debug"]["sampling_stage_bootstrap_frac"] = (stages == 0).float().mean().item()
+            self.extras["recovery_debug"]["sampling_stage_developing_frac"] = (stages == 1).float().mean().item()
+            self.extras["recovery_debug"]["sampling_stage_mature_frac"] = (stages == 2).float().mean().item()
 
-        self.extras["recovery_debug"]["recovery_rate_ema"] = (
-            self.recovery_rate_ema
-        )
+        self.extras["recovery_debug"]["recovery_rate_ema"] = self.recovery_rate_ema
 
         new_recovery = stable_recovery & (~self.recovered_flag)
 
@@ -1472,9 +1700,11 @@ class LeggedRobot(BaseTask):
             upright=upright,
             stable_height=stable_height,
             low_velocity=low_velocity,
+            low_vertical_velocity=low_vertical_velocity,
             low_ang_vel=low_ang_vel,
             good_posture=good_posture,
             stable_contacts=stable_contacts,
+            no_nonfoot_contact=no_nonfoot_contact,
             recovered=recovered,
             stable_recovery=stable_recovery,
         )
@@ -3413,7 +3643,9 @@ class LeggedRobot(BaseTask):
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_net_contact_force_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
-        self.gym.render_all_camera_sensors(self.sim)
+
+        if self.cfg.env.record_video:
+            self.gym.render_all_camera_sensors(self.sim)
 
         # create some wrapper tensors for different slices
         self.root_states = gymtorch.wrap_tensor(actor_root_state)
@@ -3461,11 +3693,7 @@ class LeggedRobot(BaseTask):
             # episode.  It is not promoted or demoted.
             #   0 = strongly inverted, 1 = partially inverted,
             #   2 = sideways,          3 = near-upright fallen.
-            self.episode_orientation_bin = torch.zeros(
-                self.num_envs,
-                device=self.device,
-                dtype=torch.long,
-            )
+            self.episode_orientation_bin = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
 
             # Backward-compatible dashboard alias.  No code should interpret
             # this value as a global curriculum phase anymore.
@@ -4892,41 +5120,187 @@ class LeggedRobot(BaseTask):
         points[:, :, 1] = grid_y.flatten()
         return points
 
+    # def _get_heights(self, env_ids, cfg):
+    #     """ Samples heights of the terrain at required points around each robot.
+    #         The points are offset by the base's position and rotated by the base's yaw
+
+    #     Args:
+    #         env_ids (List[int], optional): Subset of environments for which to return the heights. Defaults to None.
+
+    #     Raises:
+    #         NameError: [description]
+
+    #     Returns:
+    #         [type]: [description]
+    #     """
+    #     if cfg.terrain.mesh_type == 'plane':
+    #         return torch.zeros(len(env_ids), cfg.env.num_height_points, device=self.device, requires_grad=False)
+    #     elif cfg.terrain.mesh_type == 'none':
+    #         raise NameError("Can't measure height with terrain mesh type 'none'")
+
+    #     points = quat_apply_yaw(self.base_quat[env_ids].repeat(1, cfg.env.num_height_points),
+    #                             self.height_points[env_ids]) + (self.root_states[env_ids, :3]).unsqueeze(1)
+
+    #     points += self.terrain.cfg.border_size
+    #     points = (points / self.terrain.cfg.horizontal_scale).long()
+    #     px = points[:, :, 0].view(-1)
+    #     py = points[:, :, 1].view(-1)
+    #     px = torch.clip(px, 0, self.height_samples.shape[0] - 2)
+    #     py = torch.clip(py, 0, self.height_samples.shape[1] - 2)
+
+    #     heights1 = self.height_samples[px, py]
+    #     heights2 = self.height_samples[px + 1, py]
+    #     heights3 = self.height_samples[px, py + 1]
+    #     heights = torch.min(heights1, heights2)
+    #     heights = torch.min(heights, heights3)
+
+    #     return heights.view(len(env_ids), -1) * self.terrain.cfg.vertical_scale
+
     def _get_heights(self, env_ids, cfg):
-        """ Samples heights of the terrain at required points around each robot.
-            The points are offset by the base's position and rotated by the base's yaw
-
-        Args:
-            env_ids (List[int], optional): Subset of environments for which to return the heights. Defaults to None.
-
-        Raises:
-            NameError: [description]
-
-        Returns:
-            [type]: [description]
         """
-        if cfg.terrain.mesh_type == 'plane':
-            return torch.zeros(len(env_ids), cfg.env.num_height_points, device=self.device, requires_grad=False)
-        elif cfg.terrain.mesh_type == 'none':
+        Samples the configured yaw-aligned height grid around each robot.
+        """
+
+        if cfg.terrain.mesh_type == "none":
             raise NameError("Can't measure height with terrain mesh type 'none'")
 
-        points = quat_apply_yaw(self.base_quat[env_ids].repeat(1, cfg.env.num_height_points),
-                                self.height_points[env_ids]) + (self.root_states[env_ids, :3]).unsqueeze(1)
+        points_world = (
+            quat_apply_yaw(self.base_quat[env_ids].repeat(1, cfg.env.num_height_points), self.height_points[env_ids])
+            + self.root_states[env_ids, :3].unsqueeze(1)
+        )
 
-        points += self.terrain.cfg.border_size
-        points = (points / self.terrain.cfg.horizontal_scale).long()
-        px = points[:, :, 0].view(-1)
-        py = points[:, :, 1].view(-1)
-        px = torch.clip(px, 0, self.height_samples.shape[0] - 2)
-        py = torch.clip(py, 0, self.height_samples.shape[1] - 2)
+        return self._sample_terrain_height_at_xy(points_world[:, :, :2], cfg)
 
-        heights1 = self.height_samples[px, py]
-        heights2 = self.height_samples[px + 1, py]
-        heights3 = self.height_samples[px, py + 1]
-        heights = torch.min(heights1, heights2)
-        heights = torch.min(heights, heights3)
 
-        return heights.view(len(env_ids), -1) * self.terrain.cfg.vertical_scale
+    def _sample_terrain_height_at_xy(self, xy_world, cfg):
+        """
+        Samples terrain world-z at arbitrary world XY locations.
+
+        Args:
+            xy_world:
+                Tensor [num_envs, num_points, 2].
+
+            cfg:
+                Environment configuration.
+
+        Returns:
+            Tensor [num_envs, num_points].
+
+        Notes:
+            For mesh_type='trimesh', the collision mesh was generated from
+            the same underlying height field, so height_samples remains valid.
+            This assumes a 2.5-D terrain without overhangs.
+        """
+
+        if xy_world.ndim != 3 or xy_world.shape[-1] != 2:
+            raise ValueError(
+                "xy_world must have shape [num_envs, num_points, 2], "
+                f"received {tuple(xy_world.shape)}"
+            )
+
+        num_envs, num_points, _ = xy_world.shape
+        mesh_type = cfg.terrain.mesh_type
+
+        if mesh_type == "plane":
+            return torch.zeros(num_envs, num_points, device=self.device, dtype=self.root_states.dtype)
+
+        if mesh_type == "none":
+            raise RuntimeError("Cannot measure terrain height when mesh_type='none'.")
+
+        if mesh_type not in ("heightfield", "trimesh"):
+            raise ValueError(f"Unsupported terrain mesh type: {mesh_type!r}")
+
+        grid_xy = (xy_world + self.terrain.cfg.border_size) / self.terrain.cfg.horizontal_scale
+
+        px = torch.floor(grid_xy[..., 0]).long()
+        py = torch.floor(grid_xy[..., 1]).long()
+
+        px = torch.clamp(px, 0, self.height_samples.shape[0] - 2)
+        py = torch.clamp(py, 0, self.height_samples.shape[1] - 2)
+
+        h00 = self.height_samples[px, py]
+        h10 = self.height_samples[px + 1, py]
+        h01 = self.height_samples[px, py + 1]
+
+        # Preserve the same conservative convention currently used
+        # by _get_heights().
+        sampled_height = torch.min(torch.min(h00, h10), h01)
+
+        return sampled_height.to(self.root_states.dtype) * self.terrain.cfg.vertical_scale
+
+    def _get_local_terrain_height(self):
+        """
+        Returns an effective terrain support height in world-z.
+
+        Strategy:
+            1. Use terrain height directly below the base when no feet
+               carry meaningful vertical load.
+            2. Blend toward the contact-load-weighted terrain height
+               beneath the feet as support becomes established.
+            3. Use the supporting-foot estimate completely when roughly
+               three or more feet carry meaningful load.
+
+        Existing callers can continue using:
+
+            relative_base_height =
+                root_states[:, 2] - local_terrain_height
+        """
+
+        heights = self.measured_heights
+
+        if not torch.is_tensor(heights) or heights.ndim != 2 or heights.shape[0] != self.num_envs:
+            return torch.zeros(self.num_envs, device=self.device, dtype=self.root_states.dtype)
+
+        # Terrain directly below the base: fallback
+        if not hasattr(self, "_center_height_index"):
+            local_xy = self.height_points[0, :, :2]
+            distance_sq = torch.sum(torch.square(local_xy), dim=1)
+            self._center_height_index = int(torch.argmin(distance_sq).item())
+
+        center_height = heights[:, self._center_height_index]
+
+        required_state_available = hasattr(self, "foot_positions") and hasattr(self, "contact_forces") and hasattr(self, "feet_indices")
+
+        if not required_state_available:
+            return center_height
+
+        # Terrain height beneath each foot
+        foot_ground_height = self._sample_terrain_height_at_xy(self.foot_positions[:, :, :2], self.cfg)  # [num_envs, 4]
+
+        foot_fz = self.contact_forces[:, self.feet_indices, 2].clamp_min(0.0)
+
+        contact_threshold = getattr(self.cfg.rewards, "recovery_contact_force_threshold", 1.0)
+
+        # Smooth load confidence:
+        #   Fz <= threshold       -> 0
+        #   Fz around 13 N+       -> approximately 1
+        #
+        # A loaded foot remains a valid support-height reference
+        # even if it is sliding, so do not strongly gate this using
+        # horizontal foot velocity.
+        load_score = torch.clamp((foot_fz - contact_threshold) / 12.0, 0.0, 1.0)
+        load_sum = load_score.sum(dim=1)
+        support_height = (load_score * foot_ground_height).sum(dim=1) / load_sum.clamp_min(1.0e-6)
+
+        # Avoid undefined support estimates when no feet are loaded.
+        support_height = torch.where(load_sum > 1.0e-4, support_height, center_height)
+        # Smooth transition:
+        #
+        # effective load ≈ 0.5 foot -> alpha 0
+        # effective load ≈ 1.5 feet -> partial support estimate
+        # effective load ≈ 3 feet   -> alpha 1
+        support_alpha = torch.clamp((load_sum - 0.5) / 2.5, 0.0, 1.0)
+        local_terrain_height = (1.0 - support_alpha) * center_height + support_alpha * support_height
+
+        # Diagnostics
+        self.local_height_center = center_height
+        self.local_height_support = support_height
+        self.local_height_support_alpha = support_alpha
+        self.local_height_effective_load = load_sum
+        self.local_height_foot_ground = foot_ground_height
+
+        return local_terrain_height
+
 
     # def _get_local_terrain_height(self):
     #     """
@@ -4947,23 +5321,23 @@ class LeggedRobot(BaseTask):
 
     #     return trimmed_heights.mean(dim=1)
 
-    def _get_local_terrain_height(self):
-        """
-        Robust supporting-surface height near the robot.
+    # def _get_local_terrain_height(self):
+    #     """
+    #     Robust supporting-surface height near the robot.
 
-        A high quantile ignores deep gaps between stepping stones while remaining
-        less sensitive than the absolute maximum to a single raised obstacle.
-        """
-        heights = self.measured_heights
+    #     A high quantile ignores deep gaps between stepping stones while remaining
+    #     less sensitive than the absolute maximum to a single raised obstacle.
+    #     """
+    #     heights = self.measured_heights
 
-        if not torch.is_tensor(heights) or heights.ndim != 2:
-            return torch.zeros(
-                self.num_envs,
-                device=self.device,
-                dtype=self.root_states.dtype,
-            )
+    #     if not torch.is_tensor(heights) or heights.ndim != 2:
+    #         return torch.zeros(
+    #             self.num_envs,
+    #             device=self.device,
+    #             dtype=self.root_states.dtype,
+    #         )
 
-        return torch.quantile(heights, 0.80, dim=1)
+    #     return torch.quantile(heights, 0.80, dim=1)
 
     def _update_recovery_orientation_curriculum(self, episode_success):
         """
