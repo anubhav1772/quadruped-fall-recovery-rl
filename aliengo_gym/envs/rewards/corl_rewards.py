@@ -276,47 +276,47 @@ class CoRLRewards:
         return upright_reward * stability_factor
 
     # Stage I
-    # def _reward_height_alignment(self):
-    #     """
-    #     Robot must learn to rise. It is not ideal for subsequent Stage
-    #     because it does not penalize excessive extension above 0.34 m.
-    #
-    #     height below target -> increasing reward
-    #     height at target    -> maximum reward
-    #     height above target -> same maximum reward
-    #     """
-    #     env = self.env
-    #     upright_factor = torch.clamp(-env.projected_gravity[:, 2], 0.0, 1.0)
-
-    #     height_progress = self._height_progress()
-    #     loaded_support = self._loaded_support_gate()
-
-    #     # Preserve a small height gradient before feet are fully loaded.
-    #     support_factor = 0.20 + 0.80 * loaded_support
-
-    #     return upright_factor * support_factor * height_progress
-
-    # Stage II
     def _reward_height_alignment(self):
         """
-        A target-centred reward.
+        Robot must learn to rise. It is not ideal for subsequent Stage
+        because it does not penalize excessive extension above 0.34 m.
+
+        height below target -> increasing reward
+        height at target    -> maximum reward
+        height above target -> same maximum reward
         """
         env = self.env
-        cfg = env.cfg.rewards
+        upright_factor = torch.clamp(-env.projected_gravity[:, 2], 0.0, 1.0)
 
-        body_height = self.get_body_height()
-        target_height = cfg.recovery_height_target
-
-        sigma = getattr(cfg, "height_alignment_sigma", 0.06)
-
-        height_score = torch.exp(-torch.square((body_height - target_height) / sigma))
-
-        upright_gate = torch.clamp((-env.projected_gravity[:, 2] - 0.65) / 0.30, 0.0, 1.0)
-
+        height_progress = self._height_progress()
         loaded_support = self._loaded_support_gate()
+
+        # Preserve a small height gradient before feet are fully loaded.
         support_factor = 0.20 + 0.80 * loaded_support
 
-        return upright_gate * support_factor * height_score
+        return upright_factor * support_factor * height_progress
+
+    # Stage II
+    # def _reward_height_alignment(self):
+    #     """
+    #     A target-centred reward.
+    #     """
+    #     env = self.env
+    #     cfg = env.cfg.rewards
+
+    #     body_height = self.get_body_height()
+    #     target_height = cfg.recovery_height_target
+
+    #     sigma = getattr(cfg, "height_alignment_sigma", 0.06)
+
+    #     height_score = torch.exp(-torch.square((body_height - target_height) / sigma))
+
+    #     upright_gate = torch.clamp((-env.projected_gravity[:, 2] - 0.65) / 0.30, 0.0, 1.0)
+
+    #     loaded_support = self._loaded_support_gate()
+    #     support_factor = 0.20 + 0.80 * loaded_support
+
+    #     return upright_gate * support_factor * height_score
 
 
 

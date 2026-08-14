@@ -72,8 +72,10 @@ class FallRecoveryConfig(BaseCfg):
         # Episodes terminate after stable recovery
         terminate_on_recovery_success = True
 
-        # Full fallen-state training
-        terminal_stance_reset_prob = 0.15 #0.05
+        # Predominantly fallen-state training with limited terminal-state bootstrap
+        # ~90% episodes -> genuine fallen-state recovery
+        # ~10% episodes -> near-terminal/standing-state exposure
+        terminal_stance_reset_prob = 0.10
         orientation_probs = [0.50, 0.20, 0.20, 0.10]
 
         debug_clean_terminal_reset = False
@@ -308,9 +310,9 @@ class FallRecoveryConfig(BaseCfg):
         recovery_ang_vel_threshold = 1.2
         recovery_posture_threshold = 2.0
 
-        # recovery_success_steps = 10     # Stage I: 0.2 seconds (10x0.02), dt = 0.02 = 0.005 x 4
-        recovery_success_steps = 20     # Stage II
-        require_non_slipping_contacts = True #False
+        recovery_success_steps = 10     # Stage I: 0.2 seconds (10x0.02), dt = 0.02 = 0.005 x 4
+        # recovery_success_steps = 20     # Stage II
+        require_non_slipping_contacts = False #True
 
         # Retained for diagnostics and later stages
         recovery_foot_slip_vel_threshold = 0.12
@@ -322,53 +324,53 @@ class FallRecoveryConfig(BaseCfg):
         recovery_bonus_delay_s = 0.5
 
     # Stage I
-    # class reward_scales(BaseCfg.reward_scales):
-    #     # Main objective
-    #     recovery_bonus = 5000.0     # effective 100.0 (recovery_bonus * dt)
-    #     recovery_progress = 20.0
+    class reward_scales(BaseCfg.reward_scales):
+        # Main objective
+        recovery_bonus = 5000.0     # effective 100.0 (recovery_bonus * dt)
+        recovery_progress = 20.0
 
-    #     # Recovery shaping
-    #     upright_orientation = 3.0
-    #     height_alignment = 2.0
-    #     posture = 3.0
-    #     feet_on_ground = 1.0
+        # Recovery shaping
+        upright_orientation = 3.0
+        height_alignment = 2.0
+        posture = 3.0
+        feet_on_ground = 1.0
 
-    #     # Stability
-    #     base_orientation = 0.0
-    #     base_ang_vel = -1.0e-2
+        # Stability
+        base_orientation = 0.0
+        base_ang_vel = -1.0e-2
 
-    #     # Weak regularization
-    #     action = -1.0e-3
-    #     torques = -2.0e-4
-    #     dof_acc = -5.0e-8
-    #     dof_vel = -1.0e-4
+        # Weak regularization
+        action = -1.0e-3
+        torques = -2.0e-4
+        dof_acc = -5.0e-8
+        dof_vel = -1.0e-4
 
-    #     # Safety
-    #     dof_pos_limits = -0.1
-    #     joint_vel_limit = 0.0
-    #     base_contact = -0.5
+        # Safety
+        dof_pos_limits = -0.1
+        joint_vel_limit = 0.0
+        base_contact = -0.5
 
-    #     # Exploration-safe slip/smoothness
-    #     body_slip = -5.0e-3
-    #     feet_slip = -5.0e-3
-    #     action_smoothness_1 = -1.0e-3
-    #     action_smoothness_2 = -2.0e-4
+        # Exploration-safe
+        body_slip = -5.0e-3
+        feet_slip = -5.0e-3
+        action_smoothness_1 = -1.0e-3
+        action_smoothness_2 = -2.0e-4
 
-    #     # Late-gated, so it does not suppress rolling
-    #     loaded_foot_slip = -1.0
+        # Do not constrain terminal foot motion yet
+        loaded_foot_slip = 0.0
 
-    #     # Disable terminal-refinement objectives in Stage 1
-    #     stand_still_action = 0.0
-    #     late_nonfoot_contact = 0.0
-    #     support_deficit = 0.0
-    #     front_leg_error = 0.0
-    #     loaded_foot_support = 0.0
-    #     stable_foot_support = 0.0
-    #     stance_region = 0.0
-    #     rear_leg_separation = 0.0
-    #     rear_leg_crossing = 0.0
-    #     terminal_action_prior = 0.0
-    #     base_height = 0.0
+        # Terminal refinement disabled
+        stand_still_action = 0.0
+        late_nonfoot_contact = 0.0
+        support_deficit = 0.0
+        front_leg_error = 0.0
+        loaded_foot_support = 0.0
+        stable_foot_support = 0.0
+        stance_region = 0.0
+        stance_separation = 0.0
+        leg_crossing = 0.0
+        terminal_action_prior = 0.0
+        base_height = 0.0
 
     # Stage II
     # class reward_scales(BaseCfg.reward_scales):
@@ -461,37 +463,37 @@ class FallRecoveryConfig(BaseCfg):
     #     stand_still_action = -1.0e-3
 
     # Stage IV
-    class reward_scales(BaseCfg.reward_scales):
-        # Main objective
-        recovery_bonus = 5000.0
-        recovery_progress = 4.0      # 8.0 -> 4.0
+    # class reward_scales(BaseCfg.reward_scales):
+    #     # Main objective
+    #     recovery_bonus = 5000.0
+    #     recovery_progress = 4.0      # 8.0 -> 4.0
 
-        # Pose
-        upright_orientation = 3.0
-        height_alignment = 2.0
-        posture = 3.0
-        feet_on_ground = 1.0
+    #     # Pose
+    #     upright_orientation = 3.0
+    #     height_alignment = 2.0
+    #     posture = 3.0
+    #     feet_on_ground = 1.0
 
-        # Stability
-        base_ang_vel = -0.05         # -0.03 -> -0.05
-        base_lin_vel = -0.10
+    #     # Stability
+    #     base_ang_vel = -0.05         # -0.03 -> -0.05
+    #     base_lin_vel = -0.10
 
-        # Regularization
-        action = -1.0e-3
-        torques = -2.0e-4
-        dof_acc = -5.0e-8
-        dof_vel = -1.0e-4
+    #     # Regularization
+    #     action = -1.0e-3
+    #     torques = -2.0e-4
+    #     dof_acc = -5.0e-8
+    #     dof_vel = -1.0e-4
 
-        action_smoothness_1 = -1.0e-3
-        action_smoothness_2 = -2.0e-4
+    #     action_smoothness_1 = -1.0e-3
+    #     action_smoothness_2 = -2.0e-4
 
-        # Terminal support
-        loaded_foot_support = 2.0
-        stable_foot_support = 6.0    # 5.0 -> 6.0
-        support_deficit = -2.0       # -1.0 -> -2.0
-        loaded_foot_slip = -0.50     # -0.25 -> -0.50
+    #     # Terminal support
+    #     loaded_foot_support = 2.0
+    #     stable_foot_support = 6.0    # 5.0 -> 6.0
+    #     support_deficit = -2.0       # -1.0 -> -2.0
+    #     loaded_foot_slip = -0.50     # -0.25 -> -0.50
 
-        stand_still_action = -1.0e-3
+    #     stand_still_action = -1.0e-3
 
-        stance_separation = 1.0
-        leg_crossing = -1.0
+    #     stance_separation = 1.0
+    #     leg_crossing = -1.0
