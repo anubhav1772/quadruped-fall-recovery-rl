@@ -145,27 +145,27 @@ class CoRLRewards:
         return torch.clamp(loaded_count / 3.0, 0.0, 1.0)
 
 
-    def _stable_support_gate(self):
-        env = self.env
-        cfg = env.cfg.rewards
+    # def _stable_support_gate(self):
+    #     env = self.env
+    #     cfg = env.cfg.rewards
 
-        foot_fz = env.contact_forces[:, env.feet_indices, 2].clamp_min(0.0)
-        foot_contact = foot_fz > cfg.recovery_contact_force_threshold
-        foot_xy_vel = torch.norm(env.foot_velocities[:, :, :2], dim=-1)
-        non_slipping_feet = foot_contact & (foot_xy_vel < cfg.recovery_foot_slip_vel_threshold)
-        stable_count = non_slipping_feet.float().sum(dim=1)
+    #     foot_fz = env.contact_forces[:, env.feet_indices, 2].clamp_min(0.0)
+    #     foot_contact = foot_fz > cfg.recovery_contact_force_threshold
+    #     foot_xy_vel = torch.norm(env.foot_velocities[:, :, :2], dim=-1)
+    #     non_slipping_feet = foot_contact & (foot_xy_vel < cfg.recovery_foot_slip_vel_threshold)
+    #     stable_count = non_slipping_feet.float().sum(dim=1)
 
-        # Strict terminal support gate:
-        # 0 below 2 stable feet, 1 at 3 or more stable feet.
-        return torch.clamp((stable_count - 2.0) / 1.0, 0.0, 1.0)
+    #     # Strict terminal support gate:
+    #     # 0 below 3 stable feet, 1 at 4 or more stable feet.
+    #     return torch.clamp((stable_count - 3.0) / 1.0, 0.0, 1.0)
 
 
-    def _smooth_support_gate(self):
-        """
-        0 when support is poor, 1 when about 3 useful support feet exist.
-        """
-        smooth_support_count = self._smooth_support_count()
-        return torch.clamp((smooth_support_count - 1.0) / 2.0, 0.0, 1.0)
+    # def _smooth_support_gate(self):
+    #     """
+    #     0 when support is poor, 1 when about 4 useful support feet exist.
+    #     """
+    #     smooth_support_count = self._smooth_support_count()
+    #     return torch.clamp((smooth_support_count - 1.0) / 3.0, 0.0, 1.0)
 
     ######## dense success reward ########
     def _reward_recovery_progress(self):
@@ -205,14 +205,11 @@ class CoRLRewards:
 
     def _reward_recovery_bonus(self):
         """
-        Sparse recovery bonus.
+        Sparse one-shot recovery bonus.
 
-        During terminal-stabilization training, this is usually disabled by setting
-        recovery_bonus = 0.0 in reward_scales.
-
-        When re-enabled later, the delay prevents the policy from receiving a success
-        bonus immediately after being reset near standing. The robot must first survive
-        for a short time after reset.
+        A minimum episode-age delay prevents near-standing bootstrap resets
+        from receiving the sparse recovery bonus immediately. Bootstrap
+        episodes that destabilize and recover later may still become eligible.
         """
         env = self.env
 
@@ -276,48 +273,46 @@ class CoRLRewards:
         return upright_reward * stability_factor
 
     # Stage I
-    def _reward_height_alignment(self):
-        """
-        Robot must learn to rise. It is not ideal for subsequent Stage
-        because it does not penalize excessive extension above 0.34 m.
-
-        height below target -> increasing reward
-        height at target    -> maximum reward
-        height above target -> same maximum reward
-        """
-        env = self.env
-        upright_factor = torch.clamp(-env.projected_gravity[:, 2], 0.0, 1.0)
-
-        height_progress = self._height_progress()
-        loaded_support = self._loaded_support_gate()
-
-        # Preserve a small height gradient before feet are fully loaded.
-        support_factor = 0.20 + 0.80 * loaded_support
-
-        return upright_factor * support_factor * height_progress
-
-    # Stage II
     # def _reward_height_alignment(self):
     #     """
-    #     A target-centred reward.
+    #     Robot must learn to rise. It is not ideal for subsequent Stage
+    #     because it does not penalize excessive extension above 0.34 m.
+
+    #     height below target -> increasing reward
+    #     height at target    -> maximum reward
+    #     height above target -> same maximum reward
     #     """
     #     env = self.env
-    #     cfg = env.cfg.rewards
+    #     upright_factor = torch.clamp(-env.projected_gravity[:, 2], 0.0, 1.0)
 
-    #     body_height = self.get_body_height()
-    #     target_height = cfg.recovery_height_target
-
-    #     sigma = getattr(cfg, "height_alignment_sigma", 0.06)
-
-    #     height_score = torch.exp(-torch.square((body_height - target_height) / sigma))
-
-    #     upright_gate = torch.clamp((-env.projected_gravity[:, 2] - 0.65) / 0.30, 0.0, 1.0)
-
+    #     height_progress = self._height_progress()
     #     loaded_support = self._loaded_support_gate()
+
+    #     # Preserve a small height gradient before feet are fully loaded.
     #     support_factor = 0.20 + 0.80 * loaded_support
 
-    #     return upright_gate * support_factor * height_score
+    #     return upright_factor * support_factor * height_progress
 
+    # Stage II
+    def _reward_height_alignment(self):
+        """
+        Rewards maintaining the target standing height during stabilization.
+        """
+        env = self.env
+        cfg = env.cfg.rewards
+
+        body_height = self.get_body_height()
+        target_height = cfg.recovery_height_target
+
+        sigma = getattr(cfg, "height_alignment_sigma", 0.06)
+        height_score = torch.exp(-torch.square((body_height - target_height) / sigma))
+
+        upright_gate = torch.clamp((-env.projected_gravity[:, 2] - 0.65) / 0.30, 0.0, 1.0)
+
+        loaded_support = self._loaded_support_gate()
+        support_factor = 0.20 + 0.80 * loaded_support
+
+        return upright_gate * support_factor * height_score
 
 
     ###############################################
@@ -392,7 +387,6 @@ class CoRLRewards:
     #############################################################
     ################ STABILITY AND CONFIGURATION ################
     #############################################################
-    # Stage I
     # def _reward_base_ang_vel(self):
     #     """
     #     Penalizes high base angular velocity.
@@ -405,7 +399,6 @@ class CoRLRewards:
     #     """
     #     return torch.sum(torch.square(self.env.base_ang_vel), dim=1)
 
-    # Stage II
     def _reward_base_ang_vel(self):
         env = self.env
 
@@ -451,48 +444,6 @@ class CoRLRewards:
         slip = torch.clamp(body_xy_vel - 0.15, min=0.0)
         return contact.float() * torch.square(slip)
 
-    # Stage I
-    # def _reward_stable_foot_support(self):
-    #     env = self.env
-
-    #     upright_gate = torch.clamp((-env.projected_gravity[:, 2] - 0.55) / 0.35, 0.0, 1.0)
-
-    #     base_height = self.get_body_height()
-    #     height_gate = torch.clamp((base_height - 0.25) / 0.08, 0.0, 1.0)
-
-    #     foot_fz = env.contact_forces[:, env.feet_indices, 2].clamp_min(0.0)
-
-    #     # Reward loaded support, not just tiny contact.
-    #     load_score = torch.clamp((foot_fz - 3.0) / 20.0, 0.0, 1.0)
-
-    #     foot_xy_vel = torch.norm(env.foot_velocities[:, :, :2], dim=-1)
-
-    #     # Smooth no-slip score.
-    #     no_slip_score = torch.exp(-8.0 * foot_xy_vel)
-
-    #     support_score = (load_score * no_slip_score).sum(dim=1) / 4.0
-
-    #     foot_pos_body = quat_rotate_inverse(
-    #         env.base_quat.unsqueeze(1).repeat(1, 4, 1).reshape(-1, 4),
-    #         (env.foot_positions - env.base_pos.unsqueeze(1)).reshape(-1, 3)
-    #     ).reshape(env.num_envs, 4, 3)
-
-    #     y = foot_pos_body[:, :, 1]
-
-    #     front_sep = torch.abs(y[:, 0] - y[:, 1])
-    #     rear_sep = torch.abs(y[:, 2] - y[:, 3])
-
-    #     front_violation = (torch.clamp(0.24 - front_sep, min=0.0) + torch.clamp(front_sep - 0.40, min=0.0))
-    #     rear_violation = (torch.clamp(0.24 - rear_sep, min=0.0) + torch.clamp(rear_sep - 0.40, min=0.0))
-
-    #     stance_gate = torch.exp(-10.0 * (0.5 * front_violation + 0.5 * rear_violation))
-
-    #     # Non-foot/body contact gate
-    #     nonfoot_force = torch.norm(env.contact_forces[:, env.base_contact_indices, :], dim=-1).max(dim=1).values
-    #     body_contact_gate = torch.exp(-0.08 * nonfoot_force)
-
-    #     return upright_gate * height_gate * stance_gate * body_contact_gate * support_score
-
 
     # def _terminal_stable_support_count(self):
     #     env = self.env
@@ -518,9 +469,51 @@ class CoRLRewards:
 
     #     return torch.sum(load_score * no_slip_score, dim=1)
 
-    # Stage II
+    # def _reward_stable_foot_support(self):
+    #     """loaded + non-slipping terminal support
+    #     """
+    #     env = self.env
+
+    #     upright_gate = torch.clamp((-env.projected_gravity[:, 2] - 0.65) / 0.30, 0.0, 1.0)
+
+    #     body_height = self.get_body_height()
+    #     height_gate = torch.clamp((body_height - 0.25) / 0.08, 0.0, 1.0)
+
+    #     # stable_count = self._terminal_stable_support_count()
+
+    #     stable_score = self._terminal_stable_support_scores() # [N, 4], individual feet
+    #     stable_count = stable_score.sum(dim=1)                # [N], summed support
+
+    #     # 1 stable foot -> 0
+    #     # 2 stable feet -> 0.5
+    #     # 3+ stable feet -> 1
+    #     # Stage I-III
+    #     # global_support = torch.clamp((stable_count - 1.0) / 2.0, 0.0, 1.0)
+    #     # Stage IV:
+    #     # 1 stable foot -> 0.00
+    #     # 2 stable feet -> 0.33
+    #     # 3 stable feet -> 0.67
+    #     # 4 stable feet -> 1.00
+    #     global_support = torch.clamp((stable_count - 1.0) / 3.0, 0.0, 1.0)
+
+    #     # Prevent the policy from obtaining high terminal-support reward
+    #     # while sacrificing either front foot.
+    #     # Foot order: FL, FR, RL, RR
+    #     # front_support = torch.minimum(stable_score[:, 0], stable_score[:, 1])
+
+    #     # Preserve terrain-adaptive multi-foot support as the primary objective,
+    #     # while giving extra pressure to settle both front feet.
+    #     # support_score = 0.65 * global_support + 0.35 * front_support
+
+    #     return upright_gate * height_gate #* support_score
+
     def _reward_stable_foot_support(self):
-        """loaded + non-slipping terminal support
+        """
+        Rewards smooth four-foot terminal support.
+
+        A foot contributes when it is both loaded and moving slowly in XY.
+        The reward progressively increases from one useful support foot toward
+        four useful support feet.
         """
         env = self.env
 
@@ -529,34 +522,16 @@ class CoRLRewards:
         body_height = self.get_body_height()
         height_gate = torch.clamp((body_height - 0.25) / 0.08, 0.0, 1.0)
 
-        # stable_count = self._terminal_stable_support_count()
+        stable_score = self._terminal_stable_support_scores()
+        stable_count = stable_score.sum(dim=1)
 
-        stable_score = self._terminal_stable_support_scores() # [N, 4], individual feet
-        stable_count = stable_score.sum(dim=1)                # [N], summed support
-
-        # 1 stable foot -> 0
-        # 2 stable feet -> 0.5
-        # 3+ stable feet -> 1
-        # Stage I-III
-        # global_support = torch.clamp((stable_count - 1.0) / 2.0, 0.0, 1.0)
-        # Stage IV:
         # 1 stable foot -> 0.00
         # 2 stable feet -> 0.33
         # 3 stable feet -> 0.67
         # 4 stable feet -> 1.00
-        global_support = torch.clamp((stable_count - 1.0) / 3.0, 0.0, 1.0)
-
-        # Prevent the policy from obtaining high terminal-support reward
-        # while sacrificing either front foot.
-        # Foot order: FL, FR, RL, RR
-        front_support = torch.minimum(stable_score[:, 0], stable_score[:, 1])
-
-        # Preserve terrain-adaptive multi-foot support as the primary objective,
-        # while giving extra pressure to settle both front feet.
-        support_score = 0.65 * global_support + 0.35 * front_support
+        support_score = torch.clamp((stable_count - 1.0) / 3.0, 0.0, 1.0)
 
         return upright_gate * height_gate * support_score
-
 
     def _reward_leg_crossing(self):
         """
@@ -674,7 +649,7 @@ class CoRLRewards:
         contact_score = torch.clamp((foot_fz - 1.0) / 12.0, 0.0, 1.0)
         contact_count_soft = contact_score.sum(dim=1)
 
-        support_contact_progress = torch.clamp((contact_count_soft - 1.0) / 2.0, 0.0, 1.0)
+        support_contact_progress = torch.clamp((contact_count_soft - 1.0) / 3.0, 0.0, 1.0)
 
         return upright_gate * height_gate * support_contact_progress
 
