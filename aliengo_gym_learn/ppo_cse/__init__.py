@@ -75,57 +75,53 @@ caches = DataCaches(1)
 #     resume_iteration = 39200 #35600 #34400 #31600 #29600 #28800 #28400 #0         # set manually if you want logs to continue from old iter
 
 # STAGE I
-class RunnerArgs(PrefixProto, cli=False):
-    algorithm_class_name = "RMA"
-    num_steps_per_env = 24
-    max_iterations = 1500
-
-    save_interval = 400
-    save_video_interval = 300
-    log_freq = 10
-
-    resume = False
-    resume_path = None
-    checkpoint = "last"
-    resume_optimizer = False
-    resume_iteration = 0
-
-# STAGE II
 # class RunnerArgs(PrefixProto, cli=False):
-#     # runner
-#     algorithm_class_name = 'RMA'
+#     algorithm_class_name = "RMA"
 #     num_steps_per_env = 24
 #     max_iterations = 1500
 
-#     # logging
 #     save_interval = 400
 #     save_video_interval = 300
 #     log_freq = 10
 
-#     # recovery policy resume
-#     resume = True
-#     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-07-22/train_fall_recovery/175905.477939"
-#     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-07-27/train_fall_recovery/085751.292955"
-#     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-08-04/train_fall_recovery/114326.956585"
-#     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-08-10/train_fall_recovery/083357.460470"
-#     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-08-11/train_fall_recovery/085416.875723"
-#     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-08-11/train_fall_recovery/114221.049053"
-#     # terminal_action_clip = 0.30
-#     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-06-03/train_fall_recovery/101441.711985"
-#     # terminal_action_clip = 0.50
-#     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-06-03/train_fall_recovery/104741.561249"
-#     # terminal_action_clip = 0.80
-#     #resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-06-03/train_fall_recovery/113046.764231"
-#     # # terminal_action_clip = 0.90
-#     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-06-03/train_fall_recovery/141847.429995"
+#     resume = False
+#     resume_path = None
+#     checkpoint = "last"
+#     resume_optimizer = False
+#     resume_iteration = 0
 
-#     # terminal_stance_reset_prob = 1.0
-#     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-06-04/train_fall_recovery/094324.831941"
-#     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-06-04/train_fall_recovery/123700.778927"
+# STAGE II
+class RunnerArgs(PrefixProto, cli=False):
+    # runner
+    algorithm_class_name = 'RMA'
+    num_steps_per_env = 24
+    max_iterations = 1500
 
-#     checkpoint = 28000 #25200 #22800 #19600 #6000          # "last" or iteration number, e.g. 8717
-#     resume_optimizer = False     # keep False for recovery fine-tuning
-#     resume_iteration = 28001 #25201 #22801 #19601 #6001     # set manually if you want logs to continue from old iter
+    # logging
+    save_interval = 400
+    save_video_interval = 300
+    log_freq = 10
+
+    # recovery policy resume
+    resume = True
+    resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-08-14/train_fall_recovery/080722.513527"
+    # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-08-11/train_fall_recovery/114221.049053"
+    # terminal_action_clip = 0.30
+    # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-06-03/train_fall_recovery/101441.711985"
+    # terminal_action_clip = 0.50
+    # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-06-03/train_fall_recovery/104741.561249"
+    # terminal_action_clip = 0.80
+    #resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-06-03/train_fall_recovery/113046.764231"
+    # # terminal_action_clip = 0.90
+    # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-06-03/train_fall_recovery/141847.429995"
+
+    # terminal_stance_reset_prob = 1.0
+    # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-06-04/train_fall_recovery/094324.831941"
+    # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-06-04/train_fall_recovery/123700.778927"
+
+    checkpoint = 6400            # "last" or iteration number, e.g. 8717
+    resume_optimizer = False     # keep False for recovery fine-tuning
+    resume_iteration = 6401      # set manually if you want logs to continue from old iter
 
 class Runner:
 
