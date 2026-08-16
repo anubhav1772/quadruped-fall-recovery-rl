@@ -64,14 +64,14 @@ class PPO_Args(PrefixProto):
 
     clip_param = 0.2
 
-    entropy_coef = 0.01 # Stage I
-    # entropy_coef = 0.001 # Stage II
+    #entropy_coef = 0.01 # Stage I
+    entropy_coef = 0.002 # Stage II
 
     num_learning_epochs = 5
     num_mini_batches = 4
 
-    learning_rate = 3e-4
-    adaptation_module_learning_rate = 3e-4
+    learning_rate = 1e-4 #3e-4
+    adaptation_module_learning_rate = 1e-4 #3e-4
     num_adaptation_module_substeps = 1
 
     schedule = "adaptive"
