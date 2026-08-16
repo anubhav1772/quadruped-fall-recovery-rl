@@ -310,9 +310,9 @@ class FallRecoveryConfig(BaseCfg):
         recovery_ang_vel_threshold = 1.2
         recovery_posture_threshold = 2.0
 
-        recovery_success_steps = 10     # Stage I: 0.2 seconds (10x0.02), dt = 0.02 = 0.005 x 4
-        # recovery_success_steps = 20     # Stage II
-        require_non_slipping_contacts = False #True
+        # recovery_success_steps = 10     # Stage I: 0.2 seconds (10x0.02), dt = 0.02 = 0.005 x 4
+        recovery_success_steps = 20       # Stage II
+        require_non_slipping_contacts = True
 
         # Retained for diagnostics and later stages
         recovery_foot_slip_vel_threshold = 0.12
@@ -324,61 +324,12 @@ class FallRecoveryConfig(BaseCfg):
         recovery_bonus_delay_s = 0.5
 
     # Stage I
-    class reward_scales(BaseCfg.reward_scales):
-        # Main objective
-        recovery_bonus = 5000.0     # effective 100.0 (recovery_bonus * dt)
-        recovery_progress = 20.0
-
-        # Recovery shaping
-        upright_orientation = 3.0
-        height_alignment = 2.0
-        posture = 3.0
-        feet_on_ground = 1.0
-
-        # Stability
-        base_orientation = 0.0
-        base_ang_vel = -1.0e-2
-
-        # Weak regularization
-        action = -1.0e-3
-        torques = -2.0e-4
-        dof_acc = -5.0e-8
-        dof_vel = -1.0e-4
-
-        # Safety
-        dof_pos_limits = -0.1
-        joint_vel_limit = 0.0
-        base_contact = -0.5
-
-        # Exploration-safe
-        body_slip = -5.0e-3
-        feet_slip = -5.0e-3
-        action_smoothness_1 = -1.0e-3
-        action_smoothness_2 = -2.0e-4
-
-        # Do not constrain terminal foot motion yet
-        loaded_foot_slip = 0.0
-
-        # Terminal refinement disabled
-        stand_still_action = 0.0
-        late_nonfoot_contact = 0.0
-        support_deficit = 0.0
-        front_leg_error = 0.0
-        loaded_foot_support = 0.0
-        stable_foot_support = 0.0
-        stance_region = 0.0
-        stance_separation = 0.0
-        leg_crossing = 0.0
-        terminal_action_prior = 0.0
-        base_height = 0.0
-
-    # Stage II
     # class reward_scales(BaseCfg.reward_scales):
     #     # Main objective
     #     recovery_bonus = 5000.0     # effective 100.0 (recovery_bonus * dt)
-    #     recovery_progress = 8.0
+    #     recovery_progress = 20.0
 
-    #     # Final-pose shaping
+    #     # Recovery shaping
     #     upright_orientation = 3.0
     #     height_alignment = 2.0
     #     posture = 3.0
@@ -386,48 +337,93 @@ class FallRecoveryConfig(BaseCfg):
 
     #     # Stability
     #     base_orientation = 0.0
-    #     base_ang_vel = -0.03
+    #     base_ang_vel = -1.0e-2
 
-    #     # Motor regularization
+    #     # Weak regularization
     #     action = -1.0e-3
     #     torques = -2.0e-4
     #     dof_acc = -5.0e-8
     #     dof_vel = -1.0e-4
-    #     ang_vel_limit = 0.0
-    #     base_lin_vel = -0.1
 
     #     # Safety
     #     dof_pos_limits = -0.1
     #     joint_vel_limit = 0.0
     #     base_contact = -0.5
 
-    #     # Exploration-safe regularization
+    #     # Exploration-safe
     #     body_slip = -5.0e-3
     #     feet_slip = -5.0e-3
     #     action_smoothness_1 = -1.0e-3
     #     action_smoothness_2 = -2.0e-4
 
-    #     # Balance positive support against slip penalty
-    #     loaded_foot_slip = -0.25
+    #     # Do not constrain terminal foot motion yet
+    #     loaded_foot_slip = 0.0
 
-    #     # Keep morphology-specific terminal shaping disabled
+    #     # Terminal refinement disabled
+    #     stand_still_action = 0.0
     #     late_nonfoot_contact = 0.0
+    #     support_deficit = 0.0
+    #     front_leg_error = 0.0
+    #     loaded_foot_support = 0.0
+    #     stable_foot_support = 0.0
+    #     stance_region = 0.0
+    #     stance_separation = 0.0
+    #     leg_crossing = 0.0
     #     terminal_action_prior = 0.0
     #     base_height = 0.0
-    #     # Your data showed excessive front width
-    #     front_leg_error = 0.0 #-0.5
-    #     # Gentle stance refinement
-    #     stance_region = 0.0 #0.2
 
-    #     # Establish loaded, stable support
-    #     loaded_foot_support = 2.0
-    #     support_deficit = -1.0
-    #     stand_still_action = -1.0e-3
-    #     stable_foot_support = 5.0
+    # Stage II
+    class reward_scales(BaseCfg.reward_scales):
+        # Main objective
+        recovery_bonus = 5000.0
+        recovery_progress = 8.0
 
-    #     # Rear geometry is not currently the bottleneck
-    #     rear_leg_separation = 0.0
-    #     rear_leg_crossing = 0.0
+        # Final-pose shaping
+        upright_orientation = 3.0
+        height_alignment = 2.0
+        posture = 3.0
+        feet_on_ground = 1.0
+
+        # Stability
+        base_orientation = 0.0
+        base_ang_vel = -0.03
+        base_lin_vel = -0.10
+
+        # Motor regularization
+        action = -1.0e-3
+        torques = -2.0e-4
+        dof_acc = -5.0e-8
+        dof_vel = -1.0e-4
+
+        ang_vel_limit = 0.0
+        joint_vel_limit = 0.0
+
+        # Safety
+        dof_pos_limits = -0.1
+        base_contact = -0.5
+
+        # General regularization
+        body_slip = -5.0e-3
+        feet_slip = -5.0e-3
+        action_smoothness_1 = -1.0e-3
+        action_smoothness_2 = -2.0e-4
+
+        # Terminal support / stabilization
+        loaded_foot_support = 2.0
+        stable_foot_support = 5.0
+        support_deficit = -1.0
+        loaded_foot_slip = -0.25
+        stand_still_action = -1.0e-3
+
+        # Geometry-specific refinement disabled
+        late_nonfoot_contact = 0.0
+        front_leg_error = 0.0
+        stance_region = 0.0
+        stance_separation = 0.0
+        leg_crossing = 0.0
+
+        terminal_action_prior = 0.0
+        base_height = 0.0
 
     # Stage III
     # class reward_scales(BaseCfg.reward_scales):
