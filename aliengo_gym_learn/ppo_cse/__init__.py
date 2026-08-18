@@ -104,7 +104,8 @@ class RunnerArgs(PrefixProto, cli=False):
 
     # recovery policy resume
     resume = True
-    resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-08-14/train_fall_recovery/080722.513527"
+    # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-08-14/train_fall_recovery/080722.513527"
+    resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-08-15/train_fall_recovery/073618.354140"
     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-08-11/train_fall_recovery/114221.049053"
     # terminal_action_clip = 0.30
     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-06-03/train_fall_recovery/101441.711985"
@@ -119,9 +120,9 @@ class RunnerArgs(PrefixProto, cli=False):
     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-06-04/train_fall_recovery/094324.831941"
     # resume_path = "/home/ros20_doc/Projects/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-06-04/train_fall_recovery/123700.778927"
 
-    checkpoint = 6400            # "last" or iteration number, e.g. 8717
+    checkpoint = 14000 #6400            # "last" or iteration number, e.g. 8717
     resume_optimizer = False     # keep False for recovery fine-tuning
-    resume_iteration = 6401      # set manually if you want logs to continue from old iter
+    resume_iteration = 14001 #6401      # set manually if you want logs to continue from old iter
 
 class Runner:
 
