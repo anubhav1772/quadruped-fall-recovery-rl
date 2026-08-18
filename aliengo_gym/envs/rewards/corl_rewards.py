@@ -182,10 +182,11 @@ class CoRLRewards:
 
         height_progress = self._height_progress()
 
-        # Stage I-III
+        # Early recovery version:
         # support_progress = torch.clamp(self._smooth_support_count() / 3.0, 0.0, 1.0)
-        # Stage IV
-        # Recovery progress now encourages ~4 useful supports
+
+        # Stage II+:
+        # Encourage progression toward four useful supports.
         support_progress = torch.clamp(self._smooth_support_count() / 4.0, 0.0, 1.0)
 
         return (
@@ -533,64 +534,6 @@ class CoRLRewards:
 
         return upright_gate * height_gate * support_score
 
-    def _reward_leg_crossing(self):
-        """
-        Penalizes left-right foot crossing during late recovery.
-
-        Foot positions are expressed in the robot base frame. For each
-        front/rear pair, the expected ordering gives positive separation:
-
-            front_sep = y_FL - y_FR
-            rear_sep  = y_RL - y_RR
-
-        A negative separation therefore indicates that the corresponding
-        left and right feet have crossed. Crossing depth is normalized by a
-        characteristic distance and clipped to [0, 1], producing a bounded
-        penalty whose magnitude is independent of the raw distance units.
-
-        The front pair is weighted more strongly because front-leg crossing
-        is the current dominant terminal-stability failure.
-
-        The penalty is activated only when the robot is sufficiently upright
-        and raised, avoiding interference with asymmetric motions required
-        during the earlier recovery phase.
-
-        Returns:
-            Tensor of shape [num_envs], where 0 means no crossing and larger
-            values indicate increasingly severe foot crossing.
-        """
-        env = self.env
-
-        upright_gate = torch.clamp((-env.projected_gravity[:, 2] - 0.70) / 0.25, 0.0, 1.0)
-
-        base_height = self.get_body_height()
-        height_gate = torch.clamp((base_height - 0.26) / 0.07, 0.0, 1.0)
-
-        foot_pos_body = quat_rotate_inverse(
-            env.base_quat.unsqueeze(1).repeat(1, 4, 1).reshape(-1, 4),
-            (env.foot_positions - env.base_pos.unsqueeze(1)).reshape(-1, 3)
-        ).reshape(env.num_envs, 4, 3)
-
-        y = foot_pos_body[:, :, 1]
-
-        # Foot order: FL, FR, RL, RR
-        front_sep = y[:, 0] - y[:, 1]
-        rear_sep = y[:, 2] - y[:, 3]
-
-        # Separation reward already handles normal stance width.
-        # This term activates only when left/right feet actually cross.
-        # front_crossing = torch.clamp(-front_sep, min=0.0)
-        # rear_crossing = torch.clamp(-rear_sep, min=0.0)
-
-        # Normalize the crossing error with crossing_scale 0s 10 cm
-        front_crossing = torch.clamp(-front_sep / 0.10, 0.0, 1.0)
-        rear_crossing = torch.clamp(-rear_sep / 0.10, 0.0, 1.0)
-
-        # Front crossing is currently the dominant failure.
-        crossing = 2.0 * front_crossing + 0.5 * rear_crossing
-
-        return upright_gate * height_gate * crossing
-
 
     def _reward_asymmetry(self):
         """
@@ -706,12 +649,11 @@ class CoRLRewards:
 
         stable_count = self._terminal_stable_support_count()
         support_gate = torch.clamp((stable_count - 1.5) / 1.0, 0.0, 1.0)
-
-        terminal_gate = upright_gate * height_gate * support_gate
+        support_factor = 0.20 + 0.80 * support_gate
 
         lin_vel_cost = torch.sum(torch.square(env.base_lin_vel), dim=1)
 
-        return terminal_gate * lin_vel_cost
+        return upright_gate * height_gate * support_factor * lin_vel_cost
 
 
     def _reward_base_height(self):
@@ -754,28 +696,58 @@ class CoRLRewards:
         violations = ((q < q_min) | (q > q_max)).float()
         return torch.sum(violations, dim=1)
 
-    def _reward_stance_separation(self):
+    #============================================================
+    # front_leg_error -> penalizes excessively wide / forward front feet
+    # stance_separation -> penalizes feet becoming too close, especially rear pair
+    # leg_crossing -> penalizes actual left-right inversion
+    #============================================================
+    def _reward_front_leg_error(self):
         """
-        Rewards a valid lateral stance width during late recovery.
+        Penalizes excessively wide, forward, or laterally biased front-foot
+        placement during terminal recovery.
+        """
+        env = self.env
 
-        The front and rear foot-pair separations are measured in the robot
-        base frame using the expected left-right ordering:
+        upright_gate = torch.clamp((-env.projected_gravity[:, 2] - 0.75) / 0.20, 0.0, 1.0)
 
-            front_sep = y_FL - y_FR
-            rear_sep  = y_RL - y_RR
+        base_height = self.get_body_height()
+        height_gate = torch.clamp((base_height - 0.28) / 0.05, 0.0, 1.0)
+        gate = upright_gate * height_gate
 
-        Positive separation corresponds to the correct left-right ordering.
-        Separation below the target width is treated as an error, with greater
-        emphasis on the front pair because front-foot collapse/crossing is the
-        dominant terminal failure mode.
+        foot_pos_body = quat_rotate_inverse(
+            env.base_quat.unsqueeze(1).repeat(1, 4, 1).reshape(-1, 4),
+            (env.foot_positions - env.base_pos.unsqueeze(1)).reshape(-1, 3),
+        ).reshape(env.num_envs, 4, 3)
 
-        The reward is gated by uprightness and body height so that it shapes
-        the final support stance without constraining the earlier rolling and
-        push-up phases of recovery.
+        x = foot_pos_body[:, :, 0]
+        y = foot_pos_body[:, :, 1]
 
-        Returns:
-            Tensor of shape [num_envs] with larger values for sufficiently
-            separated front and rear feet.
+        # Foot order: FL, FR, RL, RR
+        front_sep = y[:, 0] - y[:, 1]
+        front_x_mean = 0.5 * (x[:, 0] + x[:, 1])
+        front_y_center = 0.5 * (y[:, 0] + y[:, 1])
+
+        # Penalize only outside a reasonable terminal stance.
+        width_err = torch.clamp(front_sep - 0.42, min=0.0) / 0.20
+        forward_err = torch.clamp(front_x_mean - 0.28, min=0.0) / 0.20
+        center_err = torch.clamp(torch.abs(front_y_center) - 0.05, min=0.0) / 0.10
+
+        err = (
+            1.5 * torch.square(width_err)
+            + 1.0 * torch.square(forward_err)
+            + 0.3 * torch.square(center_err)
+        )
+
+        return gate * torch.clamp(err, 0.0, 4.0)
+
+    def _reward_leg_crossing(self):
+        """
+        Penalizes left-right foot crossing during late recovery.
+
+        Front and rear foot separations are measured in the robot base frame.
+        Negative separation indicates crossing, with crossing depth normalized and
+        clipped to a bounded penalty. The term is gated by uprightness and body
+        height to avoid constraining early recovery motions.
         """
         env = self.env
 
@@ -795,10 +767,61 @@ class CoRLRewards:
         front_sep = y[:, 0] - y[:, 1]
         rear_sep = y[:, 2] - y[:, 3]
 
-        front_sep_err = torch.clamp(0.24 - front_sep, min=0.0)
-        rear_sep_err  = torch.clamp(0.24 - rear_sep, min=0.0)
+        # Separation reward already handles normal stance width.
+        # This term activates only when left/right feet actually cross.
+        # front_crossing = torch.clamp(-front_sep, min=0.0)
+        # rear_crossing = torch.clamp(-rear_sep, min=0.0)
 
-        sep_err = 0.75 * front_sep_err + 0.25 * rear_sep_err
+        # Normalize the crossing error with crossing_scale 0s 10 cm
+        front_crossing = torch.clamp(-front_sep / 0.10, 0.0, 1.0)
+        rear_crossing = torch.clamp(-rear_sep / 0.10, 0.0, 1.0)
+
+        # Gives equal protection against actual left-right inversion
+        # without artificially favoring one end of the robot.
+        crossing = front_crossing + rear_crossing
+
+        return upright_gate * height_gate * crossing
+
+    def _reward_stance_separation(self):
+        """
+        Rewards sufficient lateral separation between left and right feet during
+        late recovery.
+
+        Front and rear foot-pair separations are measured in the robot base frame.
+        Separation below the minimum width is penalized, with greater emphasis on
+        the rear pair. The reward is gated by uprightness and body height so it
+        does not constrain the earlier recovery motion.
+
+        rear_sep < 0 => crossing penalty
+        0 < rear_sep < 0.22 => separation reward gives gradient
+        rear_sep >= 0.22 => separation term satisfied
+        """
+        env = self.env
+
+        upright_gate = torch.clamp((-env.projected_gravity[:, 2] - 0.70) / 0.25, 0.0, 1.0)
+
+        base_height = self.get_body_height()
+        height_gate = torch.clamp((base_height - 0.26) / 0.07, 0.0, 1.0)
+
+        foot_pos_body = quat_rotate_inverse(
+            env.base_quat.unsqueeze(1).repeat(1, 4, 1).reshape(-1, 4),
+            (env.foot_positions - env.base_pos.unsqueeze(1)).reshape(-1, 3)
+        ).reshape(env.num_envs, 4, 3)
+
+        y = foot_pos_body[:, :, 1]
+
+        # Foot order: FL, FR, RL, RR
+        front_sep = y[:, 0] - y[:, 1]
+        rear_sep = y[:, 2] - y[:, 3]
+
+        # Minimum useful terminal width.
+        # Nominal stance is ~0.31 m pair separation,
+        # but allow considerable terrain adaptation.
+        min_sep = 0.22
+        front_sep_err = torch.clamp(min_sep - front_sep, min=0.0)
+        rear_sep_err = torch.clamp(min_sep - rear_sep, min=0.0)
+        # Current failure is primarily narrow rear support.
+        sep_err = 0.25 * front_sep_err + 0.75 * rear_sep_err
 
         return upright_gate * height_gate * torch.exp(-8.0 * sep_err)
 
@@ -1062,49 +1085,6 @@ class CoRLRewards:
         deficit = torch.clamp(4.0 - stable_count, min=0.0) / 4.0
 
         return upright_gate * height_gate * torch.square(deficit)
-
-    def _reward_front_leg_error(self):
-        """
-        Penalizes front feet being too wide and too far forward during terminal
-        recovery.
-
-        Current observed failure:
-            front feet act like wide forward braces instead of moving under the body.
-        """
-        env = self.env
-
-        upright_gate = torch.clamp((-env.projected_gravity[:, 2] - 0.75) / 0.20, 0.0, 1.0)
-
-        base_height = self.get_body_height()
-        height_gate = torch.clamp((base_height - 0.28) / 0.05, 0.0, 1.0)
-
-        gate = upright_gate * height_gate
-
-        foot_pos_body = quat_rotate_inverse(
-            env.base_quat.unsqueeze(1).repeat(1, 4, 1).reshape(-1, 4),
-            (env.foot_positions - env.base_pos.unsqueeze(1)).reshape(-1, 3),
-        ).reshape(env.num_envs, 4, 3)
-
-        x = foot_pos_body[:, :, 0]
-        y = foot_pos_body[:, :, 1]
-
-        # Foot order: FL, FR, RL, RR
-        front_sep = y[:, 0] - y[:, 1]
-        front_x_mean = 0.5 * (x[:, 0] + x[:, 1])
-        front_y_center = 0.5 * (y[:, 0] + y[:, 1])
-
-        # Penalize only outside a reasonable terminal stance.
-        width_err = torch.clamp(front_sep - 0.42, min=0.0) / 0.20
-        forward_err = torch.clamp(front_x_mean - 0.28, min=0.0) / 0.20
-        center_err = torch.abs(front_y_center) / 0.15
-
-        err = (
-            1.5 * torch.square(width_err)
-            + 1.0 * torch.square(forward_err)
-            + 0.3 * torch.square(center_err)
-        )
-
-        return gate * torch.clamp(err, 0.0, 4.0)
 
     def _reward_terminal_action_prior(self):
         """
