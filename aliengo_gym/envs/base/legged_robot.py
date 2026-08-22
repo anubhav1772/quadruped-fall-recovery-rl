@@ -166,9 +166,19 @@ class LeggedRobot(BaseTask):
         # Strict terminal stabilization zone.
         if near_stand_action_clip is not None:
             near_stand = (
-                (g_now[:, 2] < -0.75)
-                & (relative_base_height > 0.27)
+                (g_now[:, 2] < -0.85)
+                & (relative_base_height > 0.30)
             )
+
+            # loaded_count = (
+            #     self._foot_load_score() > 0.5
+            # ).sum(dim=1)
+
+            # near_stand = (
+            #     (g_now[:, 2] < -0.85)
+            #     & (relative_base_height > 0.30)
+            #     & (loaded_count >= 2)
+            # )
 
             self.near_stand_clip_frac = near_stand.float().mean()
 
@@ -1458,21 +1468,49 @@ class LeggedRobot(BaseTask):
         # Default is status 0: not upright.
         status = torch.zeros(self.num_envs, device=self.device, dtype=torch.int32)
 
-        # Hierarchical recovery state
-        # 0: not upright
-        status[~upright] = 0
-        # 1: upright, but insufficient height
-        status[upright & ~stable_height] = 1
-        # 2: upright + raised, but still moving too much
-        status[upright & stable_height & ~motion_stable] = 2
-        # 3: dynamically stable, but posture is not standing-like
-        status[upright & stable_height & motion_stable & ~good_posture] = 3
-        # 4: posture is good, but terminal support/contact is invalid
-        status[upright & stable_height & motion_stable & good_posture & ~contact_stable] = 4
-        # 5: all instantaneous recovery gates passed
-        status[recovered] = 5
-        # 6: recovery condition sustained for the required duration
-        status[stable_recovery] = 6
+        # # Hierarchical recovery state
+        # # 0: not upright
+        # status[~upright] = 0
+        # # 1: upright, but insufficient height
+        # status[upright & ~stable_height] = 1
+        # # 2: upright + raised, but still moving too much
+        # status[upright & stable_height & ~motion_stable] = 2
+        # # 3: dynamically stable, but posture is not standing-like
+        # status[upright & stable_height & motion_stable & ~good_posture] = 3
+        # # 4: posture is good, but terminal support/contact is invalid
+        # status[upright & stable_height & motion_stable & good_posture & ~contact_stable] = 4
+        # # 5: all instantaneous recovery gates passed
+        # status[recovered] = 5
+        # # 6: recovery condition sustained for the required duration
+        # status[stable_recovery] = 6
+
+        g0 = upright
+        status[~g0] = 0
+
+        g1 = g0 & stable_height
+        status[g0 & ~stable_height] = 1
+
+        g2 = g1 & low_velocity
+        status[g1 & ~low_velocity] = 2
+
+        g3 = g2 & low_vertical_velocity
+        status[g2 & ~low_vertical_velocity] = 3
+
+        g4 = g3 & low_ang_vel
+        status[g3 & ~low_ang_vel] = 4
+
+        g5 = g4 & good_posture
+        status[g4 & ~good_posture] = 5
+
+        g6 = g5 & stable_contacts
+        status[g5 & ~stable_contacts] = 6
+
+        g7 = g6 & no_nonfoot_contact
+        status[g6 & ~no_nonfoot_contact] = 7
+
+        status[recovered] = 8
+        status[stable_recovery] = 9
+
 
         # Output path
         if not hasattr(self, "recovery_grid_path"):
