@@ -75,7 +75,7 @@ class FallRecoveryConfig(BaseCfg):
         # Predominantly fallen-state training with limited terminal-state bootstrap
         # ~90% episodes -> genuine fallen-state recovery
         # ~10% episodes -> near-terminal/standing-state exposure
-        terminal_stance_reset_prob = 0.10
+        terminal_stance_reset_prob = 0.70
         orientation_probs = [0.50, 0.20, 0.20, 0.10]
 
         debug_clean_terminal_reset = False
@@ -83,16 +83,16 @@ class FallRecoveryConfig(BaseCfg):
         debug_hold_reset_pose = False
 
         # Do not restrict recovery exploration initially
-        terminal_action_clip = None
+        # terminal_action_clip = None
 
-        near_crouch_action_clip = None #2.0
-        near_stand_action_clip = None #0.90
+        near_crouch_action_clip = None
+        near_stand_action_clip = 4.0
 
         debug_log_terminal_reset = False
 
         robot = "go1"
-        num_observations = 42  # ang_vel(3) in base + observe_only_ang_vel adds 3 more + gravity(3) + dof_pos(12) + dof_vel(12) + actions(12)
-        num_scalar_observations = 42
+        num_observations = 45  # lin_vel(3) in base + ang_vel(3) in base + observe_only_ang_vel adds 3 more + gravity(3) + dof_pos(12) + dof_vel(12) + actions(12)
+        num_scalar_observations = 45
         num_privileged_obs = 26 + 176
         # policy_dt = 0.005 * 4 = 0.02 s
         # episode_steps = 9 / 0.02 = 450
@@ -133,7 +133,7 @@ class FallRecoveryConfig(BaseCfg):
         curriculum = True
 
         # Recovery-driven terrain progression.
-        recovery_curriculum = True
+        recovery_curriculum = False #True
 
         num_rows = 10       # difficulty levels: 0 – 9
         num_cols = 20       # physical terrain columns
@@ -426,50 +426,84 @@ class FallRecoveryConfig(BaseCfg):
     #     base_height = 0.0
 
     # Stage III
+    # class reward_scales(BaseCfg.reward_scales):
+    #     # Main recovery objective
+    #     recovery_bonus = 5000.0
+    #     recovery_progress = 4.0
+
+    #     # Preserve successful get-up behavior
+    #     upright_orientation = 3.0
+    #     height_alignment = 2.0
+    #     posture = 3.0
+    #     feet_on_ground = 1.0
+
+    #     # Terminal stabilization
+    #     base_orientation = 0.0
+    #     base_ang_vel = -0.04
+    #     base_lin_vel = -0.10
+
+    #     # Regularization
+    #     action = -1.0e-3
+    #     torques = -2.0e-4
+    #     dof_acc = -5.0e-8
+    #     dof_vel = -1.0e-4
+
+    #     action_smoothness_1 = -1.0e-3
+    #     action_smoothness_2 = -2.0e-4
+
+    #     ang_vel_limit = 0.0
+    #     joint_vel_limit = 0.0
+
+    #     # Safety
+    #     dof_pos_limits = -0.1
+    #     base_contact = -0.5
+    #     body_slip = -5.0e-3
+    #     feet_slip = -5.0e-3
+
+    #     # Support/stability
+    #     loaded_foot_support = 2.0
+    #     stable_foot_support = 6.0
+
+    #     support_deficit = -1.5
+    #     loaded_foot_slip = -0.35
+
+    #     stand_still_action = -1.0e-3
+
+    #     # Stage-III geometry correction
+    #     front_leg_error = -0.25
+    #     leg_crossing = -0.50
+    #     stance_separation = 1.0
+
+    #     # Still disabled
+    #     stance_region = 0.0
+    #     late_nonfoot_contact = 0.0
+    #     terminal_action_prior = 0.0
+    #     base_height = 0.0
+
+    # Stage IV
     class reward_scales(BaseCfg.reward_scales):
         # Main recovery objective
         recovery_bonus = 5000.0
         recovery_progress = 4.0
 
-        # Preserve successful get-up behavior
         upright_orientation = 3.0
         height_alignment = 2.0
         posture = 3.0
         feet_on_ground = 1.0
 
-        # Terminal stabilization
-        base_orientation = 0.0
         base_ang_vel = -0.04
         base_lin_vel = -0.10
 
-        # Regularization
-        action = -1.0e-3
-        torques = -2.0e-4
-        dof_acc = -5.0e-8
-        dof_vel = -1.0e-4
-
-        action_smoothness_1 = -1.0e-3
-        action_smoothness_2 = -2.0e-4
-
-        ang_vel_limit = 0.0
-        joint_vel_limit = 0.0
-
-        # Safety
-        dof_pos_limits = -0.1
-        base_contact = -0.5
-        body_slip = -5.0e-3
-        feet_slip = -5.0e-3
-
-        # Support/stability
         loaded_foot_support = 2.0
         stable_foot_support = 6.0
 
-        support_deficit = -1.5
-        loaded_foot_slip = -0.35
+        # Strengthen
+        support_deficit = -2.0       # -1.5 -> -2.0
+        loaded_foot_slip = -0.50     # -0.35 -> -0.50
 
         stand_still_action = -1.0e-3
 
-        # Stage-III geometry correction
+        # Preserve learned geometry
         front_leg_error = -0.25
         leg_crossing = -0.50
         stance_separation = 1.0
@@ -480,7 +514,8 @@ class FallRecoveryConfig(BaseCfg):
         terminal_action_prior = 0.0
         base_height = 0.0
 
-    # Stage IV
+
+    # Stage V
     # class reward_scales(BaseCfg.reward_scales):
     #     # Main objective
     #     recovery_bonus = 5000.0

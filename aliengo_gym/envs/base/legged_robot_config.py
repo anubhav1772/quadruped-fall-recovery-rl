@@ -70,8 +70,8 @@ class BaseCfg(PrefixProto, cli=False):
     class env(PrefixProto, cli=False):
         train_recovery = False
         num_envs = 4096
-        num_observations = 42
-        num_scalar_observations = 42
+        num_observations = 45
+        num_scalar_observations = 45
         # if not None a privilige_obs_buf will be returned by step() (critic obs for assymetric training). None is returned otherwise
         # Default privileged layout with current flags:
         # com_displacement(3) + Kp(12) + Kd(12) + foot_forces(12) + foot_contact_states(4)
@@ -87,7 +87,7 @@ class BaseCfg(PrefixProto, cli=False):
         episode_length_s = 20  # episode length in seconds
         observe_vel = False
         observe_only_ang_vel = True
-        observe_only_lin_vel = False
+        observe_only_lin_vel = True
         observe_yaw = False
         observe_contact_states = False
         observe_foot_forces = False
