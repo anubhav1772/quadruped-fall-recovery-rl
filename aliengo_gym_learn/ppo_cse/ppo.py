@@ -65,7 +65,7 @@ class PPO_Args(PrefixProto):
     clip_param = 0.2
 
     #entropy_coef = 0.01 # Stage I
-    entropy_coef = 0.002 # Stage II
+    entropy_coef = 0.0005 #0.002 # Stage II+
 
     num_learning_epochs = 5
     num_mini_batches = 4
@@ -222,9 +222,7 @@ class PPO:
             masks_batch,
         ) in generator:
 
-            # ------------------------------------------------------------
             # PPO actor-critic update
-            # ------------------------------------------------------------
             self.actor_critic.act(
                 obs_batch,
                 obs_history_batch,
@@ -245,9 +243,7 @@ class PPO:
             sigma_batch = self.actor_critic.action_std
             entropy_batch = self.actor_critic.entropy
 
-            # ------------------------------------------------------------
             # Adaptive learning-rate schedule using KL
-            # ------------------------------------------------------------
             if PPO_Args.desired_kl is not None and PPO_Args.schedule == "adaptive":
                 with torch.inference_mode():
                     kl = torch.sum(
@@ -325,6 +321,14 @@ class PPO:
             )
 
             self.optimizer.step()
+
+            # Keep the directly-parameterized Gaussian std in a
+            # physically useful range.
+            with torch.no_grad():
+                self.actor_critic.std.clamp_(
+                    min=0.05,
+                    max=2.0,
+                )
 
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
