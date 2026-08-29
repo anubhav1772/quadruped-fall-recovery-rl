@@ -63,7 +63,40 @@ class LeggedRobot(BaseTask):
             self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
         self._init_buffers()
 
-        self._prepare_reward_function()
+        # self._prepare_reward_function()
+        (
+            self.loco_reward_container,
+            self.loco_reward_scales,
+            self.loco_reward_functions,
+            self.loco_reward_names,
+            self.loco_episode_sums,
+            self.loco_episode_sums_eval,
+        ) = self._prepare_reward_function(self.loco_cfg)
+
+        (
+            self.recovery_reward_container,
+            self.recovery_reward_scales,
+            self.recovery_reward_functions,
+            self.recovery_reward_names,
+            self.recovery_episode_sums,
+            self.recovery_episode_sums_eval,
+        ) = self._prepare_reward_function(self.recovery_cfg)
+
+        # Locomotion-only command statistics
+        self.command_sums = {
+            name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+            for name in (
+                list(self.loco_reward_scales.keys())
+                + [
+                    "lin_vel_raw",
+                    "ang_vel_raw",
+                    "lin_vel_residual",
+                    "ang_vel_residual",
+                    "ep_timesteps",
+                ]
+            )
+        }
+
         self.init_done = True
         self.record_now = False
         self.record_eval_now = False
@@ -76,6 +109,8 @@ class LeggedRobot(BaseTask):
         Args:
             actions (torch.Tensor): Tensor of shape (num_envs, num_actions_per_env)
         """
+
+        self.applied_recovery_mode = self.recovery_mode.clone()
         clip_actions = float(self.cfg.normalization.clip_actions)
         effective_clip = torch.full((self.num_envs, 1), clip_actions, device=self.device, dtype=actions.dtype)
 
@@ -171,7 +206,19 @@ class LeggedRobot(BaseTask):
         # self.cot = torch.sum(torch.multiply(self.torques, self.dof_vel), dim=1) / (21.5 * 9.81 * torch.norm(self.base_lin_vel[:, 0:2], dim=1))
         # self.dof_acc[:] = (self.dof_vel[:] - self.last_dof_vel[:]) / self.dt
 
-        self.compute_reward()
+        # self.compute_reward()
+        mode = self.applied_recovery_mode
+        loco_mask = ~mode
+        recovery_mask = mode
+
+        self.rew_buf.zero_()
+
+        if loco_mask.any():
+            self.rew_buf += self.compute_locomotion_reward(loco_mask)
+
+        if recovery_mask.any():
+            self.rew_buf += self.compute_recovery_reward(recovery_mask)
+
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self.reset_idx(env_ids)
 
@@ -245,7 +292,9 @@ class LeggedRobot(BaseTask):
         else:
             height_fall = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
-        return contact_fall | height_fall
+        orientation_fall = -self.projected_gravity[:, 2] < 0.4
+
+        return contact_fall | height_fall | orientation_fall
 
 
     def compute_handoff_ready(self):
@@ -501,44 +550,96 @@ class LeggedRobot(BaseTask):
                                                      gymtorch.unwrap_tensor(self.root_states),
                                                      gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
 
-    def compute_reward(self):
-        """ Compute rewards
-            Calls each reward function which had a non-zero scale (processed in self._prepare_reward_function())
-            adds each terms to the episode sums and to the total reward
-        """
-        self.rew_buf[:] = 0.
-        self.rew_buf_pos[:] = 0.
-        self.rew_buf_neg[:] = 0.
-        for i in range(len(self.reward_functions)):
-            name = self.reward_names[i]
-            rew = self.reward_functions[i]() * self.reward_scales[name]
-            self.rew_buf += rew
-            if torch.sum(rew) >= 0:
-                self.rew_buf_pos += rew
-            elif torch.sum(rew) <= 0:
-                self.rew_buf_neg += rew
-            self.episode_sums[name] += rew
-            if name in ['tracking_contacts_shaped_force', 'tracking_contacts_shaped_vel']:
-                self.command_sums[name] += self.reward_scales[name] + rew
-            else:
-                self.command_sums[name] += rew
-        if self.cfg.rewards.only_positive_rewards:
-            self.rew_buf[:] = torch.clip(self.rew_buf[:], min=0.)
-        elif self.cfg.rewards.only_positive_rewards_ji22_style: #TODO: update
-            self.rew_buf[:] = self.rew_buf_pos[:] * torch.exp(self.rew_buf_neg[:] / self.cfg.rewards.sigma_rew_neg)
-        self.episode_sums["total"] += self.rew_buf
-        # add termination reward after clipping
-        if "termination" in self.reward_scales:
-            rew = self.reward_container._reward_termination() * self.reward_scales["termination"]
-            self.rew_buf += rew
-            self.episode_sums["termination"] += rew
-            self.command_sums["termination"] += rew
+    def _compute_reward(self, cfg, reward_container, reward_functions, reward_names, reward_scales, episode_sums, active_mask, command_sums=None):
+        rew_buf = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        rew_buf_pos = torch.zeros_like(rew_buf)
+        rew_buf_neg = torch.zeros_like(rew_buf)
 
-        self.command_sums["lin_vel_raw"] += self.base_lin_vel[:, 0]
-        self.command_sums["ang_vel_raw"] += self.base_ang_vel[:, 2]
-        self.command_sums["lin_vel_residual"] += (self.base_lin_vel[:, 0] - self.commands[:, 0]) ** 2
-        self.command_sums["ang_vel_residual"] += (self.base_ang_vel[:, 2] - self.commands[:, 2]) ** 2
-        self.command_sums["ep_timesteps"] += 1
+        for i in range(len(reward_functions)):
+            name = reward_names[i]
+
+            rew = reward_functions[i]() * reward_scales[name]
+
+            # Only this controller's environments contribute.
+            rew = rew * active_mask.float()
+
+            rew_buf += rew
+
+            if torch.sum(rew) >= 0:
+                rew_buf_pos += rew
+            elif torch.sum(rew) <= 0:
+                rew_buf_neg += rew
+
+            episode_sums[name] += rew
+
+            # Only locomotion passes command_sums.
+            if command_sums is not None:
+                if name in ["tracking_contacts_shaped_force", "tracking_contacts_shaped_vel"]:
+                    command_sums[name][active_mask] += (reward_scales[name] + rew[active_mask])
+                else:
+                    command_sums[name][active_mask] += rew[active_mask]
+
+        if cfg.rewards.only_positive_rewards:
+            rew_buf = torch.clip(rew_buf, min=0.)
+
+        elif cfg.rewards.only_positive_rewards_ji22_style:
+            rew_buf = rew_buf_pos * torch.exp(rew_buf_neg / cfg.rewards.sigma_rew_neg)
+
+        episode_sums["total"] += rew_buf
+
+        if "termination" in reward_scales:
+            rew = reward_container._reward_termination() * reward_scales["termination"] * active_mask.float()
+            rew_buf += rew
+            episode_sums["termination"] += rew
+
+            if command_sums is not None:
+                command_sums["termination"][active_mask] += rew[active_mask]
+
+        return rew_buf
+
+    def compute_reward(self):
+        mode = self.applied_recovery_mode
+
+        loco_mask = ~mode
+        recovery_mask = mode
+
+        self.rew_buf.zero_()
+
+        if loco_mask.any():
+            loco_rew = self._compute_reward(
+                cfg=self.loco_cfg,
+                reward_container=self.loco_reward_container,
+                reward_functions=self.loco_reward_functions,
+                reward_names=self.loco_reward_names,
+                reward_scales=self.loco_reward_scales,
+                episode_sums=self.loco_episode_sums,
+                active_mask=loco_mask,
+                command_sums=self.command_sums,
+            )
+
+            self.rew_buf += loco_rew
+
+        if recovery_mask.any():
+            recovery_rew = self._compute_reward(
+                cfg=self.recovery_cfg,
+                reward_container=self.recovery_reward_container,
+                reward_functions=self.recovery_reward_functions,
+                reward_names=self.recovery_reward_names,
+                reward_scales=self.recovery_reward_scales,
+                episode_sums=self.recovery_episode_sums,
+                active_mask=recovery_mask,
+                command_sums=None,
+            )
+
+            self.rew_buf += recovery_rew
+
+        # Locomotion command statistics only
+        if loco_mask.any():
+            self.command_sums["lin_vel_raw"][loco_mask] += self.base_lin_vel[loco_mask, 0]
+            self.command_sums["ang_vel_raw"][loco_mask] += self.base_ang_vel[loco_mask, 2]
+            self.command_sums["lin_vel_residual"][loco_mask] += (self.base_lin_vel[loco_mask, 0] - self.commands[loco_mask, 0]) ** 2
+            self.command_sums["ang_vel_residual"][loco_mask] += (self.base_ang_vel[loco_mask, 2] - self.commands[loco_mask, 2]) ** 2
+            self.command_sums["ep_timesteps"][loco_mask] += 1
 
     def compute_observations(self, cfg):
         """ Computes observations
@@ -1809,51 +1910,62 @@ class LeggedRobot(BaseTask):
         for curriculum in self.curricula:
             curriculum.set_to(low=low, high=high)
 
-    def _prepare_reward_function(self):
-        """ Prepares a list of reward functions, whcih will be called to compute the total reward.
-            Looks for self._reward_<REWARD_NAME>, where <REWARD_NAME> are names of all non zero reward scales in the cfg.
-        """
-        # reward containers
-        from go1_gym.envs.rewards.corl_rewards import CoRLRewards
-        reward_containers = {"CoRLRewards": CoRLRewards}
-        self.reward_container = reward_containers[self.cfg.rewards.reward_container_name](self)
+    def _prepare_reward_function(self, cfg):
+        """Prepare reward functions for one task/config."""
 
-        # remove zero scales + multiply non-zero ones by dt
-        for key in list(self.reward_scales.keys()):
-            scale = self.reward_scales[key]
-            if scale == 0:
-                self.reward_scales.pop(key)
+        from aliengo_gym.envs.rewards.locomotion_rewards import LocomotionRewards
+        from aliengo_gym.envs.rewards.fall_recovery_rewards import FallRecoveryRewards
+
+        reward_containers = {
+            "LocomotionRewards": LocomotionRewards,
+            "FallRecoveryRewards": FallRecoveryRewards,
+        }
+
+        reward_container = reward_containers[cfg.rewards.reward_container_name](self, cfg)
+
+        # IMPORTANT: copy, otherwise you modify the config class dictionary.
+        reward_scales = vars(cfg.reward_scales).copy()
+
+        for key in list(reward_scales.keys()):
+            if reward_scales[key] == 0:
+                reward_scales.pop(key)
             else:
-                self.reward_scales[key] *= self.dt
-        # prepare list of functions
-        self.reward_functions = []
-        self.reward_names = []
-        for name, scale in self.reward_scales.items():
+                reward_scales[key] *= self.dt
+
+        reward_functions = []
+        reward_names = []
+
+        for name in reward_scales.keys():
             if name == "termination":
                 continue
 
-            if not hasattr(self.reward_container, '_reward_' + name):
-                print(f"Warning: reward {'_reward_' + name} has nonzero coefficient but was not found!")
-            else:
-                self.reward_names.append(name)
-                self.reward_functions.append(getattr(self.reward_container, '_reward_' + name))
+            reward_name = "_reward_" + name
 
-        # reward episode sums
-        self.episode_sums = {
+            if not hasattr(reward_container, reward_name):
+                print(f"Warning: reward {reward_name} has nonzero coefficient but was not found!")
+            else:
+                reward_names.append(name)
+                reward_functions.append(getattr(reward_container, reward_name))
+
+        episode_sums = {
             name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
-            for name in self.reward_scales.keys()}
-        self.episode_sums["total"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device,
-                                                 requires_grad=False)
-        self.episode_sums_eval = {
-            name: -1 * torch.ones(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
-            for name in self.reward_scales.keys()}
-        self.episode_sums_eval["total"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device,
-                                                      requires_grad=False)
-        self.command_sums = {
-            name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
-            for name in
-            list(self.reward_scales.keys()) + ["lin_vel_raw", "ang_vel_raw", "lin_vel_residual", "ang_vel_residual",
-                                               "ep_timesteps"]}
+            for name in reward_scales.keys()
+        }
+        episode_sums["total"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, equires_grad=False)
+        episode_sums_eval = {
+            name: -torch.ones(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+            for name in reward_scales.keys()
+        }
+        episode_sums_eval["total"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+
+        return (
+            reward_container,
+            reward_scales,
+            reward_functions,
+            reward_names,
+            episode_sums,
+            episode_sums_eval,
+        )
 
     def _create_ground_plane(self):
         """ Adds a ground plane to the simulation, sets friction and restitution based on the cfg.
