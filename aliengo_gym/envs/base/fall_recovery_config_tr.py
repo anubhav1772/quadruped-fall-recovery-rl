@@ -70,7 +70,7 @@ class FallRecoveryConfig(BaseCfg):
         debug_log_height_comparison = False
 
         # Episodes terminate after stable recovery
-        terminate_on_recovery_success = True
+        terminate_on_recovery_success = False #True
 
         # Predominantly fallen-state training with limited terminal-state bootstrap
         # ~90% episodes -> genuine fallen-state recovery
@@ -289,6 +289,7 @@ class FallRecoveryConfig(BaseCfg):
         relative_height_range = [-0.2, 0.8]
 
     class rewards(BaseCfg.rewards):
+        reward_container_name = "RecoveryRewards"
         base_height_target = 0.34
 
         recovery_height_min = 0.05
