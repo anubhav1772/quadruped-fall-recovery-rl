@@ -100,6 +100,7 @@ class LocoCfg(BaseCfg):
 
     class rewards(BaseCfg.rewards):
         only_positive_rewards_ji22_style = True
+        reward_container_name = "LocomotionRewards"
 
         use_terminal_body_height = True
         use_terminal_roll_pitch = False
