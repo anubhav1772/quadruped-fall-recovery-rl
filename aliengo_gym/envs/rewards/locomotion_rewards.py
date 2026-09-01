@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from go1_gym.utils.math_utils import quat_apply_yaw, wrap_to_pi, get_scale_shift
+from aliengo_gym.utils.math_utils import quat_apply_yaw, wrap_to_pi, get_scale_shift
 from isaacgym.torch_utils import *
 from isaacgym import gymapi
 
@@ -12,7 +12,6 @@ class LocomotionRewards:
     def load_env(self, env):
         self.env = env
 
-    # ------------ reward functions----------------
     def _reward_tracking_lin_vel(self):
         # Tracking of linear velocity commands (xy axes)
         lin_vel_error = torch.sum(torch.square(self.env.commands[:, :2] - self.env.base_lin_vel[:, :2]), dim=1)
@@ -139,7 +138,6 @@ class LocomotionRewards:
         rew_foot_impact_vel = contact_states * torch.square(torch.clip(prev_foot_velocities, -100, 0))
 
         return torch.sum(rew_foot_impact_vel, dim=1)
-
 
     def _reward_collision(self):
         # Penalize collisions on selected bodies
