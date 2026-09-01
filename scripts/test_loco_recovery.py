@@ -7,15 +7,57 @@ assert isaacgym
 import torch
 from isaacgym import gymtorch
 
-from go1_gym.envs.base.go1_loco_config import LocoCfg
-
+from aliengo_gym.envs.base.go1_loco_config import LocoCfg
 # IMPORTANT:
 # This version must inherit from
 # legged_robot_loco_recovery.LeggedRobot
-from go1_gym.envs.go1.velocity_tracking_loco_recovery import VelocityTrackingEasyEnv
+from aliengo_gym.envs.aliengo.velocity_tracking_loco_recovery import VelocityTrackingEasyEnv
+import pickle as pkl
+
+
+def load_loco_saved_cfg(run_dir):
+    params_path = Path(run_dir) / "parameters.pkl"
+    assert params_path.exists(), f"Missing locomotion parameters.pkl: {params_path}"
+
+    with params_path.open("rb") as f:
+        saved = pkl.load(f)
+
+    saved_cfg = saved["Cfg"]
+
+    for section_name, values in saved_cfg.items():
+        if not hasattr(LocoCfg, section_name):
+            continue
+
+        section = getattr(LocoCfg, section_name)
+
+        if isinstance(values, dict):
+            for key, value in values.items():
+                if not key.startswith("_"):
+                    setattr(section, key, value)
+
+    return saved
 
 # Policy loading
-def load_jit_student(run_dir, device):
+def load_recovery_jit_student(run_dir, device):
+    run_dir = Path(run_dir).expanduser().resolve()
+    checkpoint_dir = run_dir / "checkpoints"
+
+    body_path = checkpoint_dir / "body_latest.jit"
+    adaptation_path = checkpoint_dir / "adaptation_module_latest.jit"
+
+    body = torch.jit.load(str(body_path), map_location=device).to(device).eval()
+    adaptation = torch.jit.load(str(adaptation_path), map_location=device).to(device).eval()
+
+    def policy(obs, obs_history):
+        obs = obs.to(device)
+        obs_history = obs_history.to(device)
+        ee_output = adaptation(obs_history)
+        actions = body(torch.cat((obs, ee_output), dim=-1))
+        return actions
+
+    return policy
+
+def load_loco_jit_student(run_dir, device):
     run_dir = Path(run_dir).expanduser().resolve()
     checkpoint_dir = run_dir / "checkpoints"
 
@@ -25,14 +67,13 @@ def load_jit_student(run_dir, device):
     assert body_path.exists(), f"Missing: {body_path}"
     assert adaptation_path.exists(), f"Missing: {adaptation_path}"
 
-    body = torch.jit.load(str(body_path), map_location=device).eval()
-    adaptation = torch.jit.load(str(adaptation_path), map_location=device).eval()
+    body = torch.jit.load(str(body_path), map_location=device).to(device).eval()
+    adaptation = torch.jit.load(str(adaptation_path), map_location=device).to(device).eval()
 
     def policy(obs, obs_history):
+        obs_history = obs_history.to(device)
         latent = adaptation(obs_history)
-        # Match ActorCritic.act_student():
-        # actor input = current obs + estimated privileged context
-        actions = body(torch.cat((obs, latent), dim=-1))
+        actions = body(torch.cat((obs_history, latent), dim=-1))
         return actions
 
     return policy
@@ -65,30 +106,22 @@ def set_locomotion_command(env, x_vel=0.5, y_vel=0.0, yaw_vel=0.0, gait_name="tr
     env.commands[:, 0] = x_vel
     env.commands[:, 1] = y_vel
     env.commands[:, 2] = yaw_vel
-
     # body height
     env.commands[:, 3] = 0.0
-
     # gait frequency
     env.commands[:, 4] = 3.0
-
     # phase / offset / bound
     env.commands[:, 5:8] = gait
-
     # gait duration
     env.commands[:, 8] = 0.5
-
     # foot swing height
     env.commands[:, 9] = 0.08
-
     # pitch / roll
     env.commands[:, 10] = 0.0
     env.commands[:, 11] = 0.0
-
     # stance width / length
     env.commands[:, 12] = 0.25
     env.commands[:, 13] = 0.40
-
     # auxiliary reward command
     env.commands[:, 14] = 0.0
 
@@ -121,9 +154,16 @@ def inject_fall(env, lateral_vel=2.5, roll_rate=6.0):
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--loco-run-dir", type=str, required=True)
-    parser.add_argument("--recovery-run-dir", type=str, required=True)
-
+    # parser.add_argument("--loco-run-dir", type=str, required=True)
+    parser.add_argument(
+        "--loco-run-dir",
+        type=str,
+        default="/home/anubhav1772/Github/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-02-10/train/194644.419603")
+    # parser.add_argument("--recovery-run-dir", type=str, required=True)
+    parser.add_argument(
+        "--recovery-run-dir",
+        type=str,
+        default="/home/anubhav1772/Github/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-08-24/train_fall_recovery/105731.979852")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--num-envs", type=int, default=1)
     parser.add_argument("--num-steps", type=int, default=1000)
@@ -140,15 +180,27 @@ def main():
         default="trotting",
         choices=["pronking", "trotting", "bounding", "pacing"],
     )
-    parser.add_argument("--force-fall-step", type=int, default=150, help="-1 disables forced fall")
+    parser.add_argument("--force-fall-step", type=int, default=-1, help="-1 disables forced fall")
 
     args = parser.parse_args()
 
     device = torch.device(args.device)
 
+    load_loco_saved_cfg(args.loco_run_dir)
+    LocoCfg.rewards.reward_container_name = "LocomotionRewards"
+
     # Evaluation configuration
     LocoCfg.env.num_envs = args.num_envs
     LocoCfg.env.record_video = False
+
+
+    LocoCfg.terrain.num_rows = 5
+    LocoCfg.terrain.num_cols = 5
+    LocoCfg.terrain.border_size = 0
+    LocoCfg.terrain.center_robots = True
+    LocoCfg.terrain.center_span = 1
+
+    LocoCfg.terrain.teleport_robots = True
 
     # Disable DR for the first deterministic integration test.
     LocoCfg.domain_rand.push_robots = False
@@ -165,10 +217,14 @@ def main():
 
     # Important for first integration test:
     # recovery was not trained with locomotion's randomized action delay.
-    LocoCfg.domain_rand.randomize_lag_timesteps = False
+    # LocoCfg.domain_rand.randomize_lag_timesteps = False
 
     # Prevent random command changes during this evaluation.
-    LocoCfg.commands.resampling_time = 1e9
+    # LocoCfg.commands.resampling_time = 1e9
+
+    LocoCfg.domain_rand.lag_timesteps = 6
+    LocoCfg.domain_rand.randomize_lag_timesteps = True
+    LocoCfg.control.control_type = "actuator_net"
 
     # Environment
     env = VelocityTrackingEasyEnv(sim_device=args.device, headless=args.headless, cfg=LocoCfg)
@@ -177,11 +233,17 @@ def main():
     base_env = env
 
     # Load both independently-trained policies
-    loco_policy = load_jit_student(args.loco_run_dir, device)
-    recovery_policy = load_jit_student(args.recovery_run_dir, device)
+    loco_policy = load_loco_jit_student(args.loco_run_dir, device)
+    recovery_policy = load_recovery_jit_student(args.recovery_run_dir, device)
 
     # Reset
     env.reset()
+
+    base_env.recovery_mode[:] = False
+    base_env.recovery_counter[:] = 0
+    base_env.recovered_flag[:] = False
+    base_env.handoff_counter[:] = 0
+    base_env.recovery_bonus_buf[:] = 0.0
 
     set_locomotion_command(
         base_env,
@@ -227,10 +289,32 @@ def main():
             loco_actions = loco_policy(loco_obs, loco_history)
             recovery_actions = recovery_policy(recovery_obs, recovery_history)
 
+            # print("mode device:", base_env.recovery_mode.device)
+            # print("loco_actions device:", loco_actions.device)
+            # print("recovery_actions device:", recovery_actions.device)
+
             # Per-env controller selection
-            actions = torch.where(base_env.recovery_mode[:, None], recovery_actions, loco_actions)
+            # actions = torch.where(base_env.recovery_mode[:, None], recovery_actions, loco_actions)
+            # actions = torch.where(
+            #     base_env.recovery_mode[:, None].to(loco_actions.device),
+            #     recovery_actions,
+            #     loco_actions,
+            # ).to(base_env.device)
+            actions = loco_actions.to(base_env.device)
+
             # Physics step
-            _, _, rewards, dones, infos = env.step(actions)
+            _, rewards, dones, infos = env.step(actions)
+
+            # For this locomotion-only diagnostic, prevent the automatic
+            # fall detector from affecting the next control step.
+            base_env.recovery_mode[:] = False
+
+            # if not args.headless:
+
+                # print("root state:", base_env.root_states[0, :3])
+                # print("env origin:", base_env.env_origins[0])
+                # print("terrain level:", base_env.terrain_levels[0])
+                # print("terrain type:", base_env.terrain_types[0])
 
             # Keep locomotion command fixed.
             set_locomotion_command(
