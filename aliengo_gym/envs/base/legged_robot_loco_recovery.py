@@ -11,10 +11,10 @@ import torch
 
 import numpy as np
 
-from go1_gym import MINI_GYM_ROOT_DIR
-from go1_gym.envs.base.base_task import BaseTask
-from go1_gym.utils.math_utils import quat_apply_yaw, wrap_to_pi, get_scale_shift
-from go1_gym.utils.terrain import Terrain
+from aliengo_gym import MINI_GYM_ROOT_DIR
+from aliengo_gym.envs.base.base_task import BaseTask
+from aliengo_gym.utils.math_utils import quat_apply_yaw, wrap_to_pi, get_scale_shift
+from aliengo_gym.utils.terrain import Terrain
 # from .legged_robot_config import Cfg
 from .fall_recovery_config_tr import FallRecoveryConfig as recoveryCfg
 from .go1_loco_config import LocoCfg
@@ -195,6 +195,8 @@ class LeggedRobot(BaseTask):
         all_env_ids = torch.arange(self.num_envs, device=self.device)
         self.recovery_measured_heights = self._get_recovery_heights(all_env_ids)
 
+        # Sparse recovery bonus is a one-step pulse.
+        self.recovery_bonus_buf.zero_()
         self.check_recovery_success()
         self.update_recovery_mode()
 
@@ -206,18 +208,18 @@ class LeggedRobot(BaseTask):
         # self.cot = torch.sum(torch.multiply(self.torques, self.dof_vel), dim=1) / (21.5 * 9.81 * torch.norm(self.base_lin_vel[:, 0:2], dim=1))
         # self.dof_acc[:] = (self.dof_vel[:] - self.last_dof_vel[:]) / self.dt
 
-        # self.compute_reward()
-        mode = self.applied_recovery_mode
-        loco_mask = ~mode
-        recovery_mask = mode
+        self.compute_reward()
+        # mode = self.applied_recovery_mode
+        # loco_mask = ~mode
+        # recovery_mask = mode
 
-        self.rew_buf.zero_()
+        # self.rew_buf.zero_()
 
-        if loco_mask.any():
-            self.rew_buf += self.compute_locomotion_reward(loco_mask)
+        # if loco_mask.any():
+        #     self.rew_buf += self.compute_locomotion_reward(loco_mask)
 
-        if recovery_mask.any():
-            self.rew_buf += self.compute_recovery_reward(recovery_mask)
+        # if recovery_mask.any():
+        #     self.rew_buf += self.compute_recovery_reward(recovery_mask)
 
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
         self.reset_idx(env_ids)
@@ -366,6 +368,8 @@ class LeggedRobot(BaseTask):
         stable_recovery = self.recovery_counter >= cfg.recovery_success_steps
 
         new_recovery = stable_recovery & (~self.recovered_flag)
+        # One-shot sparse reward on first stable recovery
+        self.recovery_bonus_buf[new_recovery] = 1.0
         self.recovered_flag |= stable_recovery
 
         self.extras["recovery_success_frac"] = stable_recovery.float().mean().item()
@@ -448,6 +452,7 @@ class LeggedRobot(BaseTask):
         self.recovery_counter[env_ids] = 0
         self.recovered_flag[env_ids] = False
         self.handoff_counter[env_ids] = 0
+        self.recovery_bonus_buf[env_ids] = 0.0
 
         # reset robot states
         self._resample_commands(env_ids)
@@ -469,20 +474,31 @@ class LeggedRobot(BaseTask):
         self.reset_buf[env_ids] = 1
         # fill extras
         train_env_ids = env_ids[env_ids < self.num_train_envs]
+
         if len(train_env_ids) > 0:
             self.extras["train/episode"] = {}
-            for key in self.episode_sums.keys():
-                self.extras["train/episode"]['rew_' + key] = torch.mean(
-                    self.episode_sums[key][train_env_ids])
-                self.episode_sums[key][train_env_ids] = 0.
+            # Locomotion rewards
+            for key in self.loco_episode_sums.keys():
+                self.extras["train/episode"]["loco_rew_" + key] = torch.mean(self.loco_episode_sums[key][train_env_ids])
+                self.loco_episode_sums[key][train_env_ids] = 0.0
+            # Recovery rewards
+            for key in self.recovery_episode_sums.keys():
+                self.extras["train/episode"]["recovery_rew_" + key] = torch.mean(self.recovery_episode_sums[key][train_env_ids])
+                self.recovery_episode_sums[key][train_env_ids] = 0.0
+
         eval_env_ids = env_ids[env_ids >= self.num_train_envs]
         if len(eval_env_ids) > 0:
             self.extras["eval/episode"] = {}
-            for key in self.episode_sums.keys():
-                # save the evaluation rollout result if not already saved
-                unset_eval_envs = eval_env_ids[self.episode_sums_eval[key][eval_env_ids] == -1]
-                self.episode_sums_eval[key][unset_eval_envs] = self.episode_sums[key][unset_eval_envs]
-                self.episode_sums[key][eval_env_ids] = 0.
+            # Locomotion rewards
+            for key in self.loco_episode_sums.keys():
+                unset_eval_envs = eval_env_ids[self.loco_episode_sums_eval[key][eval_env_ids] == -1]
+                self.loco_episode_sums_eval[key][unset_eval_envs] = self.loco_episode_sums[key][unset_eval_envs]
+                self.loco_episode_sums[key][eval_env_ids] = 0.0
+            # Recovery rewards
+            for key in self.recovery_episode_sums.keys():
+                unset_eval_envs = eval_env_ids[self.recovery_episode_sums_eval[key][eval_env_ids] == -1]
+                self.recovery_episode_sums_eval[key][unset_eval_envs] = self.recovery_episode_sums[key][unset_eval_envs]
+                self.recovery_episode_sums[key][eval_env_ids] = 0.0
 
         # log additional curriculum info
         if self.cfg.terrain.curriculum:
@@ -1245,7 +1261,7 @@ class LeggedRobot(BaseTask):
                         "tracking_contacts_shaped_vel"]:
                 if key in self.command_sums.keys():
                     task_rewards.append(self.command_sums[key][env_ids_in_category] / ep_len)
-                    success_thresholds.append(self.curriculum_thresholds[key] * self.reward_scales[key])
+                    success_thresholds.append(self.curriculum_thresholds[key] * self.loco_reward_scales[key])
 
             old_bins = self.env_command_bins[env_ids_in_category.cpu().numpy()]
             if len(success_thresholds) > 0:
@@ -1469,8 +1485,7 @@ class LeggedRobot(BaseTask):
         Args:
             env_ids (List[int]): Environemnt ids
         """
-        self.dof_pos[env_ids] = self.default_dof_pos * torch_rand_float(0.5, 1.5, (len(env_ids), self.num_dof),
-                                                                        device=self.device)
+        self.dof_pos[env_ids] = self.default_dof_pos
         self.dof_vel[env_ids] = 0.
 
         env_ids_int32 = env_ids.to(dtype=torch.int32)
@@ -1509,8 +1524,7 @@ class LeggedRobot(BaseTask):
         self.root_states[env_ids, 3:7] = quat
 
         # base velocities
-        self.root_states[env_ids, 7:13] = torch_rand_float(-0.5, 0.5, (len(env_ids), 6),
-                                                           device=self.device)  # [7:10]: lin vel, [10:13]: ang vel
+        self.root_states[env_ids, 7:13] = 0.0
         env_ids_int32 = env_ids.to(dtype=torch.int32)
         self.gym.set_actor_root_state_tensor_indexed(self.sim,
                                                      gymtorch.unwrap_tensor(self.root_states),
@@ -1672,6 +1686,7 @@ class LeggedRobot(BaseTask):
         self.recovery_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.recovered_flag = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.handoff_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.recovery_bonus_buf = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
         # initialize some data used later on
         self.common_step_counter = 0
@@ -1923,7 +1938,7 @@ class LeggedRobot(BaseTask):
 
         reward_container = reward_containers[cfg.rewards.reward_container_name](self, cfg)
 
-        # IMPORTANT: copy, otherwise you modify the config class dictionary.
+        # IMPORTANT: copy, otherwise we modify the config class dictionary.
         reward_scales = vars(cfg.reward_scales).copy()
 
         for key in list(reward_scales.keys()):
@@ -1951,7 +1966,7 @@ class LeggedRobot(BaseTask):
             name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
             for name in reward_scales.keys()
         }
-        episode_sums["total"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, equires_grad=False)
+        episode_sums["total"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
         episode_sums_eval = {
             name: -torch.ones(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
             for name in reward_scales.keys()
