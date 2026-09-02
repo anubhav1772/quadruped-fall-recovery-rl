@@ -37,7 +37,8 @@ def load_loco_saved_cfg(run_dir):
 
     return saved
 
-# Policy loading
+
+# Recovery Policy Loading
 def load_recovery_jit_student(run_dir, device):
     run_dir = Path(run_dir).expanduser().resolve()
     checkpoint_dir = run_dir / "checkpoints"
@@ -57,6 +58,8 @@ def load_recovery_jit_student(run_dir, device):
 
     return policy
 
+
+# Locomotion Policy Loading
 def load_loco_jit_student(run_dir, device):
     run_dir = Path(run_dir).expanduser().resolve()
     checkpoint_dir = run_dir / "checkpoints"
@@ -126,21 +129,20 @@ def set_locomotion_command(env, x_vel=0.5, y_vel=0.0, yaw_vel=0.0, gait_name="tr
     env.commands[:, 14] = 0.0
 
 # Deterministic fall
-def inject_fall(env, lateral_vel=2.5, roll_rate=6.0):
-    """
-    Apply a deterministic disturbance to all envs.
-
-    We change base velocity rather than directly teleporting the
-    robot into a fallen orientation, so the fall develops through
-    the simulator dynamics.
+def inject_fall(env, lateral_vel=3.5, roll_rate=6.0):
+    """Inject a deterministic velocity disturbance without teleporting pose.
     """
     env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
 
     # world-frame lateral velocity
-    env.root_states[env_ids, 8] = lateral_vel
+    # Push toward +y
+    env.root_states[env_ids, 8] += lateral_vel  # move strongly toward +y / left
 
     # world-frame angular velocity about x
-    env.root_states[env_ids, 10] = roll_rate
+    # env.root_states[env_ids, 10] += roll_rate   # positive roll about +x
+
+    # Roll toward the same (+y) side.
+    env.root_states[env_ids, 10] -= roll_rate
 
     env_ids_int32 = env_ids.to(torch.int32)
 
@@ -158,19 +160,19 @@ def main():
     parser.add_argument(
         "--loco-run-dir",
         type=str,
-        default="/home/anubhav1772/Github/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-02-10/train/194644.419603")
+        default="runs/gait-conditioned-agility/2026-02-10/train/194644.419603")
     # parser.add_argument("--recovery-run-dir", type=str, required=True)
     parser.add_argument(
         "--recovery-run-dir",
         type=str,
-        default="/home/anubhav1772/Github/quadruped-fall-recovery-rl/runs/gait-conditioned-agility/2026-08-24/train_fall_recovery/105731.979852")
+        default="runs/gait-conditioned-agility/2026-08-24/train_fall_recovery/105731.979852")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--num-envs", type=int, default=1)
-    parser.add_argument("--num-steps", type=int, default=1000)
+    parser.add_argument("--num-steps", type=int, default=500)
 
     parser.add_argument("--headless", action="store_true")
 
-    parser.add_argument("--x-vel", type=float, default=0.5)
+    parser.add_argument("--x-vel", type=float, default=0.8)
     parser.add_argument("--y-vel", type=float, default=0.0)
     parser.add_argument("--yaw-vel", type=float, default=0.0)
 
@@ -178,8 +180,7 @@ def main():
         "--gait",
         type=str,
         default="trotting",
-        choices=["pronking", "trotting", "bounding", "pacing"],
-    )
+        choices=["pronking", "trotting", "bounding", "pacing"])
     parser.add_argument("--force-fall-step", type=int, default=-1, help="-1 disables forced fall")
 
     args = parser.parse_args()
@@ -201,6 +202,21 @@ def main():
     LocoCfg.terrain.center_span = 1
 
     LocoCfg.terrain.teleport_robots = True
+
+    LocoCfg.terrain.mesh_type = "trimesh"
+    LocoCfg.terrain.terrain_proportions = [
+        0.20,  # smooth slope
+        0.20,  # rough slope
+        0.00,  # stairs up
+        0.20,  # stairs down
+        0.00,  # discrete obstacles
+        0.00,  # stepping stones
+        0.00,  # gap
+        0.00,  # pillar
+        0.20,  # random noise
+        0.20,  # half-flat half-rough
+    ]
+    LocoCfg.terrain.terrain_noise_magnitude = 0.03
 
     # Disable DR for the first deterministic integration test.
     LocoCfg.domain_rand.push_robots = False
@@ -277,46 +293,39 @@ def main():
 
     previous_mode = base_env.recovery_mode.clone()
 
-    # Evaluation loop
     with torch.inference_mode():
         for step in range(args.num_steps):
-            # forced disturbance
-            if (args.force_fall_step >= 0 and step == args.force_fall_step):
-                print(f"\n[step {step}] injecting fall")
-                inject_fall(base_env)
 
-            # Evaluate BOTH policies for ALL environments
+            # Forced disturbance
+            if args.force_fall_step >= 0 and step == args.force_fall_step:
+                if base_env.recovery_mode.any():
+                    print(
+                        f"\n[step {step}] skipping forced fall: "
+                        "robot is already in recovery"
+                    )
+                else:
+                    print(f"\n[step {step}] injecting fall")
+                    inject_fall(base_env)
+
+            # Mode used to select the controller this step
+            action_mode = base_env.recovery_mode.clone()
+
+            # Evaluate BOTH policies
             loco_actions = loco_policy(loco_obs, loco_history)
             recovery_actions = recovery_policy(recovery_obs, recovery_history)
 
-            # print("mode device:", base_env.recovery_mode.device)
-            # print("loco_actions device:", loco_actions.device)
-            # print("recovery_actions device:", recovery_actions.device)
-
             # Per-env controller selection
-            # actions = torch.where(base_env.recovery_mode[:, None], recovery_actions, loco_actions)
-            # actions = torch.where(
-            #     base_env.recovery_mode[:, None].to(loco_actions.device),
-            #     recovery_actions,
-            #     loco_actions,
-            # ).to(base_env.device)
+            actions = torch.where(
+                action_mode[:, None].to(loco_actions.device),
+                recovery_actions,
+                loco_actions,
+            ).to(base_env.device)
             actions = loco_actions.to(base_env.device)
 
             # Physics step
             _, rewards, dones, infos = env.step(actions)
 
-            # For this locomotion-only diagnostic, prevent the automatic
-            # fall detector from affecting the next control step.
-            base_env.recovery_mode[:] = False
-
-            # if not args.headless:
-
-                # print("root state:", base_env.root_states[0, :3])
-                # print("env origin:", base_env.env_origins[0])
-                # print("terrain level:", base_env.terrain_levels[0])
-                # print("terrain type:", base_env.terrain_types[0])
-
-            # Keep locomotion command fixed.
+            # Keep locomotion command fixed
             set_locomotion_command(
                 base_env,
                 x_vel=args.x_vel,
@@ -325,60 +334,56 @@ def main():
                 gait_name=args.gait,
             )
 
-            # The integrated env has already computed both
-            # observation streams.
+            # Integrated env computed both observation streams
             loco_obs = base_env.obs_buf
             recovery_obs = base_env.recovery_obs_buf
 
-            # Handle true simulator/episode resets
+            # Handle true episode resets
             done_mask = dones.bool()
 
             if done_mask.any():
                 loco_history[done_mask] = 0.0
                 recovery_history[done_mask] = 0.0
 
-            # Update BOTH shadow histories
+            # Update BOTH policy histories
             loco_history = push_history(loco_history, loco_obs)
             recovery_history = push_history(recovery_history, recovery_obs)
 
-            # Track mode transitions
+            # Mode after physics/state-machine update.
+            # This controller will be selected next step.
             current_mode = base_env.recovery_mode.clone()
-
             entered_recovery = (~previous_mode) & current_mode
-            left_recovery = previous_mode & (~current_mode)
 
+            # Don't count a true episode reset as a handoff
+            left_recovery = previous_mode & (~current_mode) & (~done_mask)
             ever_recovery |= entered_recovery
             ever_handoff |= left_recovery
 
             if entered_recovery.any():
-                print(f"[step {step}] entered recovery: {entered_recovery.nonzero().flatten().tolist()}")
+                print(f"[step {step}] >>> entered recovery: {entered_recovery.nonzero().flatten().tolist()}")
 
             if left_recovery.any():
-                print(f"[step {step}] handoff -> locomotion: {left_recovery.nonzero().flatten().tolist()}")
+                print(f"[step {step}] <<< handoff -> locomotion: {left_recovery.nonzero().flatten().tolist()}")
 
             previous_mode = current_mode
 
             if step % 25 == 0:
+                controller = "RECOVERY" if action_mode[0].item() else "LOCO"
+
                 print(
                     f"step={step:04d} | "
-                    f"recovery_mode={current_mode.float().mean().item():.2f} | "
-                    f"fall={infos.get('fall_detected_frac', 0.0):.2f} | "
-                    f"handoff_ready={infos.get('handoff_ready_frac', 0.0):.2f} | "
-                    f"new_handoff={infos.get('new_handoff_frac', 0.0):.2f} | "
-                    f"vx={base_env.base_lin_vel[:, 0].mean().item():.3f}"
+                    f"controller={controller} | "
+                    f"recovery_mode="
+                    f"{current_mode.float().mean().item():.2f} | "
+                    f"fall="
+                    f"{infos.get('fall_detected_frac', 0.0):.2f} | "
+                    f"done={done_mask.float().mean().item():.2f} | "
+                    f"vx="
+                    f"{base_env.base_lin_vel[:, 0].mean().item():.3f}"
                 )
 
-    print("\n========== Integrated evaluation ==========")
-    print(
-        f"entered_recovery_rate: "
-        f"{ever_recovery.float().mean().item():.3f}"
-    )
-    print(
-        f"successful_handoff_rate: "
-        f"{ever_handoff.float().mean().item():.3f}"
-    )
-    print("===========================================\n")
-
+    print(f"entered_recovery_rate: {ever_recovery.float().mean().item():.3f}")
+    print(f"successful_handoff_rate: {ever_handoff.float().mean().item():.3f}")
 
 if __name__ == "__main__":
     main()
