@@ -289,7 +289,8 @@ class FallRecoveryConfig(BaseCfg):
         relative_height_range = [-0.2, 0.8]
 
     class rewards(BaseCfg.rewards):
-        reward_container_name = "RecoveryRewards"
+        # reward_container_name = "FallRecoveryRewards"   # during evaluation
+        reward_container_name = "CoRLRewards"           # when training
         base_height_target = 0.34
 
         recovery_height_min = 0.05
