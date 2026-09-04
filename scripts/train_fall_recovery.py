@@ -28,7 +28,7 @@ def train_aliengo(headless=True):
     gpu_id = 0
     runner = Runner(env, device=f"cuda:{gpu_id}")
     # runner.learn(num_learning_iterations=20000, init_at_random_ep_len=True, eval_freq=100)
-    runner.learn(num_learning_iterations=10000, init_at_random_ep_len=False, eval_freq=100)
+    runner.learn(num_learning_iterations=35000, init_at_random_ep_len=False, eval_freq=100)
 
 
 if __name__ == '__main__':
