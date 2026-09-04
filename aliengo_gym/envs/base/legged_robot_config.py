@@ -69,7 +69,7 @@ class BaseCfg(PrefixProto, cli=False):
 
     class env(PrefixProto, cli=False):
         train_recovery = False
-        num_envs = 4096
+        num_envs = 20
         num_observations = 45
         num_scalar_observations = 45
         # if not None a privilige_obs_buf will be returned by step() (critic obs for assymetric training). None is returned otherwise
@@ -92,6 +92,7 @@ class BaseCfg(PrefixProto, cli=False):
         observe_contact_states = False
         observe_foot_forces = False
         observe_command = False
+        observe_desired_contact_states = False
         observe_height_command = False
         observe_gait_commands = False
         observe_timing_parameter = False # NOT that useful when already using clock_inputs which contains more info
@@ -481,7 +482,7 @@ class BaseCfg(PrefixProto, cli=False):
             rest_offset = 0.0  # [m]
             bounce_threshold_velocity = 0.5  # 0.5 [m/s]
             max_depenetration_velocity = 1.0
-            # max_gpu_contact_pairs = 2 ** 23  # 2**24 (needed for 8000 envs and more)
-            max_gpu_contact_pairs = 2 ** 24  # 16,777,216; PhysX requested 12,053,300
+            max_gpu_contact_pairs = 2 ** 23  # 2**24 (needed for 8000 envs and more)
+            # max_gpu_contact_pairs = 2 ** 24  # 16,777,216; PhysX requested 12,053,300
             default_buffer_size_multiplier = 5
             contact_collection = 2  # 0: never, 1: last sub-step, 2: all sub-steps (default=2)
