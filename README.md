@@ -255,8 +255,6 @@ These messages are useful for verifying that the locomotion and recovery policie
 - The integrated evaluator maintains separate observation histories for the two policies.
 - The locomotion command is explicitly reset during evaluation so that the commanded gait remains fixed.
 - For reproducible evaluation, domain randomization can be disabled in `test_loco_recovery.py`.
-- Terrain configuration can be changed in `fall_recovery_config_tr.py` or in the evaluation script.
-- Before integrated evaluation, make sure no locomotion-only debug line overrides the selected action after `torch.where(...)`.
 
 ## References
 
